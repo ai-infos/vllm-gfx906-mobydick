@@ -273,7 +273,7 @@ def rocm_unquantized_gemm_impl(
 
     # low batch size, use triton matmul
     if n <= 16:
-        return triton_matmul(x, weight)
+        return triton_matmul(x if x.is_contiguous() else x.contiguous(), weight)
 
     # otherwise, use native torch
     return torch.nn.functional.linear(x, weight, bias)

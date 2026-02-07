@@ -5,6 +5,7 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 
 logger = init_logger(__name__)
 
@@ -31,6 +32,11 @@ elif current_platform.is_xpu():
     get_scheduler_metadata = ipex_ops.get_scheduler_metadata  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:
+        if on_gfx906():
+            logger.info_once(
+                "On gfx906, flash-attn module with FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE is mandatory for some backends attention like MLA. "
+                "As flash-attn with CK (Composable Kernel) backend is not supported on gfx906."
+            )
         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
 
         # Mark that upstream flash-attn is available on ROCm

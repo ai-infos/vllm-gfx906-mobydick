@@ -217,7 +217,7 @@ def flash_attn_triton_available() -> bool:
         if os.environ.get("FLASH_ATTENTION_TRITON_AMD_ENABLE") != "TRUE":
             logger.info_once(
                 "Set FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE to enable "
-                "Flash Attention Triton backend on RDNA."
+                "Flash Attention Triton backend on RDNA or GFX906."
             )
             return False
         return True
@@ -420,7 +420,7 @@ class RocmPlatform(Platform):
             return AttentionBackendEnum.ROCM_AITER_FA
 
         if (
-            (on_gfx9() or on_gfx906())
+            on_gfx9()
             and find_spec("flash_attn") is not None
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
@@ -429,12 +429,12 @@ class RocmPlatform(Platform):
 
         # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
         if (
-            on_gfx1x()
+            (on_gfx1x() or on_gfx906())
             and flash_attn_triton_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
             logger.info_once(
-                "Using Flash Attention (Triton backend) for ViT model on RDNA."
+                "Using Flash Attention (Triton backend) for ViT model on RDNA or GFX906."
             )
             return AttentionBackendEnum.FLASH_ATTN
 

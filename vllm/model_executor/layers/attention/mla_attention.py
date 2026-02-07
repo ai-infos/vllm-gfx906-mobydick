@@ -229,6 +229,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import (
@@ -926,6 +927,13 @@ except ImportError:
     # so we don't attempt the fallback there.
     if current_platform.is_rocm():
         try:
+            if on_gfx906():
+                logger.warning_once(
+                    "On gfx906 flash_attn MLA, use FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE as CK (Composable Kernel) backend not supported. "
+                    "And FLASH_ATTENTION_TRITON_AMD_REF=TRUE is recommended "
+                    "as TORCH REF 2.10.0 provides better performance than Triton 3.6.0 for gfx906 MLA "
+                    "(even if best triton gfx906 config fwd_prefill provided: BLOCK_M: 64, BLOCK_N: 16, waves_per_eu: 1, PRE_LOAD_V: False, num_warps: 4, num_stages: 1)."
+                )
             from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
         except ImportError:
             logger.debug(
