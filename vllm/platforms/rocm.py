@@ -254,6 +254,7 @@ class RocmPlatform(Platform):
         "mxfp4",
         "petit_nvfp4",
         "torchao",
+        "inc",
     ]
     # bitsandbytes not supported on gfx9 (warp size 64 limitation)
     if not on_gfx9():
