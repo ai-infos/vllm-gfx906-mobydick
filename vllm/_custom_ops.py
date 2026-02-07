@@ -592,6 +592,8 @@ if hasattr(torch.ops._C, "gptq_gemm"):
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
     torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
+def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
+    torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
 
 if hasattr(torch.ops._C, "allspark_w8a16_gemm"):
 
@@ -2149,9 +2151,9 @@ def moe_wna16_gemm(
     BLOCK_SIZE_K: int,
     bit: int,
 ) -> torch.Tensor:
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         raise NotImplementedError(
-            "The optimized moe_wna16_gemm kernel is only available on CUDA platforms"
+            "The optimized moe_wna16_gemm kernel is only available on CUDA platforms or ROCm platforms"
         )
     torch.ops._moe_C.moe_wna16_gemm(
         input,

@@ -134,6 +134,12 @@ def on_mi3xx() -> bool:
 
 
 @cache
+def on_gfx906() -> bool:
+    GPU_ARCH = _get_gcn_arch_via_amdsmi()
+    return any(arch in GPU_ARCH for arch in ["gfx906"])
+
+
+@cache
 def on_gfx9() -> bool:
     GPU_ARCH = _get_gcn_arch_via_amdsmi()
     return any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
@@ -414,7 +420,7 @@ class RocmPlatform(Platform):
             return AttentionBackendEnum.ROCM_AITER_FA
 
         if (
-            on_gfx9()
+            (on_gfx9() or on_gfx906())
             and find_spec("flash_attn") is not None
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):

@@ -1,3 +1,12 @@
+CREDITS
+-------
+
+- https://github.com/nlzy/vllm-gfx906
+- https://github.com/Said-Akbar/vllm-rocm
+- https://github.com/vllm-project/vllm
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>

@@ -1021,8 +1021,12 @@ def get_config_file_name(
         device_name = "NVIDIA_H200"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
-        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+        "" if not block_shape or not all(block_shape) else
+        f",block_shape={block_shape}"
     ).replace(" ", "")
+    gfx906_names = [ "Instinct_MI50", "Instinct_MI60", "AMD_Radeon_Graphics", "Radeon_Pro_VII", "Radeon_VII", "Vega_20" ]
+    if any(s in device_name for s in gfx906_names):
+        device_name = "AMD_GFX906"
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
 
 
@@ -1093,48 +1097,6 @@ def get_moe_configs(
     return None
 
 
-def _ensure_block_size_k_divisible(
-    size_k: int, block_size_k: int, group_size: int
-) -> int:
-    """Ensure block_size_k is a divisor of size_k and divisible by group_size.
-
-    This ensures BLOCK_SIZE_K compatibility with MoeWNA16 CUDA kernel which
-    requires size_k % BLOCK_SIZE_K == 0 and BLOCK_SIZE_K % group_size == 0.
-
-    Args:
-        size_k: The size_k dimension that must be divisible by result.
-        block_size_k: Preferred block size (will be adjusted if needed).
-        group_size: The result must be divisible by this.
-
-    Returns:
-        A valid BLOCK_SIZE_K that divides size_k and is divisible by group_size.
-    """
-    # Fast path: already valid
-    if size_k % block_size_k == 0 and block_size_k % group_size == 0:
-        return block_size_k
-
-    # Find the largest value that:
-    # 1. Divides size_k (size_k % candidate == 0)
-    # 2. Is divisible by group_size (candidate % group_size == 0)
-    # 3. Is <= block_size_k (prefer smaller values close to block_size_k)
-    #
-    # Strategy: Search from min(block_size_k, size_k) down to group_size,
-    # stepping by group_size to ensure divisibility by group_size
-    max_search = min(block_size_k, size_k)
-    start = (max_search // group_size) * group_size
-    for candidate in range(start, group_size - 1, -group_size):
-        if size_k % candidate == 0:
-            return candidate
-
-    # Fallback: if group_size divides size_k, use it
-    # This should always be true with correct group_size configuration
-    if size_k % group_size == 0:
-        return group_size
-
-    # This should not happen with correct group_size, but ensure divisibility
-    return size_k
-
-
 def get_moe_wna16_block_config(
     config: dict[str, int],
     use_moe_wna16_cuda: bool,
@@ -1153,9 +1115,19 @@ def get_moe_wna16_block_config(
         # triton moe wna16 kernel
         if num_valid_tokens // real_top_k == 1:
             # if bs=1, use a smaller BLOCK_SIZE_N
-            return {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64}
+            block_size_n = 32
+            block_size_k = 64
         else:
-            return {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}
+            block_size_n = 64
+            block_size_k = 32
+        while block_size_k > 16 and size_k % block_size_k != 0:
+            block_size_k //= 2
+        if size_k % block_size_k != 0:
+            block_size_k = 1 << (size_k.bit_length() - 1)
+            while block_size_k > size_k or size_k % block_size_k != 0:
+                block_size_k //= 2
+        return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
+            
     else:
         # cuda moe wna16 kernel
         # set default block_size 128, and increase them when num_blocks
@@ -1200,8 +1172,12 @@ def get_moe_wna16_block_config(
             # at the same time.
             block_size_n = 1024
 
-        # Ensure BLOCK_SIZE_K is a divisor of size_k for CUDA kernel compatibility
-        block_size_k = _ensure_block_size_k_divisible(size_k, block_size_k, group_size)
+        while block_size_k > group_size and size_k % block_size_k != 0:
+            block_size_k //= 2
+        if size_k % block_size_k != 0:
+            block_size_k = 1 << (size_k.bit_length() - 1)
+            while block_size_k > group_size and size_k % block_size_k != 0:
+                block_size_k //= 2
 
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
@@ -1210,7 +1186,7 @@ def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
     return (
-        current_platform.is_cuda()
+        current_platform.is_cuda_alike() 
         and bit == 4
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6

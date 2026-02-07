@@ -92,17 +92,18 @@ __forceinline__ __device__ void dequant_4bit_8_gptq(const uint32_t q_0,
                                                     half2 (&y1y16)[2],
                                                     int stride, bool scaled) {
   const uint32_t c0 = 0x64006400;
+  const half2 inv16{ 0x1.p-4f, 0x1.p-4f }; // 1/16
 
   uint32_t qa = q_0;
-  half2_uint32 q0((qa & 0x000f000f) |
-                  c0);  // half2( q[0]      + 1024, q[1]      + 1024 )
-  half2_uint32 q1((qa & 0x00f000f0) |
-                  c0);  // half2( q[2] * 16 + 1024, q[3] * 16 + 1024 )
+  half2_uint32 q0(bfi(0x000f000f, qa,
+                      c0));  // half2( q[0]      + 1024, q[1]      + 1024 )
+  half2_uint32 q1(bfi(0x00f000f0, qa,
+                      c0));  // half2( q[2] * 16 + 1024, q[3] * 16 + 1024 )
   qa >>= 8;
-  half2_uint32 q2((qa & 0x000f000f) |
-                  c0);  // half2( q[4]      + 1024, q[5]      + 1024 )
-  half2_uint32 q3((qa & 0x00f000f0) |
-                  c0);  // half2( q[6] * 16 + 1024, q[7] * 16 + 1024 )
+  half2_uint32 q2(bfi(0x000f000f, qa,
+                      c0));  // half2( q[4]      + 1024, q[5]      + 1024 )
+  half2_uint32 q3(bfi(0x00f000f0, qa,
+                      c0));  // half2( q[6] * 16 + 1024, q[7] * 16 + 1024 )
 
   if (scaled) {
     dq[0] = __hfma2(q0.as_half2, y1y16[0],
@@ -113,10 +114,10 @@ __forceinline__ __device__ void dequant_4bit_8_gptq(const uint32_t q_0,
     dq[3] = __hfma2(q3.as_half2, y1y16[1], z1z16[1]);
   } else {
     dq[0] = __hadd2(q0.as_half2, z1z16[0]);  // half2( q[0] - z, q[1] - z )
-    dq[1] = __hfma2(q1.as_half2, y1y16[1],
+    dq[1] = __hfma2(q1.as_half2, inv16,
                     z1z16[1]);               // half2( q[2] - z, q[3] - z )
     dq[2] = __hadd2(q2.as_half2, z1z16[0]);  // half2( q[4] - z, q[5] - z )
-    dq[3] = __hfma2(q3.as_half2, y1y16[1],
+    dq[3] = __hfma2(q3.as_half2, inv16,
                     z1z16[1]);  // half2( q[6] - z, q[7] - z )
   }
 }

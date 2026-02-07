@@ -90,7 +90,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16, torch.half]
+        return [torch.half] # moe_wna16_gemm kernel has been updated to support only fp16 (for gfx906)
 
     @classmethod
     def get_min_capability(cls) -> int:
