@@ -29,7 +29,7 @@ cat /proc/cmdline  # >>> to check: must return: "BOOT_IMAGE=... iommu=pt"
 
 ```
 
-### vllm-gfx906-mobydick fork with its dependencies (torch, triton, python, etc)
+### vllm-gfx906-mobydick fork with its dependencies (python, torch, triton, flash-attn, etc)
 
 ```code
 
@@ -37,7 +37,7 @@ pyenv install 3.12.11
 pyenv virtualenv 3.12.11 venv312
 pyenv activate venv312
 
-# TRITON v3.5.1
+# TRITON-GFX906  v3.5.1
 
 git clone --branch v3.5.1+gfx906 https://github.com/ai-infos/triton-gfx906.git
 cd triton-gfx906
@@ -46,8 +46,13 @@ pip install -r python/requirements.txt
 pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
 pip install ./dist/triton-*.whl  
 
+# FLASH-ATTENTION-GFX906 (triton backend)
 
-# VLLM main
+git clone https://github.com/ai-infos/flash-attention-gfx906.git
+cd flash-attention
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+
+# VLLM-GFX906-MOBYDICK main
 
 git clone https://github.com/ai-infos/vllm-gfx906-mobydick.git
 cd vllm-gfx906-mobydick
