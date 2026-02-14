@@ -18,9 +18,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.transformers_utils.config import get_safetensors_params_metadata
+from vllm.platforms.rocm import on_gfx906
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -71,8 +73,7 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # The AWQ kernel only supports Turing or newer GPUs.
-        return 75
+        return 60
 
     @staticmethod
     def get_config_filenames() -> list[str]:
@@ -103,6 +104,9 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
+            logger.warning_once(
+                "[vllm-gfx906] You are using AWQ with exllama kernel, "
+                "this is differ from the offical vLLM.")
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             # Lazy import to avoid circular import.
@@ -110,9 +114,9 @@ class AWQConfig(QuantizationConfig):
             from .moe_wna16 import MoeWNA16Config
             from .utils.marlin_utils import check_moe_marlin_supports_layer
 
-            if not check_moe_marlin_supports_layer(layer, self.group_size):
+            if on_gfx906() or not check_moe_marlin_supports_layer(layer, self.group_size):
                 logger.warning_once(
-                    f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
+                    f"Layer '{prefix}' is not supported by AWQMoeMarlin or GFX906 used. "
                     "Falling back to Moe WNA16 kernels."
                 )
                 config = {
@@ -252,27 +256,30 @@ class AWQLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        qweight = layer.qweight
-        scales = layer.scales
-        qzeros = layer.qzeros
-        pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+        bits = self.quant_config.weight_bits
+        empty = torch.empty(0, device=layer.qzeros.device)
+
+        # hints: shuffle twice is equal to unshuffle once
+        ops.gptq_shuffle(layer.qzeros, empty, bits)
+        ops.gptq_shuffle(layer.qzeros, empty, bits)
+
+        ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
+        layer.qweight.data = layer.qweight.reshape((layer.qweight.shape[0] // 8,
+                                                    layer.qweight.shape[1] * 8))
+        replace_parameter(layer, "qweight", layer.qweight.data)
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: torch.Tensor | None = None) -> torch.Tensor:
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1], )
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        # num_tokens >= threshold
-        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
-
-        if FP16_MATMUL_HEURISTIC_CONDITION:
-            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-            out = torch.matmul(reshaped_x, out)
-        else:
-            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+        output = ops.gptq_gemm(
+            reshaped_x, layer.qweight, layer.qzeros, layer.scales,
+            torch.empty(0, device=layer.qweight.device),
+            True, True, self.quant_config.weight_bits
+        )
         if bias is not None:
-            out.add_(bias)
-        return out.reshape(out_shape)
+            output.add_(bias)
+        return output.reshape(out_shape)

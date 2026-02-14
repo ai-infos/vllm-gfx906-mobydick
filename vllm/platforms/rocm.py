@@ -129,6 +129,7 @@ _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
 _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
+_ON_GFX906 = "gfx906" in _GCN_ARCH
 
 
 def on_gfx1x() -> bool:
@@ -137,6 +138,10 @@ def on_gfx1x() -> bool:
 
 def on_mi3xx() -> bool:
     return _ON_MI3XX
+
+
+def on_gfx906() -> bool:
+    return _ON_GFX906
 
 
 def on_gfx9() -> bool:
@@ -207,7 +212,7 @@ def flash_attn_triton_available() -> bool:
         if os.environ.get("FLASH_ATTENTION_TRITON_AMD_ENABLE") != "TRUE":
             logger.info_once(
                 "Set FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE to enable "
-                "Flash Attention Triton backend on RDNA."
+                "Flash Attention Triton backend on RDNA or GFX906."
             )
             return False
         return True
@@ -244,6 +249,7 @@ class RocmPlatform(Platform):
         "mxfp4",
         "petit_nvfp4",
         "torchao",
+        "inc",
     ]
     # bitsandbytes not supported on gfx9 (warp size 64 limitation)
     if not on_gfx9():
@@ -420,12 +426,12 @@ class RocmPlatform(Platform):
 
         # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
         if (
-            on_gfx1x()
+            (on_gfx1x() or on_gfx906())
             and flash_attn_triton_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
             logger.info_once(
-                "Using Flash Attention (Triton backend) for ViT model on RDNA."
+                "Using Flash Attention (Triton backend) for ViT model on RDNA or GFX906."
             )
             return AttentionBackendEnum.FLASH_ATTN
 

@@ -1,16 +1,17 @@
 # Common dependencies
 -r common.txt
 
---extra-index-url https://download.pytorch.org/whl/test/rocm7.0
-torch==2.10.0
-torchvision==0.25.0
-torchaudio==2.10.0
-triton==3.6.0
+# torch torchaudio 2.10.0 torchvision 0.25.0 to be built manually with rocm6.3
+#--extra-index-url https://download.pytorch.org/whl/test/rocm7.0
+#torch==2.10.0
+#torchvision==0.25.0
+#torchaudio==2.10.0
+#triton==3.6.0 # use instead forked triton for gfx906 (to be built manually)
 cmake>=3.26.1,<4
 packaging>=24.2
 setuptools>=77.0.3,<80.0.0
 setuptools-scm>=8
 wheel
 jinja2>=3.1.6
-amdsmi==6.4.3
+amdsmi>=6.3,<6.4
 timm>=1.0.17
