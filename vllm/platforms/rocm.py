@@ -87,6 +87,14 @@ def with_amdsmi_context(fn):
     return wrapper
 
 
+# Known amdsmi target_graphics_version quirks.
+# Some ROCm versions (e.g. 6.3.4) return non-standard names like
+# "gfx9006" instead of "gfx906".  Map them to canonical names here.
+_AMDSMI_GFX_NORMALIZATION: dict[str, str] = {
+    "gfx9006": "gfx906",
+}
+
+
 @with_amdsmi_context
 def _query_gcn_arch_from_amdsmi() -> str:
     """Query GCN arch from amdsmi. Raises if not available."""
@@ -97,7 +105,15 @@ def _query_gcn_arch_from_amdsmi() -> str:
         # e.g., 'gfx942' for MI300X/MI325X
         target_gfx = asic_info.get("target_graphics_version", "")
         if target_gfx:
-            return target_gfx
+            normalized = _AMDSMI_GFX_NORMALIZATION.get(target_gfx, target_gfx)
+            if normalized != target_gfx:
+                logger.warning(
+                    "amdsmi returned non-standard GCN arch '%s', "
+                    "normalizing to '%s'.",
+                    target_gfx,
+                    normalized,
+                )
+            return normalized
     raise RuntimeError("amdsmi did not return valid GCN arch")
 
 
@@ -200,8 +216,6 @@ def use_rocm_custom_paged_attention(
 
 @cache
 def flash_attn_triton_available() -> bool:
-    if not on_gfx1x():
-        return False
     try:
         from importlib.util import find_spec
 
