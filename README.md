@@ -49,7 +49,7 @@ pip install ./dist/triton-*.whl
 # FLASH-ATTENTION-GFX906 (triton backend)
 
 git clone https://github.com/ai-infos/flash-attention-gfx906.git
-cd flash-attention
+cd flash-attention-gfx906
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 
 # VLLM-GFX906-MOBYDICK main
