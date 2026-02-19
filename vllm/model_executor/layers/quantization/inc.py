@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 if TYPE_CHECKING:
@@ -248,7 +249,7 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if backend == "auto" or "marlin" in backend:
+        if (backend == "auto" or "marlin" in backend) and not on_gfx906():
             AWQ_TYPE_MAP = {
                 4: scalar_types.uint4,
                 8: scalar_types.uint8,
@@ -334,7 +335,7 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if backend == "auto" or "marlin" in backend:
+        if (backend == "auto" or "marlin" in backend) and not on_gfx906():
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,
                 (8, True): scalar_types.uint8b128,
