@@ -102,7 +102,7 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.half, torch.bfloat16]
+        return [torch.half, torch.bfloat16, torch.float32]
 
     @classmethod
     def get_min_capability(cls) -> int:

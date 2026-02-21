@@ -112,6 +112,31 @@ __device__ inline void dequant<half2, 4>(int q, half2* res) {
                    *reinterpret_cast<const half2*>(&ADD));
 }
 
+// ========================================================================
+//  FP32 Dequantization for 4-bit weights
+//  Must match the INTERLEAVED order of the half2 version:
+//    res[0] = {nibble0, nibble4}
+//    res[1] = {nibble1, nibble5}
+//    res[2] = {nibble2, nibble6}
+//    res[3] = {nibble3, nibble7}
+//  The input data is loaded with this same interleaved layout.
+// ========================================================================
+template <>
+__device__ inline void dequant<float2, 4>(int q, float2* res) {
+    res[0] = make_float2(
+        static_cast<float>((q >>  0) & 0xF),    // nibble 0
+        static_cast<float>((q >> 16) & 0xF));   // nibble 4
+    res[1] = make_float2(
+        static_cast<float>((q >>  4) & 0xF),    // nibble 1
+        static_cast<float>((q >> 20) & 0xF));   // nibble 5
+    res[2] = make_float2(
+        static_cast<float>((q >>  8) & 0xF),    // nibble 2
+        static_cast<float>((q >> 24) & 0xF));   // nibble 6
+    res[3] = make_float2(
+        static_cast<float>((q >> 12) & 0xF),    // nibble 3
+        static_cast<float>((q >> 28) & 0xF));   // nibble 7
+}
+
 // TODO: support 8
 // template <>
 // __device__ inline void dequant<half2, 8>(int q, half2* res) {

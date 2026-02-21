@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -26,6 +27,7 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 
+# For CUDA:
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -286,14 +288,14 @@ class SparseAttnIndexer(CustomOp):
     def forward_native(
         self,
         hidden_states: torch.Tensor,
-        q_fp8: torch.Tensor,
+        q: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
         if current_platform.is_cuda():
-            return self.forward_cuda(hidden_states, q_fp8, k, weights)
+            return self.forward_cuda(hidden_states, q, k, weights)
         elif current_platform.is_rocm():
-            return self.forward_hip(hidden_states, q_fp8, k, weights)
+            return self.forward_hip(hidden_states, q, k, weights)
         else:
             raise NotImplementedError(
                 "SparseAttnIndexer native forward is only implemented for "
@@ -326,16 +328,16 @@ class SparseAttnIndexer(CustomOp):
     def forward_hip(
         self,
         hidden_states: torch.Tensor,
-        q_fp8: torch.Tensor,
+        q: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        if rocm_aiter_ops.is_enabled():
+        if rocm_aiter_ops.is_enabled() or envs.VLLM_ROCM_MLA_SPARSE_FP16:
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
                 self.k_cache.prefix,
                 self.k_cache.kv_cache[0],
-                q_fp8,
+                q,
                 k,
                 weights,
                 self.quant_block_size,

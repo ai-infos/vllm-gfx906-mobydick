@@ -327,6 +327,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        _KV_DTYPE_MAP = {"half": torch.float16, "bfloat16": torch.bfloat16}
+        self.kv_16bits_dtype = _KV_DTYPE_MAP.get(self.kv_cache_dtype)
+        self.is_16bits_casting_enabled = False
+
         dtype = torch.get_default_dtype()
         self.attn_backend = get_attn_backend(
             self.head_size,
@@ -489,18 +493,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
+            # During the profile run try to simulate the worst case output size
             # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            # since this can be large.
+            # Sparse MLA impls never use forward_mha/_compute_prefill_context,
+            # so skip this allocation to avoid OOM on memory-constrained GPUs.
+            if not isinstance(self.impl, SparseMLAAttentionImpl):
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -562,7 +569,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if num_mqa_tokens > 0:
-            mqa_q = q[:num_mqa_tokens]
+            # Cast to 16 bits kv cache dtype (fp16/bf16) if --dtype is fp32 for perf
+            mqa_q = q[:num_mqa_tokens].to(kv_cache.dtype) if self.is_16bits_casting_enabled else q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(
@@ -651,8 +659,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # we currently do not have quantized bmm's which are needed for
-        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
-        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
+        # `W_UV` and `W_UK_T`, we just store --dtype (fp16/bf16/fp32) copies and perform
+        # the bmm's in --dtype, the extra memory overhead of this is fairly low
         kv_b_proj_weight = get_and_maybe_dequant_weights(
             self.kv_b_proj, out_dtype=act_dtype
         ).T
@@ -737,6 +745,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
+            # Pre-cache 16-bit copies of weight matrices if --dtype is fp32
+            # to avoid per-call .to() GPU allocations during inference
+            if self.W_UK_T.dtype == torch.float32 and self.kv_16bits_dtype is not None:
+                self.is_16bits_casting_enabled = True
+                # Cast to 16 bits kv cache dtype (fp16/bf16) if --dtype is fp32 for perf
+                self.W_UV = self.W_UV.to(self.kv_16bits_dtype)
+                self.W_UK_T = self.W_UK_T.to(self.kv_16bits_dtype)
+                self._v_proj_buf: torch.Tensor | None = None
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -786,6 +802,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
         )
 
+    def _get_v_proj_buffer(
+        self, N: int, B: int, V: int,
+        dtype: torch.dtype, device: torch.device,
+    ) -> torch.Tensor:
+        """Return a (N, B, V) fp16/bf16 buffer, reusing previous allocation
+        when possible. Only reallocates if batch size grew."""
+        buf = self._v_proj_buf
+        if buf is None or buf.shape[1] < B:
+            # Allocate (or grow) the buffer
+            buf = torch.empty(N, B, V, dtype=dtype, device=device)
+            self._v_proj_buf = buf
+        return buf[:N, :B, :V]
+
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -810,16 +839,29 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Convert from (B, N * V) to (N, B, V)
             out = out.transpose(0, 1)
 
-            # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-            torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
+            if self.is_16bits_casting_enabled:
+                # bmm in fp16/bf16 for perf on gfx906
+                # Use persistent buffer to avoid per-call GPU allocations
+                N, B, L = x.shape
+                V = self.v_head_dim
+                buf = self._get_v_proj_buffer(N, B, V, x.dtype, x.device)
+                # Multiply (N, B, L) x (N, L, V) -> (N, B, V) into fp16/bf16 buffer
+                torch.bmm(x, self.W_UV, out=buf)
+                # Single copy: transpose (N,B,V)->(B,N,V), flatten to (B,N*V),
+                # and cast fp16/bf16->fp32 all in one copy_ call
+                out.resize_((B, N * V))
+                out.copy_(buf.transpose(0, 1).reshape(B, N * V))
+            else:
+                # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+                torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
 
-            # Convert from (N, B, V) to (B, N * V)
-            out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
+                # Convert from (N, B, V) to (B, N * V)
+                out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
 
-            # Adjust output buffer shape back to the original (B, N * V)
-            N, B, V = out.shape
-            out.resize_((B, N * V))
-            out.copy_(out_new)  # Copy result
+                # Adjust output buffer shape back to the original (B, N * V)
+                N, B, V = out.shape
+                out.resize_((B, N * V))
+                out.copy_(out_new)  # Copy result
 
 
 @maybe_transfer_kv_layer
