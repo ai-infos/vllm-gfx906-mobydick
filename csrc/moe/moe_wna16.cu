@@ -9,6 +9,54 @@
 
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
+// ========================================================================
+//  Add missing ScalarType specialization for float (FP32)
+//  This provides the necessary type mappings (scalar_t2 -> float2) 
+//  and conversion helpers that the kernel expects.
+// ========================================================================
+template<>
+struct ScalarType<float> {
+    using scalar_t2 = float2;
+
+    __device__ __forceinline__ static float2 num2num2(float v) {
+        return make_float2(v, v);
+    }
+
+    __device__ __forceinline__ static float int2num(int v) {
+        return static_cast<float>(v);
+    }
+
+    __device__ __forceinline__ static float num2float(float v) {
+        return v;
+    }
+
+    __device__ __forceinline__ static float float2num(float v) {
+        return v;
+    }
+};
+
+// ========================================================================
+//  FP32 Helper Math Functions
+//  Standard arithmetic operators (+, *, -) are not always defined 
+//  for vector types (float2) in all CUDA/HIP environments.
+// ========================================================================
+
+__device__ __forceinline__ float2 fma2_float(float2 a, float2 b, float2 c) {
+    return make_float2(a.x * b.x + c.x, a.y * b.y + c.y);
+}
+
+__device__ __forceinline__ float2 mul2_float(float2 a, float2 b) {
+    return make_float2(a.x * b.x, a.y * b.y);
+}
+
+__device__ __forceinline__ float2 sub2_float(float2 a, float2 b) {
+    return make_float2(a.x - b.x, a.y - b.y);
+}
+
+// ========================================================================
+//  Kernel Implementation
+// ========================================================================
+
 template <typename scalar_t, int bit, int GROUPS>
 __global__ void moe_wna16_gemm_kernel(
     const scalar_t* __restrict__ input, scalar_t* __restrict__ output,
@@ -36,8 +84,10 @@ __global__ void moe_wna16_gemm_kernel(
   const int32_t expert_id = expert_ids[blockIdx.x];
 
   int32_t num_valid_tokens = 0;
-  extern __shared__ uint16_t block_input_tmp[];
-  scalar_t* block_input = reinterpret_cast<scalar_t*>(block_input_tmp);
+  
+  // Use char for extern shared to avoid alignment issues during cast
+  extern __shared__ char block_input_tmp_char[];
+  scalar_t* block_input = reinterpret_cast<scalar_t*>(block_input_tmp_char);
   scalar_t2* block_input_half2 = reinterpret_cast<scalar_t2*>(block_input);
 
   // load BLOCK_SIZE_M * BLOCK_SIZE_K into shared memory
@@ -104,25 +154,46 @@ __global__ void moe_wna16_gemm_kernel(
   if constexpr (GROUPS == 1) {
     *expert_scales_groups = expert_scales[scales_offset_tmp];
   } else if constexpr (GROUPS == 2) {
-    float* expert_scales_groups_tmp =
-        reinterpret_cast<float*>(expert_scales_groups);
-    *expert_scales_groups_tmp =
-        reinterpret_cast<const float*>(expert_scales)[scales_offset_tmp];
+      if constexpr (sizeof(scalar_t) == 2) {
+        float* dst = reinterpret_cast<float*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float*>(expert_scales)[scales_offset_tmp];
+      } else {
+        float2* dst = reinterpret_cast<float2*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float2*>(expert_scales)[scales_offset_tmp];
+      }
   } else if constexpr (GROUPS == 4) {
-    float2* expert_scales_groups_tmp =
-        reinterpret_cast<float2*>(expert_scales_groups);
-    *expert_scales_groups_tmp =
-        reinterpret_cast<const float2*>(expert_scales)[scales_offset_tmp];
+      if constexpr (sizeof(scalar_t) == 2) {
+        float2* dst = reinterpret_cast<float2*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float2*>(expert_scales)[scales_offset_tmp];
+      } else {
+        float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
+      }
   } else if constexpr (GROUPS == 8) {
-    float4* expert_scales_groups_tmp =
-        reinterpret_cast<float4*>(expert_scales_groups);
-    *expert_scales_groups_tmp =
-        reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
+      if constexpr (sizeof(scalar_t) == 2) {
+        float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
+      } else {
+        // float32 path: load 2 float4s manually
+        const float4* src = reinterpret_cast<const float4*>(expert_scales);
+        float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+        dst[0] = src[scales_offset_tmp * 2];
+        dst[1] = src[scales_offset_tmp * 2 + 1];
+      }
   } else if constexpr (GROUPS == 16) {
-    float4* expert_scales_groups_f4 = reinterpret_cast<float4*>(expert_scales_groups);
-    const float4* expert_scales_f4 = reinterpret_cast<const float4*>(expert_scales);
-    expert_scales_groups_f4[0] = expert_scales_f4[scales_offset_tmp * 2];
-    expert_scales_groups_f4[1] = expert_scales_f4[scales_offset_tmp * 2 + 1];
+    float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+    const float4* src = reinterpret_cast<const float4*>(expert_scales);
+    
+    if constexpr (sizeof(scalar_t) == 2) {
+        dst[0] = src[scales_offset_tmp * 2];
+        dst[1] = src[scales_offset_tmp * 2 + 1];
+    } else {
+        // float32 path: 16 floats = 4 float4s
+        dst[0] = src[scales_offset_tmp * 4];
+        dst[1] = src[scales_offset_tmp * 4 + 1];
+        dst[2] = src[scales_offset_tmp * 4 + 2];
+        dst[3] = src[scales_offset_tmp * 4 + 3];
+    }
   }
 
   // load all required qzeros one time
@@ -138,29 +209,21 @@ __global__ void moe_wna16_gemm_kernel(
         (offset_n / (8 / bit)) * (size_k / group_size / GROUPS) +
         offset_k / group_size / GROUPS;
     if constexpr (GROUPS == 1) {
-      uint8_t* expert_qzeros_groups_tmp =
-          reinterpret_cast<uint8_t*>(expert_qzeros_groups);
-      *expert_qzeros_groups_tmp =
-          reinterpret_cast<const uint8_t*>(expert_qzeros)[qzeros_offset_tmp];
+      uint8_t* dst = reinterpret_cast<uint8_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint8_t*>(expert_qzeros)[qzeros_offset_tmp];
     } else if constexpr (GROUPS == 2) {
-      uint16_t* expert_qzeros_groups_tmp =
-          reinterpret_cast<uint16_t*>(expert_qzeros_groups);
-      *expert_qzeros_groups_tmp =
-          reinterpret_cast<const uint16_t*>(expert_qzeros)[qzeros_offset_tmp];
+      uint16_t* dst = reinterpret_cast<uint16_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint16_t*>(expert_qzeros)[qzeros_offset_tmp];
     } else if constexpr (GROUPS == 4) {
-      uint32_t* expert_qzeros_groups_tmp =
-          reinterpret_cast<uint32_t*>(expert_qzeros_groups);
-      *expert_qzeros_groups_tmp =
-          reinterpret_cast<const uint32_t*>(expert_qzeros)[qzeros_offset_tmp];
+      uint32_t* dst = reinterpret_cast<uint32_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint32_t*>(expert_qzeros)[qzeros_offset_tmp];
     } else if constexpr (GROUPS == 8) {
-      uint64_t* expert_qzeros_groups_tmp =
-          reinterpret_cast<uint64_t*>(expert_qzeros_groups);
-      *expert_qzeros_groups_tmp =
-          reinterpret_cast<const uint64_t*>(expert_qzeros)[qzeros_offset_tmp];
+      uint64_t* dst = reinterpret_cast<uint64_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint64_t*>(expert_qzeros)[qzeros_offset_tmp];
     } else if constexpr (GROUPS == 16) {
-      uint4* expert_qzeros_groups_u4 = reinterpret_cast<uint4*>(expert_qzeros_groups);
-      const uint4* expert_qzeros_u4 = reinterpret_cast<const uint4*>(expert_qzeros);
-      *expert_qzeros_groups_u4 = expert_qzeros_u4[qzeros_offset_tmp];
+      uint4* dst = reinterpret_cast<uint4*>(expert_qzeros_groups);
+      const uint4* src = reinterpret_cast<const uint4*>(expert_qzeros);
+      *dst = src[qzeros_offset_tmp];
     }
   }
 
@@ -198,8 +261,15 @@ __global__ void moe_wna16_gemm_kernel(
 #pragma unroll
       for (int i = 0; i < 16 / bit; i++) {
         int32_t offset_input = m * BLOCK_SIZE_K / 2 + tmp_k * (16 / bit) + i;
-        res2 = __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
-                        block_input_half2[offset_input], res2);
+        
+        if constexpr (std::is_same_v<scalar_t, half>) {
+            res2 = __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
+                           block_input_half2[offset_input], res2);
+        } else {
+            // Float path using helpers
+            float2 dequantized = mul2_float(sub2_float(weight_half2[i], qzero_f2), scale_f2);
+            res2 = fma2_float(dequantized, block_input_half2[offset_input], res2);
+        }
       }
 
       if (tmp_k == 0) {
@@ -216,8 +286,12 @@ __global__ void moe_wna16_gemm_kernel(
     if (mul_topk_weight) {
       res[m] *= topk_weights[token_index];
     }
-    atomicAdd_half(&output[token_index * size_n + offset_n],
-              Dtype::float2num(res[m]));
+    
+    if constexpr (std::is_same_v<scalar_t, half>) {
+        atomicAdd_half(&output[token_index * size_n + offset_n], Dtype::float2num(res[m]));
+    } else {
+        atomicAdd(&output[token_index * size_n + offset_n], Dtype::float2num(res[m]));
+    }
   }
 }
 
@@ -262,10 +336,12 @@ void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
     // } else if (BLOCK_SIZE_K / group_size == 8) {
     //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 8>;
     // }
-    TORCH_CHECK(false, "???");
+    TORCH_CHECK(false, "Unsupported bit width");
   }
 
-  const int shared_mem_size = BLOCK_SIZE_M * BLOCK_SIZE_K * 2;
+  // Use generic size
+  const int shared_mem_size = BLOCK_SIZE_M * BLOCK_SIZE_K * sizeof(scalar_t);
+  
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   kernel<<<gridDim, blockDim, shared_mem_size, stream>>>(
       input, output, b_qweight, b_scales, b_qzeros, topk_weights,
@@ -330,8 +406,19 @@ torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
         num_experts, group_size, num_token_blocks, top_k, size_m, size_n,
         size_k, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, bit,
         b_qzeros.has_value(), topk_weights.has_value());
+  } else if (input.scalar_type() == at::ScalarType::Float) {
+    run_moe_wna16_gemm<float>(
+      (const float*)input.data_ptr<float>(),
+      (float*)output.data_ptr<float>(),
+      (const uint32_t*)b_qweight.data_ptr<uint8_t>(),
+      (const float*)b_scales.data_ptr<float>(), b_qzeros_ptr,
+      topk_weights_ptr, sorted_token_ids.data_ptr<int32_t>(),
+      expert_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
+      num_experts, group_size, num_token_blocks, top_k, size_m, size_n,
+      size_k, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, bit,
+      b_qzeros.has_value(), topk_weights.has_value());
   } else {
-    TORCH_CHECK(false, "moe_wna16_gemm only supports float16");
+    TORCH_CHECK(false, "moe_wna16_gemm only supports float16 and float32");
   }
   return output;
 }

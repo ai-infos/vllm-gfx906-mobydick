@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -106,7 +107,7 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        return [torch.bfloat16, torch.float16, torch.float32]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -126,11 +127,11 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
 
-    qo_indptr: torch.Tensor
-    paged_kv_last_page_len: torch.Tensor
-    paged_kv_indices: torch.Tensor
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indptr_rest: torch.Tensor
+    qo_indptr: torch.Tensor | None = None
+    paged_kv_last_page_len: torch.Tensor | None = None
+    paged_kv_indices: torch.Tensor | None = None
+    paged_kv_indptr: torch.Tensor | None = None
+    paged_kv_indptr_rest: torch.Tensor | None = None
 
     block_size: int = 1
     topk_tokens: int = 2048
@@ -153,7 +154,6 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         self.device = device
-        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
@@ -174,23 +174,25 @@ class ROCMAiterMLASparseMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
-        self.qo_indptr = torch.arange(
-            0, max_num_batched_tokens + 1, dtype=torch.int32, device=device
-        )
-        self.paged_kv_last_page_len = torch.ones(
-            max_num_batched_tokens, dtype=torch.int32, device=device
-        )
+        if not envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.qo_indptr = torch.arange(
+                0, max_num_batched_tokens + 1, dtype=torch.int32, device=device
+            )
+            self.paged_kv_last_page_len = torch.ones(
+                max_num_batched_tokens, dtype=torch.int32, device=device
+            )
 
-        # These two needs to be calculated in runtime,
-        # but we still needs to prepare the buffer
-        self.paged_kv_indices = torch.zeros(
-            [max_num_batched_tokens * self.topk_tokens],
-            dtype=torch.int32,
-            device=device,
-        )
-        self.paged_kv_indptr = torch.zeros(
-            [max_num_batched_tokens + 1], dtype=torch.int32, device=device
-        )
+            # These two needs to be calculated in runtime,
+            # but we still needs to prepare the buffer
+            self.paged_kv_indices = torch.zeros(
+                [max_num_batched_tokens * self.topk_tokens],
+                dtype=torch.int32,
+                device=device,
+            )
+            self.paged_kv_indptr = torch.zeros(
+                [max_num_batched_tokens + 1], dtype=torch.int32, device=device
+            )
 
     def build(
         self,
@@ -209,15 +211,23 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             torch.from_numpy(req_id_per_token), non_blocking=True
         )
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
-
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
-        qo_indptr = self.qo_indptr[: num_tokens + 1]
-        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
-        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
-        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
+
+        if not envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            self.paged_kv_indices.fill_(0)
+            self.paged_kv_indptr.fill_(0)
+            qo_indptr = self.qo_indptr[: num_tokens + 1]
+            paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
+            paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+            paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+            paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
+        else:
+            qo_indptr = None
+            paged_kv_last_page_len = None
+            paged_kv_indices = None
+            paged_kv_indptr = None
+            paged_kv_indptr_rest = None
+
 
         metadata = ROCMAiterMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
@@ -240,32 +250,41 @@ class ROCMAiterMLASparseMetadataBuilder(
 
 
 # Take from
-# https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_prefill.py#L72
+# https://github.com/deepseek-ai/FlashMLA/blob/082094b793fcc7452977d0a71a00e266a2e3061e/tests/ref.py
 def reference_mla_sparse_prefill(
-    q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sm_scale: float, d_v: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    import math
-
-    def log2sumexp2(a: torch.Tensor, dim: int) -> torch.Tensor:
-        return torch.logsumexp(a * math.log(2), dim=dim) * math.log2(math.e)
-
-    skv = kv.shape[0]
-    sq = q.shape[0]
+    q: torch.Tensor, # in kv dtype
+    kv: torch.Tensor, 
+    indices: torch.Tensor, 
+    sm_scale: float, 
+    d_v: int,
+) -> torch.Tensor:
+    """
+    Returns:
+    - o: [s_q, h_q, dv]
+    """
     topk = indices.shape[-1]
-    dqk = q.shape[-1]
+    s_kv = kv.shape[0]
+    s_q, h_q, d_qk = q.shape  # [s_q, h_q, d_qk]
     indices = indices[:, 0, :]  # [s_q, topk]
-    invalid_indices_mask = (indices < 0) | (indices >= skv)
-    indices[invalid_indices_mask] = 0
-    qs = q  # [s_q, h_q, d_qk]
-    kvs = kv[:, 0, :][indices].view(sq, topk, dqk)  # [s_q, topk, d_qk]
+    invalid_mask = (indices < 0) | (indices >= s_kv)    # [s_q, topk]
+    indices[invalid_mask] = 0
 
-    attn_score = (qs @ kvs.transpose(1, 2)).float()  # [s_q, h_q, topk]
-    attn_score.masked_fill_(invalid_indices_mask.unsqueeze(1), float("-inf"))
-    attn_score *= sm_scale * math.log2(math.e)
-    lse = log2sumexp2(attn_score, dim=-1)  # [s_q, h_q]
-    attn_score = torch.exp2(attn_score - lse.unsqueeze(-1))  # [s_q, h_q, topk]
-    result = attn_score.to(q.dtype) @ kvs[:, :, :d_v]
-    return (result, lse)
+    gathered_kv = kv.index_select(dim=0, index=indices.flatten()).reshape(s_q, topk, d_qk)   # [s_q, topk, d_qk]
+    if kv.dtype == torch.float32:
+        P = q @ gathered_kv.transpose(1, 2) # [s_q, h_q, topk]
+    else: # q and kv are both fp16 or bf16
+        P = (q @ gathered_kv.transpose(1, 2)).float() # 16 bits matmul for performance
+    P.masked_fill_(invalid_mask.unsqueeze(1), float("-inf"))
+    P *= sm_scale
+
+    orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
+    s_for_o = torch.exp(P - orig_lse.unsqueeze(-1))
+    if kv.dtype == torch.float32:
+        out = s_for_o @ gathered_kv[..., :d_v]
+    else:
+        out = s_for_o.to(kv.dtype) @ gathered_kv[..., :d_v]
+
+    return out # in kv dtype
 
 
 class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata]):
@@ -296,7 +315,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
 
-    def _forward_bf16_kv(
+    def _forward_kv(
         self,
         q: torch.Tensor,  # [sq, heads, d_qk]
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
@@ -304,32 +323,42 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         attn_metadata: ROCMAiterMLASparseMetadata,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
-        output = torch.empty(
-            [num_tokens, self.num_heads, self.kv_lora_rank],
-            dtype=q.dtype,
-            device=q.device,
+        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
+            -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
-        seq_len = (topk_indices != -1).sum(dim=-1)
-        torch.cumsum(seq_len, dim=0, out=attn_metadata.paged_kv_indptr[1:])
-        attn_metadata.paged_kv_indptr_rest.fill_(attn_metadata.paged_kv_indptr[-1])
-        fetch_id_to_ragged_triton(
-            topk_indices,
-            attn_metadata.paged_kv_indptr,
-            attn_metadata.paged_kv_indices,
-            attn_metadata.topk_tokens,
-        )
+        topk_indices = topk_indices.view(num_tokens, 1, -1)
 
-        rocm_aiter_ops.mla_decode_fwd(
-            q,
-            kv_c_and_k_pe_cache,
-            output,
-            self.scale,
-            attn_metadata.qo_indptr,
-            1,
-            attn_metadata.paged_kv_indptr,
-            attn_metadata.paged_kv_indices,
-            attn_metadata.paged_kv_last_page_len,
-        )
+        if envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            output = reference_mla_sparse_prefill(
+                q, kv_c_and_k_pe_cache, topk_indices,
+                self.softmax_scale, self.kv_lora_rank,
+            )
+        else:
+            seq_len = (topk_indices != -1).sum(dim=-1)
+            torch.cumsum(seq_len, dim=0, out=attn_metadata.paged_kv_indptr[1:])
+            attn_metadata.paged_kv_indptr_rest.fill_(attn_metadata.paged_kv_indptr[-1])
+            fetch_id_to_ragged_triton(
+                topk_indices,
+                attn_metadata.paged_kv_indptr,
+                attn_metadata.paged_kv_indices,
+                attn_metadata.topk_tokens,
+            )
+            output = torch.empty(
+                [num_tokens, self.num_heads, self.kv_lora_rank],
+                dtype=q.dtype,
+                device=q.device,
+            )
+            rocm_aiter_ops.mla_decode_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                output,
+                self.scale,
+                attn_metadata.qo_indptr,
+                1,
+                attn_metadata.paged_kv_indptr,
+                attn_metadata.paged_kv_indices,
+                attn_metadata.paged_kv_last_page_len,
+            )
 
         return output[:, : self.num_heads, :]
 
@@ -361,7 +390,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
-        attn_out = self._forward_bf16_kv(
+        attn_out = self._forward_kv(
             q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
         )
 

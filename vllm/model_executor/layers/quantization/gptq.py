@@ -129,7 +129,7 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.half]
+        return [torch.half, torch.float32]
 
     @classmethod
     # Need to figure it out
@@ -380,6 +380,18 @@ class GPTQLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+
+        # If --dtype float32 force operations to run in FP16 as w4a32 mode not implemented for gptq_gemm kernel
+        # TODO: implement w4a32 mode for gptq_gemm kernel to be consistent (only if necessary, for example: in case of w4a16 precision issues leading to garbage outputs with future models)
+        # NB: it has not been implemented yet as Deepseek v3.2 int4 autoround gptq works with dtype fp32 and with moe_wna16 kernel with true w4a32 mode implemented there
+        # So gptq_gemm has been left in w4a16 mode only for now with the below cast workaround when dtype is fp32 -> that's enough for now.
+        orig_dtype = x.dtype
+        scales = layer.scales
+        if x.dtype == torch.float32:
+            x = x.to(torch.float16)
+            if scales.dtype == torch.float32:
+                scales = scales.to(torch.float16)
+
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         # GPTQ v1 and v2 format checkpoints deals with zero points differently,
@@ -388,12 +400,14 @@ class GPTQLinearMethod(LinearMethodBase):
             reshaped_x,
             layer.qweight,
             layer.qzeros,
-            layer.scales,
+            scales,
             layer.g_idx,
             layer.exllama_state == ExllamaState.READY,
             self.use_v2_format,
             self.quant_config.weight_bits,
         )
+        if output.dtype != orig_dtype:
+            output = output.to(orig_dtype)
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

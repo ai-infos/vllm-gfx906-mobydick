@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
+    VLLM_ROCM_MLA_SPARSE_FP16: bool = False
+    VLLM_ROCM_MLA_SPARSE_FP16_TRITON: bool = False
+    VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE: int = 4
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
@@ -895,6 +898,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+    ),
+    "VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE", "4")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_FP16": lambda: (
+        os.getenv("VLLM_ROCM_MLA_SPARSE_FP16", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_FP16_TRITON": lambda: (
+        os.getenv("VLLM_ROCM_MLA_SPARSE_FP16_TRITON", "False").lower() in ("true", "1")
     ),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.

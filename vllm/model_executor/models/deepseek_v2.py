@@ -645,8 +645,8 @@ class Indexer(nn.Module):
         #       where we store value in fp8 and scale in fp32
         #       per self.quant_block_size element
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+            head_dim=self.head_dim if envs.VLLM_ROCM_MLA_SPARSE_FP16 else self.head_dim + self.head_dim // self.quant_block_size * 4,
+            dtype=torch.float16 if envs.VLLM_ROCM_MLA_SPARSE_FP16 else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -694,15 +694,18 @@ class Indexer(nn.Module):
         k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q,
-            self.quant_block_size,
-            column_major_scales=False,
-            use_ue8m0=self.scale_fmt is not None,
-        )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        if not envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            q = q.view(-1, self.head_dim)
+            q, q_scale = per_token_group_quant_fp8(
+                q,
+                self.quant_block_size,
+                column_major_scales=False,
+                use_ue8m0=self.scale_fmt is not None,
+            )
+            q = q.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+        else:
+            q_scale = 1
 
         weights, _ = self.weights_proj(hidden_states)
         weights = (
@@ -710,7 +713,7 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        return self.indexer_op(hidden_states, q, k, weights)
 
 
 class DeepSeekV2FusedQkvAProj(MergedColumnParallelLinear):
