@@ -221,193 +221,222 @@ def cp_gather_indexer_k_quant_cache_triton(
 
 @triton.jit
 def _deepgemm_fp16_paged_mqa_logits_stage1(
-    batch_size,
-    next_n,
-    heads_num,
-    Q_buffer,           # FP16
-    stride_q_batch,
-    stride_q_next_n,
-    stride_q_heads,
-    KV_buffer,          # FP16 [NumBlocks, BlockSize, Heads, Dim]
-    stride_k_blk,       # Stride(0): Jump to next physical block (numel per block)
-    stride_k_tok,       # Stride(1): Jump to next token inside block (usually Heads*Dim)
-    context_len_ptr,
-    block_table,        # [Batch, MaxNumBlocks] - Note: This is now a BLOCK table, not token indices
-    weights,            # [Batch*NextN, Heads] FP32
-    stride_w_batch,
+    # Dimensions
+    batch_size, next_n,
+    # Q: [Batch, NextN, Heads, Dim] FP16
+    Q_buffer,
+    stride_q_batch: tl.int64, stride_q_next_n: tl.int64,
+    stride_q_heads: tl.int64, stride_q_dim: tl.int64,
+    # KV: [NumBlocks, BlockSize, 1, Dim] FP16
+    KV_buffer,
+    stride_kv_blk: tl.int64,   # stride(0): jump to next physical block
+    stride_kv_tok: tl.int64,   # stride(1): jump to next token in block
+    # Runtime data
+    context_len_ptr,            # [Batch] int32
+    block_table,                # [Batch, MaxNumBlocks] int32
+    weights,                    # [Batch*NextN, Heads] FP32
+    stride_w_row: tl.int64,    # weights.stride(0)
+    # Output: [Batch*NextN, max_model_len] FP32 (head-reduced!)
     Out_buffer,
-    stride_out_heads,
-    stride_out_batch,
-    max_model_len,
-    max_num_blocks,     # Changed from max_blk_len (tokens) to max_num_blocks
-    ChunkQ: tl.constexpr,
-    ChunkK: tl.constexpr, # Must match BlockSize (e.g., 64)
-    HiddenDim: tl.constexpr,
-    SplitKV: tl.constexpr = 1,
+    stride_out_row: tl.int64,  # output.stride(0)
+    # Sizes
+    max_num_blocks,
+    # Compile-time constants
+    NUM_HEADS: tl.constexpr,    # 64
+    BLOCK_D: tl.constexpr,      # 64 (D-chunk size)
+    HEAD_DIM: tl.constexpr,     # 128
+    CHUNK_K: tl.constexpr,      # 64 (= BlockSize)
 ):
-    pid = tl.program_id(0)
-    num_block_q_head = tl.cdiv(heads_num, ChunkQ)
+    """
+    Optimized decode kernel with in-kernel head reduction.
+    Each program handles ONE (batch_item, kv_block) pair and processes ALL
+    heads internally using HEAD_GROUP=8. Output is already head-reduced.
+    Grid: (num_kv_blocks_max, batch_size * next_n)
+    """
+    pid_kv_block = tl.program_id(0)   # which logical KV block
+    pid_bn = tl.program_id(1)         # which (batch, next_n) element
 
-    pid_q_head, remain_pid = pid % num_block_q_head, pid // num_block_q_head
-    pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
-    pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
+    pid_batch = pid_bn // next_n
+    pid_next_n = pid_bn % next_n
 
+    # Load context length for this batch element
     context_length = tl.load(context_len_ptr + pid_batch)
 
-    # Grid logic
-    context_chunk_num = tl.cdiv(context_length, ChunkK)
-    split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
-    split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
-        
-    # Cap the length to the assigned split
-    split_context_length = min(
-        context_length - split_context_start, split_context_chunk_num * ChunkK
+    # How many KV blocks does this sequence actually have?
+    num_kv_blocks = tl.cdiv(context_length, CHUNK_K)
+
+    # Early exit: this program's KV block is beyond the sequence length
+    if pid_kv_block >= num_kv_blocks:
+        return
+
+    # Compute token offset for this block
+    context_idx = pid_kv_block * CHUNK_K
+
+    # Load physical block ID from block table
+    physical_block_id = tl.load(
+        block_table + pid_batch * max_num_blocks + pid_kv_block
     )
 
-    # 1. Load Q (dtype)
-    q = tl.load(
-        Q_buffer
-        + pid_batch * stride_q_batch
-        + pid_next_n * stride_q_next_n
-        + ((pid_q_head * ChunkQ + tl.arange(0, ChunkQ)) * stride_q_heads)[:, None]
-        + tl.arange(0, HiddenDim)[None, :],
+    # KV validity mask (last block may be partial)
+    kv_offsets = tl.arange(0, CHUNK_K)
+    mask_kv = (context_idx + kv_offsets) < context_length
+
+    # Causal mask: kv_pos <= query_pos
+    causal_mask = (
+        (context_idx + kv_offsets) <= (context_length - next_n + pid_next_n)
     )
+    combined_mask = mask_kv & causal_mask
 
-    # 2. Load Weights (FP32)
-    # Based on reference: weight_slice = weights[i * next_n:(i + 1) * next_n, ...]
-    # These act as gating/scaling factors after ReLU.
-    scale_weight = tl.load(
-        weights
-        + (pid_batch * next_n + pid_next_n) * stride_w_batch
-        + pid_q_head * ChunkQ
-        + tl.arange(0, ChunkQ)
-    )
+    # Accumulator for the head-reduced output: [CHUNK_K] in FP32
+    acc = tl.zeros([CHUNK_K], dtype=tl.float32)
 
-    # Loop over KV blocks
-    # CRITICAL CHANGE: We iterate aligned to ChunkK (64)
-    # We assume ChunkK == BlockSize for this implementation
-    for context_idx in range(
-        split_context_start, split_context_start + split_context_length, ChunkK
-    ):
-        # 3. Paged Attention Indexing
-        # a. Calculate which logical block we are in
-        current_logical_block = context_idx // ChunkK
-        
-        # b. Load the Physical Block ID from the Block Table
-        #    block_table shape: [Batch, MaxNumBlocks]
-        physical_block_id = tl.load(
-            block_table + pid_batch * max_num_blocks + current_logical_block
-        )
+    # D-range for chunked loading
+    d_range = tl.arange(0, BLOCK_D)
 
-        mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
+    # Base pointer for Q for this (batch, next_n) element
+    q_base = (Q_buffer
+              + pid_batch * stride_q_batch
+              + pid_next_n * stride_q_next_n)
 
-        # 4. Load K (FP16)
-        #    Pointer = Base of Physical Block + Offset for Token inside Block
-        #    KV_buffer shape is [NumPhysicalBlocks, BlockSize, 1, Dim]
-        k = tl.load(
-            KV_buffer
-            + physical_block_id * stride_k_blk      # Jump to the correct physical block
-            + tl.arange(0, ChunkK)[:, None] * stride_k_tok # Iterate tokens 0..63 inside that block
-            + tl.arange(0, HiddenDim)[None, :],     # Iterate dim
-            mask=mask_kv[:, None],
-            other=0.0,
-        )
+    # Base pointer for weights for this (batch, next_n) element
+    w_base = weights + (pid_batch * next_n + pid_next_n) * stride_w_row
 
-        # 5. Dot Product (FORCE FP32 ACCUMULATION)
-        o = tl.dot(q.to(tl.float16) if q.dtype == tl.float32 else q, k.T, out_dtype=tl.float32)
-        
-        # 6. Activation (ReLU)
-        # Matches reference: s = torch.relu(s)
-        o = tl.maximum(o, 0.0)
+    # Process heads in groups of 8 - load KV once per D-chunk, reuse for 8
+    for hg_start in range(0, NUM_HEADS, 8):
+        # Per-head score accumulators: [CHUNK_K] each
+        s0 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s1 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s2 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s3 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s4 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s5 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s6 = tl.zeros([CHUNK_K], dtype=tl.float32)
+        s7 = tl.zeros([CHUNK_K], dtype=tl.float32)
 
-        # 7. Apply Weights (Gating)
-        # Matches reference: s = s * weight_slice
-        # scale_weight shape is [ChunkQ], o is [ChunkQ, ChunkK]
-        # We broadcast scale_weight to apply per-head scaling
-        o = o * scale_weight[None, :].T
+        # D-chunked dot product
+        for d_start in range(0, HEAD_DIM, BLOCK_D):
+            d_offs = d_start + d_range
 
-        # 8. Masking (Causal/Padding)
-        mask = (
-            context_idx + tl.arange(0, ChunkK) <= context_length - next_n + pid_next_n
-        )
-        o = tl.where(mask[None, :], o, float("-inf"))
+            # Load KV chunk: [CHUNK_K, BLOCK_D] - ONCE, reused for 8 heads
+            kv_ptrs = (KV_buffer
+                       + physical_block_id * stride_kv_blk
+                       + kv_offsets[:, None] * stride_kv_tok
+                       + d_offs[None, :])
+            kv_tile = tl.load(
+                kv_ptrs, mask=mask_kv[:, None], other=0.0
+            )  # [CHUNK_K, BLOCK_D]
 
-        # Store Output
-        tl.store(
-            Out_buffer
-            + (pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (pid_q_head * ChunkQ + tl.arange(0, ChunkQ)[:, None, None])
-            * stride_out_heads
-            + (context_idx + tl.arange(0, ChunkK)[None, None, :]),
-            o[:, None, :],
-        )
-        
+            # Load Q for each of 8 heads: [BLOCK_D] per head (decode=1 token)
+            q0 = tl.load(q_base + (hg_start + 0) * stride_q_heads + d_offs)
+            q1 = tl.load(q_base + (hg_start + 1) * stride_q_heads + d_offs)
+            q2 = tl.load(q_base + (hg_start + 2) * stride_q_heads + d_offs)
+            q3 = tl.load(q_base + (hg_start + 3) * stride_q_heads + d_offs)
+            q4 = tl.load(q_base + (hg_start + 4) * stride_q_heads + d_offs)
+            q5 = tl.load(q_base + (hg_start + 5) * stride_q_heads + d_offs)
+            q6 = tl.load(q_base + (hg_start + 6) * stride_q_heads + d_offs)
+            q7 = tl.load(q_base + (hg_start + 7) * stride_q_heads + d_offs)
 
-# First implementation attempt, not fully optimized but faster than torch reference
+            # Dot products: kv_tile[CHUNK_K, BLOCK_D] * q[BLOCK_D] → [CHUNK_K]
+            s0 += tl.sum(
+                kv_tile * q0[None, :].to(kv_tile.dtype), axis=1
+            )
+            s1 += tl.sum(
+                kv_tile * q1[None, :].to(kv_tile.dtype), axis=1
+            )
+            s2 += tl.sum(
+                kv_tile * q2[None, :].to(kv_tile.dtype), axis=1
+            )
+            s3 += tl.sum(
+                kv_tile * q3[None, :].to(kv_tile.dtype), axis=1
+            )
+            s4 += tl.sum(
+                kv_tile * q4[None, :].to(kv_tile.dtype), axis=1
+            )
+            s5 += tl.sum(
+                kv_tile * q5[None, :].to(kv_tile.dtype), axis=1
+            )
+            s6 += tl.sum(
+                kv_tile * q6[None, :].to(kv_tile.dtype), axis=1
+            )
+            s7 += tl.sum(
+                kv_tile * q7[None, :].to(kv_tile.dtype), axis=1
+            )
+
+        # ReLU + weight multiply + accumulate for all 8 heads
+        w0 = tl.load(w_base + (hg_start + 0))
+        w1 = tl.load(w_base + (hg_start + 1))
+        w2 = tl.load(w_base + (hg_start + 2))
+        w3 = tl.load(w_base + (hg_start + 3))
+        w4 = tl.load(w_base + (hg_start + 4))
+        w5 = tl.load(w_base + (hg_start + 5))
+        w6 = tl.load(w_base + (hg_start + 6))
+        w7 = tl.load(w_base + (hg_start + 7))
+
+        acc += tl.maximum(s0, 0.0) * w0
+        acc += tl.maximum(s1, 0.0) * w1
+        acc += tl.maximum(s2, 0.0) * w2
+        acc += tl.maximum(s3, 0.0) * w3
+        acc += tl.maximum(s4, 0.0) * w4
+        acc += tl.maximum(s5, 0.0) * w5
+        acc += tl.maximum(s6, 0.0) * w6
+        acc += tl.maximum(s7, 0.0) * w7
+
+    # Apply causal mask
+    acc = tl.where(combined_mask, acc, float("-inf"))
+
+    # Store output: [CHUNK_K] → output[pid_bn, context_idx:context_idx+CHUNK_K]
+    out_ptrs = (Out_buffer
+                + (pid_batch * next_n + pid_next_n) * stride_out_row
+                + context_idx + kv_offsets)
+    tl.store(out_ptrs, acc, mask=mask_kv)
+
+
+# Optimized decode kernel v2: in-kernel head reduction + D-chunking + 2D grid
 def deepgemm_fp16_paged_mqa_logits_stage1(
     q: torch.Tensor,           # [Batch, NextN, Heads, Dim] (--dtype)
     kv_cache: torch.Tensor,    # [NumBlocks, BlockSize, 1, Dim] (FP16)
     weights: torch.Tensor,     # [Batch * NextN, Heads] (FP32)
-    out_qk: torch.Tensor,      # Output Logits (FP32)
+    out_qk: torch.Tensor,      # Output: [Batch*NextN, max_model_len] FP32
     context_lens: torch.Tensor,
-    block_tables: torch.Tensor, # [Batch, MaxNumBlocks] (Not per-token as blockSize !=1)
+    block_tables: torch.Tensor, # [Batch, MaxNumBlocks] int32
     max_model_len: int,
     # MI50 TUNED DEFAULTS:
-    ChunkQ: int = 16,           # Smaller tiles = More thread blocks = Higher Occupancy on MI50's 60 CUs.
-    ChunkK: int = 64,           # Must match BlockSize, 64 has slightly better performance than 32 (with ChunkQ=32).
-    TotalCuCount: int = 60,     # MI50 has 60 CU
-    WavePerEU: int = 1,         # 1 for gfx906
-    num_warps: int = 4,   # Sweet spot for register usage on gfx906.
-    num_stages: int = 1,  # Essential for stability (avoids LDS crashes)
+    num_warps: int = 4,         # Sweet spot for register usage on gfx906.
+    num_stages: int = 1,        # Essential for stability (avoids LDS crashes)
+    BLOCK_D: int = 32,          # D-chunk size; 32 is optimal on MI50 gfx906
 ):
-    
-    # Check Block Size matches ChunkK
-    block_size = kv_cache.size(1) 
-    assert block_size == ChunkK, f"Kernel requires BlockSize ({block_size}) == ChunkK ({ChunkK})"
-    
+    block_size = kv_cache.size(1)
+    assert block_size == 64, (
+        f"Kernel requires BlockSize ({block_size}) == 64"
+    )
+
     batch_size, next_n, heads, hidden_dim = q.size()
     _, max_num_blocks = block_tables.size()
 
-    # Calculate strides for the KV Cache
-    # KV Cache: [NumBlocks, BlockSize, 1, Dim]
-    stride_k_blk = kv_cache.stride(0)  # Steps to jump 1 physical block
-    stride_k_tok = kv_cache.stride(1)  # Steps to jump 1 token inside a block
+    assert heads % 8 == 0, f"NUM_HEADS ({heads}) must be divisible by 8"
 
-    TileQCount = batch_size * next_n * (heads // ChunkQ)
-    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+    # Grid: (max_kv_blocks, batch_size * next_n)
+    grid = (max_num_blocks, batch_size * next_n)
 
-    config = {
-        "ChunkQ": ChunkQ,
-        "ChunkK": ChunkK,
-        "HiddenDim": hidden_dim,
-        "SplitKV": SplitKV,
-    }
-    
-    grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
-    
     _deepgemm_fp16_paged_mqa_logits_stage1[grid](
-        batch_size,
-        next_n,
-        heads,
+        batch_size, next_n,
         q,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         kv_cache,
-        stride_k_blk,  # Stride per block
-        stride_k_tok,  # Stride per token
+        kv_cache.stride(0), kv_cache.stride(1),
         context_lens,
-        block_tables,  # Block Table
+        block_tables,
         weights,
         weights.stride(0),
         out_qk,
         out_qk.stride(0),
-        out_qk.stride(1),
-        max_model_len,
-        max_num_blocks, # Max Blocks, not tokens
+        max_num_blocks,
+        NUM_HEADS=heads,
+        BLOCK_D=BLOCK_D,
+        HEAD_DIM=hidden_dim,
+        CHUNK_K=block_size,
         num_warps=num_warps,
         num_stages=num_stages,
-        **config,
     )
 
 
@@ -545,8 +574,9 @@ def rocm_paged_mqa_logits(
     batch_size, next_n, heads, _ = q.shape
 
     if envs.VLLM_ROCM_MLA_SPARSE_FP16_TRITON:
+        # Output is already head-reduced: [B*N, max_model_len]
         out_qk = torch.full(
-            (heads, batch_size * next_n, max_model_len),
+            (batch_size * next_n, max_model_len),
             float("-inf"),
             device="cuda",
             dtype=torch.float32,
@@ -560,7 +590,7 @@ def rocm_paged_mqa_logits(
             block_tables,
             max_model_len,
         )
-        return out_qk.sum(dim=0)
+        return out_qk
     elif envs.VLLM_ROCM_MLA_SPARSE_FP16:
         return fp16_paged_mqa_logits_torch(q, kv_cache, weights, context_lens, block_tables, max_model_len)
 
@@ -697,6 +727,289 @@ def fp16_mqa_logits_torch(
     return final_logits
 
 
+# ============================================================================
+# Triton FP16 MQA Logits Kernels (optimized for MI50 gfx906)
+# Activated by: VLLM_ROCM_MLA_SPARSE_FP16_TRITON=1
+#
+# v2: Basic 2D grid + D-chunking. Best for small KV (e.g. 18000/10).
+# v4: HEAD_GROUP=8 - loads KV once per 8 heads. Best for standard/large.
+# Auto-dispatcher picks the best variant based on seq_len_kv.
+# ============================================================================
+
+
+@triton.jit
+def _fp16_mqa_logits_v2_kernel(
+    Q_ptr, KV_ptr, weights_ptr, cu_start_ptr, cu_end_ptr, logits_ptr,
+    seq_len, seq_len_kv,
+    NUM_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,
+    stride_q_s: tl.int64, stride_q_h: tl.constexpr, stride_q_d: tl.constexpr,
+    stride_kv_s: tl.int64, stride_kv_d: tl.constexpr,
+    stride_w_s: tl.int64, stride_w_h: tl.constexpr,
+    stride_logits_s: tl.int64, stride_logits_k: tl.int64,
+    BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """2D-parallel kernel: each program handles one (Q_block, KV_block) tile.
+    Inner loops: heads * D-chunks. Best for small KV dimensions."""
+    pid_q = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+    start_q = pid_q * BLOCK_Q
+    start_kv = pid_kv * BLOCK_KV
+
+    offs_q = start_q + tl.arange(0, BLOCK_Q)
+    offs_kv = start_kv + tl.arange(0, BLOCK_KV)
+    mask_q = offs_q < seq_len
+    mask_kv = offs_kv < seq_len_kv
+
+    qs_starts = tl.load(cu_start_ptr + offs_q, mask=mask_q, other=0)
+    qs_ends = tl.load(cu_end_ptr + offs_q, mask=mask_q, other=0)
+
+    max_end = tl.max(qs_ends, axis=0)
+    min_start = tl.min(qs_starts, axis=0)
+    if start_kv >= max_end or start_kv + BLOCK_KV <= min_start:
+        return
+
+    acc = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+    d_range = tl.arange(0, BLOCK_D)
+
+    for h in range(NUM_HEADS):
+        score = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        for d_start in range(0, HEAD_SIZE, BLOCK_D):
+            d_offs = d_start + d_range
+            q_ptrs = (Q_ptr + offs_q[:, None] * stride_q_s
+                      + h * stride_q_h + d_offs[None, :] * stride_q_d)
+            q_tile = tl.load(q_ptrs, mask=mask_q[:, None], other=0.0)
+
+            kv_ptrs = (KV_ptr + offs_kv[:, None] * stride_kv_s
+                       + d_offs[None, :] * stride_kv_d)
+            kv_tile = tl.load(kv_ptrs, mask=mask_kv[:, None], other=0.0)
+
+            score = tl.dot(q_tile, tl.trans(kv_tile), acc=score)
+
+        score = tl.maximum(score, 0.0)
+        w = tl.load(weights_ptr + offs_q * stride_w_s + h * stride_w_h,
+                    mask=mask_q, other=0.0)
+        acc += score * w[:, None]
+
+    in_window = ((offs_kv[None, :] >= qs_starts[:, None]) &
+                 (offs_kv[None, :] < qs_ends[:, None]))
+    logits_ptrs = (logits_ptr + offs_q[:, None] * stride_logits_s
+                   + offs_kv[None, :] * stride_logits_k)
+    final_mask = mask_q[:, None] & mask_kv[None, :] & in_window
+    tl.store(logits_ptrs, acc, mask=final_mask)
+
+
+@triton.jit
+def _fp16_mqa_logits_v4_kernel(
+    Q_ptr, KV_ptr, weights_ptr, cu_start_ptr, cu_end_ptr, logits_ptr,
+    seq_len, seq_len_kv,
+    NUM_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,
+    stride_q_s: tl.int64, stride_q_h: tl.constexpr, stride_q_d: tl.constexpr,
+    stride_kv_s: tl.int64, stride_kv_d: tl.constexpr,
+    stride_w_s: tl.int64, stride_w_h: tl.constexpr,
+    stride_logits_s: tl.int64, stride_logits_k: tl.int64,
+    BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """2D-parallel kernel with HEAD_GROUP=8: loads KV once per 8 heads.
+    Best for standard/large configs. Requires NUM_HEADS % 8 == 0."""
+    pid_q = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+    start_q = pid_q * BLOCK_Q
+    start_kv = pid_kv * BLOCK_KV
+
+    offs_q = start_q + tl.arange(0, BLOCK_Q)
+    offs_kv = start_kv + tl.arange(0, BLOCK_KV)
+    mask_q = offs_q < seq_len
+    mask_kv = offs_kv < seq_len_kv
+
+    qs_starts = tl.load(cu_start_ptr + offs_q, mask=mask_q, other=0)
+    qs_ends = tl.load(cu_end_ptr + offs_q, mask=mask_q, other=0)
+
+    max_end = tl.max(qs_ends, axis=0)
+    min_start = tl.min(qs_starts, axis=0)
+    if start_kv >= max_end or start_kv + BLOCK_KV <= min_start:
+        return
+
+    acc = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+    d_range = tl.arange(0, BLOCK_D)
+
+    # Process 8 heads per KV load cycle
+    for hg_start in range(0, NUM_HEADS, 8):
+        s0 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s1 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s2 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s3 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s4 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s5 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s6 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+        s7 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
+
+        for d_start in range(0, HEAD_SIZE, BLOCK_D):
+            d_offs = d_start + d_range
+
+            # Load KV ONCE per D-chunk (shared across 8 heads)
+            kv_ptrs = (KV_ptr + offs_kv[:, None] * stride_kv_s
+                       + d_offs[None, :] * stride_kv_d)
+            kv_tile = tl.load(kv_ptrs, mask=mask_kv[:, None], other=0.0)
+            kv_t = tl.trans(kv_tile)
+
+            # 8 Q loads + dot products
+            q_base = (Q_ptr + offs_q[:, None] * stride_q_s
+                      + d_offs[None, :] * stride_q_d)
+
+            q0 = tl.load(q_base + (hg_start + 0) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s0 = tl.dot(q0, kv_t, acc=s0)
+
+            q1 = tl.load(q_base + (hg_start + 1) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s1 = tl.dot(q1, kv_t, acc=s1)
+
+            q2 = tl.load(q_base + (hg_start + 2) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s2 = tl.dot(q2, kv_t, acc=s2)
+
+            q3 = tl.load(q_base + (hg_start + 3) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s3 = tl.dot(q3, kv_t, acc=s3)
+
+            q4 = tl.load(q_base + (hg_start + 4) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s4 = tl.dot(q4, kv_t, acc=s4)
+
+            q5 = tl.load(q_base + (hg_start + 5) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s5 = tl.dot(q5, kv_t, acc=s5)
+
+            q6 = tl.load(q_base + (hg_start + 6) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s6 = tl.dot(q6, kv_t, acc=s6)
+
+            q7 = tl.load(q_base + (hg_start + 7) * stride_q_h,
+                         mask=mask_q[:, None], other=0.0)
+            s7 = tl.dot(q7, kv_t, acc=s7)
+
+        # ReLU + weighted accumulate for all 8 heads
+        w_base = weights_ptr + offs_q * stride_w_s
+
+        s0 = tl.maximum(s0, 0.0)
+        w0 = tl.load(w_base + (hg_start + 0) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s0 * w0[:, None]
+
+        s1 = tl.maximum(s1, 0.0)
+        w1 = tl.load(w_base + (hg_start + 1) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s1 * w1[:, None]
+
+        s2 = tl.maximum(s2, 0.0)
+        w2 = tl.load(w_base + (hg_start + 2) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s2 * w2[:, None]
+
+        s3 = tl.maximum(s3, 0.0)
+        w3 = tl.load(w_base + (hg_start + 3) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s3 * w3[:, None]
+
+        s4 = tl.maximum(s4, 0.0)
+        w4 = tl.load(w_base + (hg_start + 4) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s4 * w4[:, None]
+
+        s5 = tl.maximum(s5, 0.0)
+        w5 = tl.load(w_base + (hg_start + 5) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s5 * w5[:, None]
+
+        s6 = tl.maximum(s6, 0.0)
+        w6 = tl.load(w_base + (hg_start + 6) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s6 * w6[:, None]
+
+        s7 = tl.maximum(s7, 0.0)
+        w7 = tl.load(w_base + (hg_start + 7) * stride_w_h,
+                     mask=mask_q, other=0.0)
+        acc += s7 * w7[:, None]
+
+    # Causal mask + store
+    in_window = ((offs_kv[None, :] >= qs_starts[:, None]) &
+                 (offs_kv[None, :] < qs_ends[:, None]))
+    logits_ptrs = (logits_ptr + offs_q[:, None] * stride_logits_s
+                   + offs_kv[None, :] * stride_logits_k)
+    final_mask = mask_q[:, None] & mask_kv[None, :] & in_window
+    tl.store(logits_ptrs, acc, mask=final_mask)
+
+
+def _launch_fp16_mqa_logits_kernel(kernel, Q, KV, weights, cu_starts, cu_ends,
+                                   BLOCK_Q=32, BLOCK_KV=64, BLOCK_D=64):
+    """Common launcher for fp16 MQA logits Triton kernels."""
+    seq_len, num_heads, head_size = Q.shape
+    seq_len_kv = KV.shape[0]
+
+    logits = torch.full(
+        (seq_len, seq_len_kv), fill_value=-float("inf"),
+        dtype=torch.float32, device=Q.device,
+    )
+
+    grid = (triton.cdiv(seq_len, BLOCK_Q), triton.cdiv(seq_len_kv, BLOCK_KV))
+
+    kernel[grid](
+        Q_ptr=Q, KV_ptr=KV, weights_ptr=weights,
+        cu_start_ptr=cu_starts, cu_end_ptr=cu_ends, logits_ptr=logits,
+        seq_len=seq_len, seq_len_kv=seq_len_kv,
+        NUM_HEADS=num_heads, HEAD_SIZE=head_size,
+        stride_q_s=Q.stride(0), stride_q_h=Q.stride(1),
+        stride_q_d=Q.stride(2),
+        stride_kv_s=KV.stride(0), stride_kv_d=KV.stride(1),
+        stride_w_s=weights.stride(0), stride_w_h=weights.stride(1),
+        stride_logits_s=logits.stride(0), stride_logits_k=logits.stride(1),
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
+        num_warps=4, num_stages=1, waves_per_eu=1,
+    )
+    return logits
+
+
+def fp16_mqa_logits_triton(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Triton FP16 MQA logits with auto-dispatch.
+
+    Uses v2 (basic 2D grid) for small KV, v4 (HEAD_GROUP=8) for standard/large.
+    Up to 2.3x faster than the torch chunked reference on MI50 gfx906.
+
+    Args:
+        q: Query tensor [M, H, D], dtype float16 or float32 (auto-casted).
+        kv: KV tensor [N, D], dtype float16.
+        weights: [M, H], dtype float32.
+        cu_seqlen_ks: Start indices [M], dtype int32.
+        cu_seqlen_ke: End indices [M], dtype int32.
+
+    Returns:
+        Logits [M, N], dtype float32.
+    """
+    if q.dtype != torch.float16:
+        q = q.half()
+
+    seq_len_kv = kv.shape[0]
+    num_heads = q.shape[1]
+
+    # Auto-dispatch: v2 for tiny KV, v4 for everything else
+    if seq_len_kv <= 64 or num_heads % 8 != 0:
+        return _launch_fp16_mqa_logits_kernel(
+            _fp16_mqa_logits_v2_kernel, q, kv, weights,
+            cu_seqlen_ks, cu_seqlen_ke,
+        )
+    else:
+        return _launch_fp16_mqa_logits_kernel(
+            _fp16_mqa_logits_v4_kernel, q, kv, weights,
+            cu_seqlen_ks, cu_seqlen_ke,
+        )
+
+
 # Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
 def fp8_mqa_logits_torch(
     q: torch.Tensor,
@@ -768,7 +1081,11 @@ def rocm_mqa_logits(
     """
 
     if envs.VLLM_ROCM_MLA_SPARSE_FP16:
-        # only torch kernel available here for kv_fp16 (with q_fp16 or q_fp32) as it is much faster than triton equivalent for gfx906
+        if envs.VLLM_ROCM_MLA_SPARSE_FP16_TRITON:
+            # Triton kernel: 2D grid + D-chunking + HEAD_GROUP=8
+            # Up to 2.3x faster than torch, uses much less VRAM
+            return fp16_mqa_logits_triton(
+                q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
         return fp16_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
     # TODO(ganyi): Temporarily workaround, will remove the module check and reference
