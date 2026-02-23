@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -79,6 +80,7 @@ def write_zeros_to_output(
 
 @triton.jit
 def fused_moe_kernel_gptq_awq(
+    on_gfx906: tl.constexpr,
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -231,7 +233,7 @@ def fused_moe_kernel_gptq_awq(
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
+    # `accumulator` will be converted back to compute_type (--dtype) after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
@@ -286,10 +288,16 @@ def fused_moe_kernel_gptq_awq(
 
         # We accumulate along the K dimension.
         if has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            if compute_type == tl.float32 and on_gfx906:
+                b = ((b.to(tl.float32) - b_zp) * b_scale).to(tl.float16)
+            else:
+                b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+            if compute_type == tl.float32 and on_gfx906:
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(tl.float16)
+            else:
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        accumulator = tl.dot(a.to(tl.float16) if compute_type == tl.float32 and on_gfx906 else a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -302,7 +310,8 @@ def fused_moe_kernel_gptq_awq(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
+    if not compute_type == tl.float32:
+        accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -686,7 +695,12 @@ def invoke_fused_moe_wna16_triton_kernel(
         )
     )
 
+    # For gfx906 and compute_type == tl.float32: the kernel internally casts to fp16 before tl.dot,
+    # but we still pass compute_type so the OUTPUT is stored correctly.
+    # The accumulator is always fp32 inside the kernel regardless.
+
     fused_moe_kernel_gptq_awq[grid](
+        on_gfx906(),
         A,
         B,
         C,

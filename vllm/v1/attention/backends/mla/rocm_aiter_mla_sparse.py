@@ -249,9 +249,196 @@ class ROCMAiterMLASparseMetadataBuilder(
         return metadata
 
 
-# Take from
+@triton.jit
+def _mla_sparse_vec_kernel(
+    output_ptr, query_ptr, kv_ptr, topk_indices_ptr,
+    stride_out_sq: tl.int64, stride_out_hq: tl.int64,
+    stride_q_sq: tl.int64, stride_q_hq: tl.int64,
+    stride_kv_skv: tl.int64,
+    stride_idx_sq: tl.int64,
+    scale,
+    s_kv: tl.int32,
+    D_QK: tl.constexpr,
+    D_V: tl.constexpr,
+    TOPK: tl.constexpr,
+    D_SCORE_CHUNK: tl.constexpr,
+    D_V_CHUNK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    pid_token = tl.program_id(0)
+    pid_hb = tl.program_id(1)
+    pid_dv = tl.program_id(2)
+
+    head_start = pid_hb * BLOCK_M
+    dv_start = pid_dv * D_V_CHUNK
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_dk = tl.arange(0, D_SCORE_CHUNK)
+    offs_dv = tl.arange(0, D_V_CHUNK)
+    offs_tk = tl.arange(0, TILE_K)
+
+    q_base = query_ptr + pid_token * stride_q_sq
+    idx_base = topk_indices_ptr + pid_token * stride_idx_sq
+
+    M_val = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L_val = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D_V_CHUNK], dtype=tl.float32)
+
+    for t_start in range(0, TOPK, TILE_K):
+        t_mask = (t_start + offs_tk) < TOPK
+        kv_pos = tl.load(idx_base + t_start + offs_tk, mask=t_mask, other=0)
+        valid = t_mask & (kv_pos >= 0) & (kv_pos < s_kv)
+        kv_pos = tl.where(valid, kv_pos, 0)
+
+        S = tl.zeros([BLOCK_M, TILE_K], dtype=tl.float32)
+
+        for d_start in range(0, D_QK, D_SCORE_CHUNK):
+            d_offs = d_start + offs_dk
+            q_ptrs = (q_base
+                      + (head_start + offs_m[:, None]) * stride_q_hq
+                      + d_offs[None, :])
+            Q_d = tl.load(q_ptrs)
+
+            k_ptrs = (kv_ptr
+                      + kv_pos[None, :] * stride_kv_skv
+                      + d_offs[:, None])
+            K_d = tl.load(k_ptrs, mask=valid[None, :], other=0.0)
+
+            S = tl.dot(Q_d, K_d, acc=S)
+
+        S *= scale
+        S = tl.where(valid[None, :], S, float("-inf"))
+
+        m_j = tl.max(S, axis=1)
+        m_new = tl.maximum(M_val, m_j)
+        m_new = tl.where(m_new > float("-inf"), m_new, 0.0)
+
+        alpha = tl.exp(M_val - m_new)
+        P = tl.exp(S - m_new[:, None])
+        l_j = tl.sum(P, axis=1)
+
+        acc = acc * alpha[:, None]
+        L_val = L_val * alpha + l_j
+        M_val = m_new
+
+        v_ptrs = (kv_ptr
+                  + kv_pos[:, None] * stride_kv_skv
+                  + (dv_start + offs_dv)[None, :])
+        V = tl.load(v_ptrs, mask=valid[:, None], other=0.0)
+
+        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+
+    acc = acc / L_val[:, None]
+
+    out_ptrs = (output_ptr
+                + pid_token * stride_out_sq
+                + (head_start + offs_m[:, None]) * stride_out_hq
+                + (dv_start + offs_dv)[None, :])
+    tl.store(out_ptrs, acc.to(output_ptr.type.element_ty))
+
+
+def triton_mla_sparse_vec(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    BLOCK_M: int = 16,
+    TILE_K: int = 32,
+    D_V_CHUNK: int = 256,
+    num_warps: int = 4,
+) -> torch.Tensor:
+    s_q, h_q, d_qk = q.shape
+    s_kv = kv.shape[0]
+    kv_flat = kv.view(s_kv, d_qk).contiguous()
+
+    if indices.ndim == 3:
+        indices = indices[:, 0, :]
+    indices = indices.to(torch.int32).contiguous()
+    topk = indices.shape[1]
+
+    out = torch.empty((s_q, h_q, d_v), device=q.device, dtype=q.dtype)
+
+    D_SCORE_CHUNK = 64
+    num_hb = h_q // BLOCK_M
+    num_dv = d_v // D_V_CHUNK
+
+    grid = (s_q, num_hb, num_dv)
+
+    _mla_sparse_vec_kernel[grid](
+        output_ptr=out, query_ptr=q, kv_ptr=kv_flat,
+        topk_indices_ptr=indices,
+            stride_out_sq=out.stride(0), stride_out_hq=out.stride(1),
+            stride_q_sq=q.stride(0), stride_q_hq=q.stride(1),
+            stride_kv_skv=kv_flat.stride(0),
+            stride_idx_sq=indices.stride(0),
+            scale=sm_scale, s_kv=s_kv,
+            D_QK=d_qk, D_V=d_v, TOPK=topk,
+            D_SCORE_CHUNK=D_SCORE_CHUNK,
+            D_V_CHUNK=D_V_CHUNK, BLOCK_M=BLOCK_M, TILE_K=TILE_K,
+            num_warps=num_warps, num_stages=1,
+        )
+    return out
+
+
+# Inspired from
 # https://github.com/deepseek-ai/FlashMLA/blob/082094b793fcc7452977d0a71a00e266a2e3061e/tests/ref.py
 def reference_mla_sparse_prefill(
+    q: torch.Tensor,       # [s_q, h_q, d_qk] in kv dtype
+    kv: torch.Tensor,      # [total_kv, 1, d_qk]
+    indices: torch.Tensor, # [s_q, 1, topk]
+    sm_scale: float,
+    d_v: int,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    #GPU reference that chunks over QUERY tokens to avoid OOM.
+    #Memory per chunk: chunk_size * topk * d_qk * 4 bytes (FP32)
+    #With chunk_size=512, topk=2048, d_qk=576:
+    # 512 * 2048 * 576 * 4 = 2416 MB (safe on 32GB GPU)
+
+    indices = indices[:, 0, :]  # [s_q, topk]
+    topk = indices.shape[-1]
+    s_kv = kv.shape[0]
+    s_q, h_q, d_qk = q.shape  # [s_q, h_q, d_qk]
+
+    out = torch.empty(s_q, h_q, d_v, device=q.device, dtype=kv.dtype)
+    
+    for start in range(0, s_q, chunk_size):
+        end = min(start + chunk_size, s_q)
+
+        idx_chunk = indices[start:end]  # [cs, topk]
+
+        # Mark invalid indices (-1 or out-of-bounds)
+        invalid_mask = (idx_chunk < 0) | (idx_chunk >= s_kv) # [s_q, topk]
+        idx_chunk[invalid_mask] = 0
+
+        # Gather: [cs, topk, d_qk] this is the memory-critical step
+        gathered_kv = kv.index_select(dim=0, index=idx_chunk.flatten()).reshape(end-start, topk, d_qk)  # [cs, topk, d_qk]
+
+        if kv.dtype == torch.float32:
+            P = q[start:end] @ gathered_kv.transpose(1, 2) # [s_q, h_q, topk]
+        else: # q and kv are both fp16 or bf16
+            P = (q[start:end] @ gathered_kv.transpose(1, 2)).float() # 16 bits matmul for performance
+    
+        P.masked_fill_(invalid_mask.unsqueeze(1), float("-inf"))
+        P *= sm_scale
+        
+        orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
+        s_for_o = torch.exp(P - orig_lse.unsqueeze(-1)) # [cs, h_q, topk]
+        
+        if kv.dtype == torch.float32:
+            out[start:end] = s_for_o @ gathered_kv[..., :d_v]
+        else:
+            out[start:end] = s_for_o.to(kv.dtype) @ gathered_kv[..., :d_v]
+
+        # Free gather tensor immediately to reduce memory pressure
+        del gathered_kv, P
+
+    return out # in kv dtype
+
+
+def mla_sparse(
     q: torch.Tensor, # in kv dtype
     kv: torch.Tensor, 
     indices: torch.Tensor, 
@@ -261,30 +448,23 @@ def reference_mla_sparse_prefill(
     """
     Returns:
     - o: [s_q, h_q, dv]
+    
+    Smart dispatch implementation to avoid OOM on MI50 (gfx906) while maximizing speed.
     """
-    topk = indices.shape[-1]
-    s_kv = kv.shape[0]
-    s_q, h_q, d_qk = q.shape  # [s_q, h_q, d_qk]
-    indices = indices[:, 0, :]  # [s_q, topk]
-    invalid_mask = (indices < 0) | (indices >= s_kv)    # [s_q, topk]
-    indices[invalid_mask] = 0
-
-    gathered_kv = kv.index_select(dim=0, index=indices.flatten()).reshape(s_q, topk, d_qk)   # [s_q, topk, d_qk]
-    if kv.dtype == torch.float32:
-        P = q @ gathered_kv.transpose(1, 2) # [s_q, h_q, topk]
-    else: # q and kv are both fp16 or bf16
-        P = (q @ gathered_kv.transpose(1, 2)).float() # 16 bits matmul for performance
-    P.masked_fill_(invalid_mask.unsqueeze(1), float("-inf"))
-    P *= sm_scale
-
-    orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
-    s_for_o = torch.exp(P - orig_lse.unsqueeze(-1))
-    if kv.dtype == torch.float32:
-        out = s_for_o @ gathered_kv[..., :d_v]
+    s_q = q.shape[0]
+    
+    if s_q == 1:
+        # Decode: no VRAM risk, maximize rocBLAS speed (effectively unchunked)
+        return reference_mla_sparse_prefill(q, kv, indices, sm_scale, d_v)
     else:
-        out = s_for_o.to(kv.dtype) @ gathered_kv[..., :d_v]
-
-    return out # in kv dtype
+        # Prefill: VRAM is the primary concern for large batches.
+        # We can route to Triton if specifically instructed.
+        if envs.VLLM_ROCM_MLA_SPARSE_FP16_TRITON:
+            return triton_mla_sparse_vec(q, kv, indices, sm_scale, d_v)
+        else:
+            # By default, use chunked PyTorch. 
+            # Note: 512 is the sweet-spot for MI50 rocBLAS performance!
+            return reference_mla_sparse_prefill(q, kv, indices, sm_scale, d_v, chunk_size=512)
 
 
 class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata]):
@@ -329,6 +509,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         topk_indices = topk_indices.view(num_tokens, 1, -1)
 
         if envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            # Force ref Torch (instead of using mla_sparse) as triton is still slower than chunked torch (1.5 vs 8 TFLOPS) and not steady enough (HSA_STATUS_ERROR_OUT_OF_RESOURCES when running with max-num-batched-tokens 8192)
             output = reference_mla_sparse_prefill(
                 q, kv_c_and_k_pe_cache, topk_indices,
                 self.softmax_scale, self.kv_lora_rank,
