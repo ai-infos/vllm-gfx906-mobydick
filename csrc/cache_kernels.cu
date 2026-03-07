@@ -24,6 +24,8 @@
 typedef __hip_bfloat16 __nv_bfloat16;
 #endif
 
+#include <type_traits> // for std::remove_cv_t
+
 #if defined(__gfx942__)
 constexpr float kFp8ScaleDivisor = 224.f;
 #else
@@ -131,7 +133,13 @@ struct CopyWithScaleOp {
 
   __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      dst = static_cast<OutT>(src);
+      if constexpr (std::is_same<OutT, InT>::value) {
+        dst = static_cast<OutT>(src);
+      } else {
+        // Cross-type conversion (e.g., float -> half, bf16 -> half)
+        __half h = __float2half(static_cast<float>(src));
+        dst = *reinterpret_cast<OutT*>(&h);
+      }
     } else {
       dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
     }
@@ -318,7 +326,13 @@ __global__ void concat_and_cache_mla_kernel(
       const int64_t dst_idx =
           block_idx * block_stride + block_offset * entry_stride + i + offset;
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst[dst_idx] = src[src_idx];
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          dst[dst_idx] = src[src_idx];
+        } else {
+          // Cross-type conversion (e.g., float -> half, bf16 -> half)
+          __half h = __float2half(static_cast<float>(src[src_idx]));
+          dst[dst_idx] = *reinterpret_cast<cache_t*>(&h);
+        }
       } else {
         dst[dst_idx] =
             fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);
@@ -883,8 +897,20 @@ __global__ void gather_and_maybe_dequant_cache(
 #pragma unroll
     for (int idx = threadIdx.x; idx < vec_iter_cnt; idx += CTA_SIZE) {
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        reinterpret_cast<stype*>(dst_)[idx] =
-            static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          reinterpret_cast<stype*>(dst_)[idx] =
+              static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+        } else {
+          // Cross-type dequant (e.g., half cache -> float/bf16 dst)
+          ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
+          stype store_val;
+#pragma unroll
+          for (int j = 0; j < vec_size; ++j) {
+            __half h = *reinterpret_cast<const __half*>(&loaded_val.val[j]);
+            store_val.val[j] = static_cast<scalar_t>(__half2float(h));
+          }
+          reinterpret_cast<stype*>(dst_)[idx] = store_val;
+        }
       } else {
         ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
         stype store_val;
@@ -903,7 +929,12 @@ __global__ void gather_and_maybe_dequant_cache(
 #pragma unroll
     for (int idx = threadIdx.x; idx < tail_cnt; idx += CTA_SIZE) {
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst_[idx] = static_cast<scalar_t>(src_[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          dst_[idx] = static_cast<scalar_t>(src_[idx]);
+        } else {
+          __half h = *reinterpret_cast<const __half*>(&src_[idx]);
+          dst_[idx] = static_cast<scalar_t>(__half2float(h));
+        }
       } else {
         dst_[idx] =
             fp8::scaled_convert<scalar_t, cache_t, kv_dt>(src_[idx], *scale);
@@ -1130,6 +1161,154 @@ __global__ void cp_gather_cache(
     }
   }
 }
+
+// -------------------------------------------------------------------------
+// LOCAL VECTOR HELPERS
+// -------------------------------------------------------------------------
+
+template<typename T, int N>
+struct BuiltinVec;
+
+template<> struct BuiltinVec<float, 4> { using Type = float4; };
+template<> struct BuiltinVec<uint16_t, 4> { using Type = float2; };
+template<> struct BuiltinVec<at::Half, 4> { using Type = float2; };
+
+// Helper to cast pointers for vectorized loads.
+// FIX: We use std::remove_cv_t to handle 'const uint16_t' correctly.
+template<typename T, int N>
+__device__ __forceinline__ typename BuiltinVec<std::remove_cv_t<T>, N>::Type* vec_ptr(T* ptr) {
+    using NonConstT = std::remove_cv_t<T>;
+    return reinterpret_cast<typename BuiltinVec<NonConstT, N>::Type*>(const_cast<NonConstT*>(ptr));
+}
+
+// -------------------------------------------------------------------------
+// Kernel 1: Indexer and Cache (Write K to Cache)
+// -------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void indexer_k_cache_fp16_kernel(
+    const scalar_t* __restrict__ k,          
+    uint16_t* __restrict__ kv_cache,         
+    const int64_t* __restrict__ slot_mapping,
+    const int head_dim,
+    const int cache_block_size,
+    const int cache_stride) {
+    
+    constexpr int VEC_SIZE = 4;
+    using CacheVecType = typename BuiltinVec<uint16_t, VEC_SIZE>::Type;
+
+    const int64_t token_idx = blockIdx.x;
+    const int64_t head_dim_idx = (blockIdx.y * blockDim.y * blockDim.x +
+                                threadIdx.y * blockDim.x + threadIdx.x) * VEC_SIZE;
+
+    if (head_dim_idx >= head_dim) return;
+
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if (slot_idx < 0) return;
+
+    const int64_t block_idx = slot_idx / cache_block_size;
+    const int64_t block_offset = slot_idx % cache_block_size;
+
+    // 1. Vectorized Load
+    using InputVecType = typename BuiltinVec<scalar_t, VEC_SIZE>::Type;
+    InputVecType k_val_vec = *vec_ptr<const scalar_t, VEC_SIZE>(&k[token_idx * head_dim + head_dim_idx]);
+    const scalar_t* k_val_ptr = reinterpret_cast<const scalar_t*>(&k_val_vec);
+
+    // 2. Prepare Destination Offset
+    const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
+                               block_offset * head_dim + head_dim_idx;
+
+    // 3. Convert and Store
+    if constexpr (std::is_same<scalar_t, at::Half>::value) {
+        // Direct vector store
+        *vec_ptr<uint16_t, VEC_SIZE>(&kv_cache[dst_offset]) = 
+            *reinterpret_cast<CacheVecType*>(&k_val_vec);
+    } else {
+        // Float -> Half conversion
+        union {
+            CacheVecType vec;
+            uint16_t arr[VEC_SIZE];
+        } output_buffer;
+
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; i++) {
+            // FIX: Store result in temporary var before casting to avoid r-value address error
+            __half temp_half = __float2half(k_val_ptr[i]);
+            output_buffer.arr[i] = *reinterpret_cast<uint16_t*>(&temp_half);
+        }
+        
+        *vec_ptr<uint16_t, VEC_SIZE>(&kv_cache[dst_offset]) = output_buffer.vec;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Kernel 2: Gather (Read K from Cache)
+// -------------------------------------------------------------------------
+template <typename scalar_t, int BLOCK_Y_SIZE>
+__global__ void cp_gather_indexer_k_cache_fp16_kernel(
+    const uint16_t* __restrict__ kv_cache,   
+    scalar_t* __restrict__ dst_k,            
+    const int* __restrict__ block_table,     
+    const int* __restrict__ cu_seq_lens,     
+    const int batch_size,
+    const int64_t token_stride,
+    const int64_t head_dim,
+    const int64_t block_stride,
+    const int64_t cache_block_size,
+    const int num_blocks,
+    const int num_tokens) {
+    
+    constexpr int VEC_SIZE = 4;
+    using DstVecType = typename BuiltinVec<scalar_t, VEC_SIZE>::Type;
+    using CacheVecType = typename BuiltinVec<uint16_t, VEC_SIZE>::Type;
+
+    const int token_idx = blockIdx.x * blockDim.y + threadIdx.y;
+    const int head_idx = (blockIdx.y * blockDim.x + threadIdx.x) * VEC_SIZE;
+
+    __shared__ int batch_idx[BLOCK_Y_SIZE];
+    for (int iter = 0; iter < cuda_utils::ceil_div(batch_size, int(blockDim.x)); iter++) {
+        int tid = iter * blockDim.x + threadIdx.x;
+        if (tid < batch_size) {
+            const int seq_start = cu_seq_lens[tid];
+            const int seq_end = cu_seq_lens[tid + 1];
+            if (token_idx >= seq_start && token_idx < seq_end) {
+                batch_idx[threadIdx.y] = tid;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (head_idx >= head_dim || token_idx >= num_tokens) return;
+
+    const int inbatch_seq_idx = token_idx - cu_seq_lens[batch_idx[threadIdx.y]];
+    const int block_idx_val = block_table[batch_idx[threadIdx.y] * num_blocks +
+                                        inbatch_seq_idx / cache_block_size];
+    
+    const int64_t src_offset = block_idx_val * block_stride + 
+                               (inbatch_seq_idx % cache_block_size) * head_dim + head_idx;
+    const int64_t dst_offset = token_idx * token_stride + head_idx;
+
+    // Load from Cache
+    CacheVecType loaded_vec = *vec_ptr<const uint16_t, VEC_SIZE>(&kv_cache[src_offset]);
+    const uint16_t* loaded_raw = reinterpret_cast<const uint16_t*>(&loaded_vec);
+
+    if constexpr (std::is_same<scalar_t, at::Half>::value) {
+        *vec_ptr<scalar_t, VEC_SIZE>(&dst_k[dst_offset]) = *reinterpret_cast<DstVecType*>(&loaded_vec);
+    } else {
+        union {
+            DstVecType vec;
+            scalar_t arr[VEC_SIZE];
+        } out_buffer;
+
+        #pragma unroll
+        for(int i=0; i<VEC_SIZE; i++) {
+            // FIX: Reinterpret load safely
+            __half temp_half = *reinterpret_cast<const __half*>(&loaded_raw[i]);
+            out_buffer.arr[i] = __half2float(temp_half);
+        }
+        *vec_ptr<scalar_t, VEC_SIZE>(&dst_k[dst_offset]) = out_buffer.vec;
+    }
+}
+
 }  // namespace vllm
 
 // Macro to dispatch the kernel based on the data type.
@@ -1364,4 +1543,98 @@ void cp_gather_indexer_k_quant_cache(
   } else {
     CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(32);
   }
+}
+
+// No quant_block_size needed, but kept in signature if you want to maintain API compatibility
+// or removed if you clean up the python side too. Here I simplified it.
+void indexer_k_cache_fp16(
+    torch::Tensor& k,               // [num_tokens, head_dim]
+    torch::Tensor& kv_cache,        // [num_blocks, block_size, cache_stride]
+    torch::Tensor& slot_mapping)    // [num_tokens]
+{
+    int num_tokens = k.size(0);
+    int head_dim = k.size(1);
+    int cache_block_size = kv_cache.size(1);
+    int cache_stride = kv_cache.size(2);
+
+    // Validate inputs
+    TORCH_CHECK(k.is_cuda(), "k must be on CUDA/ROCm");
+    TORCH_CHECK(kv_cache.is_cuda(), "kv_cache must be on CUDA/ROCm");
+    
+    // For MI50 optimization, we enforce kv_cache to be Half (Float16)
+    // We don't check k.dtype() rigorously here, we dispatch based on it.
+
+    constexpr int VEC_SIZE = 4;
+    // Grid calculation
+    dim3 grid(num_tokens, (head_dim + VEC_SIZE - 1) / VEC_SIZE); // Simple Y mapping
+    // Block dimensions: 32x4 = 128 threads (2 wavefronts on MI50)
+    dim3 block(32, VEC_SIZE); 
+    
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(k));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (k.dtype() == at::ScalarType::Float) {
+        vllm::indexer_k_cache_fp16_kernel<float><<<grid, block, 0, stream>>>(
+            k.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(kv_cache.data_ptr()),
+            slot_mapping.data_ptr<int64_t>(),
+            head_dim, cache_block_size, cache_stride);
+    } else if (k.dtype() == at::ScalarType::Half) {
+        vllm::indexer_k_cache_fp16_kernel<at::Half><<<grid, block, 0, stream>>>(
+            k.data_ptr<at::Half>(),
+            reinterpret_cast<uint16_t*>(kv_cache.data_ptr()),
+            slot_mapping.data_ptr<int64_t>(),
+            head_dim, cache_block_size, cache_stride);
+    } else {
+        TORCH_CHECK(false, "Unsupported data type for k: ", k.dtype());
+    }
+}
+
+// Host wrapper for Gather
+void cp_gather_indexer_k_cache_fp16(
+    const torch::Tensor& kv_cache,       // [num_blocks, block_size, cache_stride]
+    torch::Tensor& dst_k,                // [num_tokens, head_dim]
+    const torch::Tensor& block_table,    // [batch_size, num_blocks]
+    const torch::Tensor& cu_seq_lens     // [batch_size + 1]
+) {
+    int batch_size = block_table.size(0);
+    int num_tokens = dst_k.size(0);
+    int head_dim = dst_k.size(1);
+
+    int block_stride = kv_cache.stride(0);
+    int cache_block_size = kv_cache.size(1);
+    int num_blocks = kv_cache.size(0);
+
+    constexpr int VEC_SIZE = 4;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(kv_cache));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Helper macro to dispatch based on token count (block Y size)
+    #define LAUNCH_GATHER(BLOCK_Y, TYPE) \
+        vllm::cp_gather_indexer_k_cache_fp16_kernel<TYPE, BLOCK_Y> \
+        <<<dim3((num_tokens + BLOCK_Y - 1) / BLOCK_Y, (head_dim + VEC_SIZE - 1) / VEC_SIZE), \
+           dim3(32, BLOCK_Y), 0, stream>>>( \
+            reinterpret_cast<uint16_t*>(kv_cache.data_ptr()), \
+            dst_k.data_ptr<TYPE>(), \
+            block_table.data_ptr<int32_t>(), \
+            cu_seq_lens.data_ptr<int32_t>(), \
+            batch_size, dst_k.stride(0), head_dim, \
+            block_stride, cache_block_size, num_blocks, num_tokens)
+
+    // Select dispatch type
+    if (dst_k.dtype() == at::ScalarType::Float) {
+        if (num_tokens < 32) { LAUNCH_GATHER(1, float); }
+        else if (num_tokens < 64) { LAUNCH_GATHER(2, float); }
+        else if (num_tokens < 128) { LAUNCH_GATHER(4, float); }
+        else if (num_tokens < 256) { LAUNCH_GATHER(8, float); }
+        else { LAUNCH_GATHER(16, float); }
+    } else if (dst_k.dtype() == at::ScalarType::Half) {
+        if (num_tokens < 32) { LAUNCH_GATHER(1, at::Half); }
+        else if (num_tokens < 64) { LAUNCH_GATHER(2, at::Half); }
+        else if (num_tokens < 128) { LAUNCH_GATHER(4, at::Half); }
+        else if (num_tokens < 256) { LAUNCH_GATHER(8, at::Half); }
+        else { LAUNCH_GATHER(16, at::Half); }
+    } else {
+        TORCH_CHECK(false, "Unsupported dst_k dtype");
+    }
 }

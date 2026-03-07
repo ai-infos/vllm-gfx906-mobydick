@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 if TYPE_CHECKING:
@@ -50,6 +51,7 @@ class INCConfig(QuantizationConfig):
         extra_config: dict[str, Any] | None = None,
         data_type: str = "int",
         backend: str = "auto",
+        checkpoint_format: str = "",
     ) -> None:
         super().__init__()
         if weight_bits not in self.SUPPORTED_BITS:
@@ -86,6 +88,7 @@ class INCConfig(QuantizationConfig):
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
+        self.checkpoint_format = checkpoint_format
 
     def __repr__(self) -> str:
         return (
@@ -99,7 +102,7 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.half, torch.bfloat16]
+        return [torch.half, torch.bfloat16, torch.float32]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -124,6 +127,7 @@ class INCConfig(QuantizationConfig):
             extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
             backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
+            checkpoint_format=cls.get_from_keys_or(config, ["checkpoint_format"], ""),
         )
 
     def get_layer_config(self, layer, layer_name: str):
@@ -245,7 +249,7 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if backend == "auto" or "marlin" in backend:
+        if (backend == "auto" or "marlin" in backend) and not on_gfx906():
             AWQ_TYPE_MAP = {
                 4: scalar_types.uint4,
                 8: scalar_types.uint8,
@@ -331,7 +335,7 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if backend == "auto" or "marlin" in backend:
+        if (backend == "auto" or "marlin" in backend) and not on_gfx906():
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,
                 (8, True): scalar_types.uint8b128,
@@ -373,6 +377,7 @@ class INCConfig(QuantizationConfig):
                 lm_head_quantized=False,
                 desc_act=False,
                 dynamic={},
+                checkpoint_format=self.checkpoint_format,
             )
 
         if isinstance(layer, FusedMoE):
@@ -426,10 +431,12 @@ class INCConfig(QuantizationConfig):
             or self.backend == "ipex"
         ):
             return self.apply_ipex_quant_layer(layer, prefix)
+        
+        # FIX: Pass self.backend to the quant layer methods to avoid default backend auto falling back to marlin
         if "gptq" in self.packing_format or "gptq" in self.backend:
-            return self.apply_gptq_quant_layer(layer, prefix)
+            return self.apply_gptq_quant_layer(layer, prefix, self.backend)
         if "awq" in self.packing_format or "awq" in self.backend:
-            return self.apply_awq_quant_layer(layer, prefix)
+            return self.apply_awq_quant_layer(layer, prefix, self.backend)
 
     @classmethod
     def override_quantization_method(

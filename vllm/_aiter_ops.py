@@ -49,12 +49,11 @@ def is_aiter_found_and_supported() -> bool:
     This allows explicit backend selection via attention_config to work even when
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
     """
-    if current_platform.is_rocm() and IS_AITER_FOUND:
-        from vllm.platforms.rocm import on_gfx9
-
-        return on_gfx9()
+    # TODO: fix ugly workaround that enables ops registration (rocm_aiter_sparse_attn_indexer) on gfx906
+    from vllm.platforms.rocm import on_gfx9, on_gfx906
+    if current_platform.is_rocm() and (IS_AITER_FOUND or on_gfx906()):
+        return on_gfx9() or on_gfx906()
     return False
-
 
 def if_aiter_supported(func: Callable) -> Callable:
     """Decorator that only executes the function if
