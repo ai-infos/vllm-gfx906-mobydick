@@ -374,6 +374,7 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    on_gfx906: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -481,7 +482,8 @@ def fused_moe_kernel(
     if use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            if not on_gfx906:
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
@@ -517,7 +519,10 @@ def fused_moe_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if on_gfx906:
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+        else:
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -525,12 +530,22 @@ def fused_moe_kernel(
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
                 offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
-                )
+                if not on_gfx906:
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    )
+                else:
+                    # Bitwise E4M3 -> FP16 dequant for B (b is already uint8)
+                    b_sign = (b & 0x80).to(tl.uint16) << 8
+                    b_exp = ((b & 0x78) >> 3).to(tl.uint16)
+                    b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
+                    b_mant = (b & 0x07).to(tl.uint16) << 7
+                    b_bits = b_sign | (b_exp << 10) | b_mant
+                    b = b_bits.to(tl.float16, bitcast=True)
+                
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :] if not on_gfx906 else tl.dot(a, b) * b_scale[None, :]
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
@@ -551,7 +566,7 @@ def fused_moe_kernel(
     if use_int8_w8a16:
         accumulator = accumulator * b_scale
     elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
-        accumulator = accumulator * a_scale * b_scale
+        accumulator = accumulator * a_scale * b_scale if not on_gfx906 else accumulator * b_scale
 
     # Bias addition:
     # Bias must be applied after dequantization:
@@ -847,6 +862,7 @@ def invoke_fused_moe_triton_kernel(
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         **config,
+        on_gfx906=on_gfx906(),
     )
 
 
@@ -1235,20 +1251,46 @@ def get_default_config(
     num_stages_rocm = 2
 
     if dtype == "fp8_w8a8" and block_shape is not None:
-        # Block-wise quant: tile sizes are constrained by block_shape.
-        # Use a small M tile for decode-like batches where tokens are
-        # spread thin across experts. Larger batches benefit from
-        # GROUP_SIZE_M > 1 because the per-block scales add memory
-        # traffic that benefits from L2 tile reuse.
-        config = {
-            "BLOCK_SIZE_M": 16 if M <= 64 else 64,
-            "BLOCK_SIZE_N": block_shape[0],
-            "BLOCK_SIZE_K": block_shape[1],
-            "GROUP_SIZE_M": 1 if M <= 16 else 32,
-            "SPLIT_K": 1,
-            "num_warps": 4,
-            "num_stages": 3 if not current_platform.is_rocm() else num_stages_rocm,
-        }
+        # Block-wise quant: BLOCK_SIZE_N must be divisible by block_shape[0]
+        # BLOCK_SIZE_K must be divisible by block_shape[1]
+        # num_stages=3 can cause triton.runtime.errors.OutOfResources
+        # on ROCm, set it to 2 instead.
+        # gfx906: Optimize for MI50 based on benchmark results.
+        if on_gfx906():
+            if M <= 1:
+                bm, gm, nw, ns = 16, 16, 4, 1
+            elif M <= 8:
+                bm, gm, nw, ns = 16, 1, 4, 1
+            elif M <= 16:
+                bm, gm, nw, ns = 16, 8, 4, 1
+            elif M <= 64:
+                bm, gm, nw, ns = 32, 4, 4, 1
+            else:
+                bm, gm, nw, ns = 32, 8, 4, 1
+            config = {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_K": block_shape[1],
+                "GROUP_SIZE_M": gm,
+                "SPLIT_K": 1,
+                "num_warps": nw,
+                "num_stages": ns,
+                }
+        else:
+            # Block-wise quant: tile sizes are constrained by block_shape.
+            # Use a small M tile for decode-like batches where tokens are
+            # spread thin across experts. Larger batches benefit from
+            # GROUP_SIZE_M > 1 because the per-block scales add memory
+            # traffic that benefits from L2 tile reuse.
+            config = {
+                "BLOCK_SIZE_M": 16 if M <= 64 else 64,
+                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_K": block_shape[1],
+                "GROUP_SIZE_M": 1 if M <= 16 else 32,
+                "SPLIT_K": 1,
+                "num_warps": 4,
+                "num_stages": 3 if not current_platform.is_rocm() else num_stages_rocm,
+            }
     elif dtype in ["int4_w4a16", "int8_w8a16"] and block_shape is not None:
         # moe wna16 kernels
         # only set BLOCK_SIZE_M
@@ -1946,10 +1988,12 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             from vllm.platforms.rocm import on_gfx9
 
             is_rocm_on_gfx9 = on_gfx9()
+            is_rocm_on_gfx906 = on_gfx906()
         else:
             is_rocm_on_gfx9 = False
+            is_rocm_on_gfx906 = False
 
-        device_supports_fp8 = is_rocm_on_gfx9 or (
+        device_supports_fp8 = is_rocm_on_gfx9 or is_rocm_on_gfx906 or (
             p.is_cuda() and p.has_device_capability((8, 9))
         )
 
@@ -2023,6 +2067,114 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        # ── GFX906 FP8: bitwise Triton dequant path ────────────────────
+        _gfx906_fp8 = (self.quant_config.use_fp8_w8a8
+                        and self.block_shape is not None
+                        and on_gfx906())
+        if _gfx906_fp8:
+            logger.info_once(
+                "GFX906: bitwise FP8 dequant + FP16 GEMM path active",
+                scope="local",
+            )
+
+            # hidden_states must be FP16 (fp8 quantized avoided in prepare_finalize.py)
+            #assert hidden_states.dtype == torch.float16, "hidden_states must be FP16"
+            #assert a1q_scale is None, "a1q_scale must be None"
+
+
+            E_orig, num_tokens, N, K, top_k_num = self.moe_problem_size(
+                hidden_states, w1, w2, topk_ids
+            )
+
+            if global_num_experts == -1:
+                global_num_experts = E_orig
+
+            config = try_get_optimal_moe_config(
+                w1.size(),
+                w2.size(),
+                top_k_num,
+                "fp8_w8a8",
+                num_tokens,
+                block_shape=self.block_shape,
+            )
+
+            compute_type = tl.float16
+
+            intermediate_cache1 = _resize_cache(
+                workspace2, (num_tokens, top_k_num, N))
+            cache2_dim = self.adjust_N_for_activation(N, activation)
+            intermediate_cache2 = _resize_cache(
+                workspace13, (num_tokens * top_k_num, cache2_dim))
+            intermediate_cache3 = _resize_cache(
+                workspace2, (num_tokens, top_k_num, K))
+
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(
+                    topk_ids,
+                    config["BLOCK_SIZE_M"],
+                    E_orig,
+                    expert_map,
+                )
+            )
+
+            # First GEMM: hidden * w1
+            invoke_fused_moe_triton_kernel(
+                hidden_states,           # FP16
+                w1.view(torch.uint8),    # FP8
+                intermediate_cache1,
+                None,          # a_scale
+                self.w1_scale, # b_scale
+                None,          # topk_weights
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                False,         # mul_routed_weights
+                top_k_num,
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+                use_int8_w8a8=self.quant_config.use_int8_w8a8,
+                use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                per_channel_quant=self.per_act_token_quant,
+                block_shape=self.block_shape,
+                B_bias=self.w1_bias,
+            )
+
+            self.activation(
+                activation, intermediate_cache2,
+                intermediate_cache1.view(-1, N))
+
+            assert intermediate_cache2.dtype == torch.float16, "intermediate_cache2 must be FP16"
+
+            # Second GEMM: intermediate * w2
+            invoke_fused_moe_triton_kernel(
+                intermediate_cache2,   # FP16
+                w2.view(torch.uint8),  # FP8
+                intermediate_cache3,
+                None,                  # a_scale
+                self.w2_scale,         # b_scale
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input,
+                1,
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+                use_int8_w8a8=self.quant_config.use_int8_w8a8,
+                use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                per_channel_quant=self.per_act_token_quant,
+                block_shape=self.block_shape,
+                B_bias=self.w2_bias,
+            )
+
+            self.moe_sum(intermediate_cache3, output)
+            return
+
+        # ── Standard (non-gfx906) path ────────────────────────────────
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"

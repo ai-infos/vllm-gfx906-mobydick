@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.platforms.rocm import on_gfx906
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
@@ -65,18 +66,24 @@ class MoEPrepareAndFinalizeNaiveEP(mk.FusedMoEPrepareAndFinalize):
             a1q = a1
             a1q_scale = None
         else:
-            a1q, a1q_scale = moe_kernel_quantize_input(
-                a1,
-                quant_config.a1_gscale if use_nvfp4 else quant_config.a1_scale,
-                quant_config.quant_dtype,
-                quant_config.per_act_token_quant,
-                quant_config.block_shape,
-                # NOTE: swizzling pads the scales to multiple of 128
-                # which makes the scales tensor different shape than
-                # the hidden states, breaking the A2A kernel. So, we
-                # delay the swizzling until after the A2A.
-                is_fp4_scale_swizzled=False,
-            )
+            # On gfx906, skip FP8 activation quantization - the
+            # bitwise dequant path expects FP16 inputs.
+            if on_gfx906() and quant_config.quant_dtype == torch.float8_e4m3fn:
+                a1q = a1
+                a1q_scale = None
+            else:
+                a1q, a1q_scale = moe_kernel_quantize_input(
+                    a1,
+                    quant_config.a1_gscale if use_nvfp4 else quant_config.a1_scale,
+                    quant_config.quant_dtype,
+                    quant_config.per_act_token_quant,
+                    quant_config.block_shape,
+                    # NOTE: swizzling pads the scales to multiple of 128
+                    # which makes the scales tensor different shape than
+                    # the hidden states, breaking the A2A kernel. So, we
+                    # delay the swizzling until after the A2A.
+                    is_fp4_scale_swizzled=False,
+                )
 
         # Skip gathering scales if we have static quantization
         # (the scale is a scalar, replicated on all ranks) or
@@ -179,6 +186,11 @@ class MoEPrepareAndFinalizeNoEP(mk.FusedMoEPrepareAndFinalize):
             if quant_config.use_nvfp4_w4a4
             else quant_config.a1_scale
         )
+        # On gfx906, skip FP8 activation quantization - the
+        # bitwise dequant path expects FP16 inputs.
+        if on_gfx906() and quant_config.quant_dtype == torch.float8_e4m3fn:
+            return a1, None, None, None, None
+
         a1q, a1q_scale = moe_kernel_quantize_input(
             a1,
             input_sf,
