@@ -88,7 +88,7 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1]
+        return [1, 32, 64]
 
     @staticmethod
     def get_name() -> str:
