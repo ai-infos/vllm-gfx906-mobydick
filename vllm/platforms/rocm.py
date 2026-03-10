@@ -470,36 +470,34 @@ class RocmPlatform(Platform):
                 invalid_reasons = ["ImportError"]
             if invalid_reasons:
                 raise ValueError(
-                    "ROCMAiterMLASparseBackend doesn't support fp8 kv_cache_dtype."
+                    f"Selected backend {selected_backend} is not valid for "
+                    f"this configuration. Reason: {invalid_reasons}"
                 )
-            #assert block_size == 1, (
-            #    "Sparse MLA backend on ROCm only supports block size 1 for now."
-            #)
-            logger.info_once("Using Sparse MLA backend.")
-            return AttentionBackendEnum.ROCM_AITER_MLA_SPARSE.get_path()
+            else:
+                logger.info("Using %s backend.", selected_backend)
+                return selected_backend.get_path()
 
-        if attn_selector_config.use_mla:
-            if selected_backend is None:
-                selected_backend = (
-                    AttentionBackendEnum.ROCM_AITER_MLA
-                    if rocm_aiter_ops.is_mla_enabled() or block_size == 1
-                    else AttentionBackendEnum.TRITON_MLA
-                )
-            if selected_backend == AttentionBackendEnum.TRITON_MLA:
-                if block_size != 1:
-                    logger.info_once("Using Triton MLA backend.")
-                    return AttentionBackendEnum.TRITON_MLA.get_path()
-                raise ValueError(
-                    f" The selected backend, {selected_backend.name},"
-                    f"does not support block size {block_size}."
-                )
-            if selected_backend == AttentionBackendEnum.ROCM_AITER_MLA:
-                logger.info("Using AITER MLA backend.")
-                return AttentionBackendEnum.ROCM_AITER_MLA.get_path()
-            if selected_backend == AttentionBackendEnum.ROCM_AITER_TRITON_MLA:
-                logger.info("Using AITER TRITON MLA backend.")
-                return AttentionBackendEnum.ROCM_AITER_TRITON_MLA.get_path()
-
+        # No selected backend or the selected backend is invalid,
+        # so we try finding a valid backend.
+        valid_backends_priorities, invalid_reasons = cls.get_valid_backends(
+            device_capability=device_capability,
+            attn_selector_config=attn_selector_config,
+            num_heads=num_heads,
+        )
+        reasons_str = (
+            "{"
+            + ", ".join(
+                f"{backend.name}: [{', '.join(reasons)}]"
+                for backend, reasons in invalid_reasons.items()
+            )
+            + "}"
+        )
+        config_str = attn_selector_config.__repr__()
+        logger.debug_once(
+            f"Some attention backends are not valid for {cls.device_name} with "
+            f"{config_str}. Reasons: {reasons_str}."
+        )
+        if len(valid_backends_priorities) == 0:
             raise ValueError(
                 f"No valid attention backend found for {cls.device_name} "
                 f"with {config_str}. Reasons: {reasons_str}."
