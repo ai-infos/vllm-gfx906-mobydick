@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+from copy import deepcopy
 from enum import Enum
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Union
@@ -12,13 +13,17 @@ from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    get_dynamic_override,
     get_linear_quant_method,
 )
 from vllm.model_executor.parameter import (
@@ -173,6 +178,11 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["GPTQLinearMethod", "QuantizeMethodBase"] | None:
         if isinstance(layer, FusedMoE):
+            cloned_config = deepcopy(self)
+            # False = skip module, None = no override, else = Positive match
+            if get_dynamic_override(cloned_config, layer_name=prefix) == False:
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+
             # GPTQ MoE support: fall back to MoeWNA16 for broad compatibility
             from .moe_wna16 import MoeWNA16Config
 

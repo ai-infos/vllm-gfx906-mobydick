@@ -422,6 +422,7 @@ class RocmPlatform(Platform):
         "torchao",
         "inc",
         "bitsandbytes",
+        "moe_wna16",
     ]
 
     @classmethod

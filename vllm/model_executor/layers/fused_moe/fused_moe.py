@@ -1169,8 +1169,8 @@ def get_moe_wna16_block_config(
         # set default block_size 128, and increase them when num_blocks
         # is too large.
         block_size_n = 128
-        block_size_k = 128
-        if block_size_k <= group_size:
+        block_size_k = min(128, size_k)
+        if block_size_k <= group_size and group_size <= size_k:
             block_size_k = group_size
 
         num_n_blocks = size_k // block_size_k

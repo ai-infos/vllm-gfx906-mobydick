@@ -154,6 +154,10 @@ def kernel_unified_attention_2d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    # Downcast Q to KV cache dtype for efficient tl.dot (e.g. fp32 -> fp16)
+    kv_dtype = key_cache_ptr.dtype.element_ty
+    if not kv_dtype.is_fp8() and Q.dtype != kv_dtype:
+        Q = Q.to(kv_dtype)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -515,6 +519,10 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    # Downcast Q to KV cache dtype for efficient tl.dot (e.g. fp32 -> fp16)
+    kv_dtype = key_cache_ptr.dtype.element_ty
+    if not kv_dtype.is_fp8() and Q.dtype != kv_dtype:
+        Q = Q.to(kv_dtype)
 
     block_table_offset = seq_idx * block_table_stride
 

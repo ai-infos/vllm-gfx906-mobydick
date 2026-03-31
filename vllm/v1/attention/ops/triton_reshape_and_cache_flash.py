@@ -119,7 +119,7 @@ def triton_reshape_and_cache_flash(
     # [num_blocks, block_size, num_heads, head_size]
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
-    kv_cache_dtype: str,  # "auto", "fp8"
+    kv_cache_dtype: str,  # "auto", "fp8", "half"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
@@ -145,14 +145,18 @@ def triton_reshape_and_cache_flash(
     block_stride = key_cache.stride()[0]
     page_stride = key_cache.stride()[1]
 
-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
-        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
-    )
-    kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
-        if kv_cache_dtype.startswith("fp8")
-        else key_cache.dtype
-    )
+    assert (
+        kv_cache_dtype == "auto"
+        or kv_cache_dtype.startswith("fp8")
+        or kv_cache_dtype == "half"
+    ), f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+
+    if kv_cache_dtype.startswith("fp8"):
+        kv_cache_torch_dtype = current_platform.fp8_dtype()
+    elif kv_cache_dtype == "half":
+        kv_cache_torch_dtype = torch.float16
+    else:
+        kv_cache_torch_dtype = key_cache.dtype
 
     if key_cache.dtype != kv_cache_torch_dtype and kv_cache_dtype.startswith("fp8"):
         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
@@ -172,7 +176,7 @@ def triton_reshape_and_cache_flash(
         torch.float8_e4m3fnuz,
     ], (
         "unsupported dtype of KV cache tensor, got "
-        "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+        f"{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
         "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
     )
 
@@ -309,7 +313,7 @@ def triton_reshape_and_cache_flash_diffkv(
     # [num_blocks, block_size, num_heads, head_size + head_size_v]
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
-    kv_cache_dtype: str,  # "auto", "fp8"
+    kv_cache_dtype: str,  # "auto", "fp8", "half"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
@@ -323,14 +327,18 @@ def triton_reshape_and_cache_flash_diffkv(
     block_stride = kv_cache.stride()[0]
     page_stride = kv_cache.stride()[1]
 
-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
-        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
-    )
-    kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
-        if kv_cache_dtype.startswith("fp8")
-        else kv_cache.dtype
-    )
+    assert (
+        kv_cache_dtype == "auto"
+        or kv_cache_dtype.startswith("fp8")
+        or kv_cache_dtype == "half"
+    ), f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+
+    if kv_cache_dtype.startswith("fp8"):
+        kv_cache_torch_dtype = current_platform.fp8_dtype()
+    elif kv_cache_dtype == "half":
+        kv_cache_torch_dtype = torch.float16
+    else:
+        kv_cache_torch_dtype = kv_cache.dtype
 
     if kv_cache.dtype != kv_cache_torch_dtype and kv_cache_dtype.startswith("fp8"):
         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
@@ -349,7 +357,7 @@ def triton_reshape_and_cache_flash_diffkv(
         torch.float8_e4m3fnuz,
     ], (
         "unsupported dtype of KV cache tensor, got "
-        "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+        f"{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
         "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
     )
 
