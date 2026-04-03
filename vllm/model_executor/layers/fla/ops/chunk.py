@@ -179,9 +179,15 @@ def chunk_gated_delta_rule(
         )
     """
     assert q.dtype == k.dtype == v.dtype
-    assert q.dtype != torch.float32, (
-        "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    )
+    # Auto-downcast fp32 inputs to fp16 for devices that don't support bf16
+    # (e.g. MI50/gfx906). The FLA kernel requires fp16 or bf16.
+    orig_dtype = q.dtype
+    if orig_dtype == torch.float32:
+        q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        g = g.to(torch.float16)
+        beta = beta.to(torch.float16)
+        if initial_state is not None:
+            initial_state = initial_state.to(torch.float16)
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H]."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -208,4 +214,9 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
     )
+    # Cast output back to original dtype if we downcast the inputs
+    if orig_dtype == torch.float32:
+        o = o.to(orig_dtype)
+        if final_state is not None:
+            final_state = final_state.to(orig_dtype)
     return o, final_state

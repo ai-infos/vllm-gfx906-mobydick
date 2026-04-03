@@ -218,8 +218,9 @@ class Worker(WorkerBase):
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
-            # This env var set by Ray causes exceptions with graph building.
-            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            if not current_platform.is_rocm(): # don't remove NCCL_ASYNC_ERROR_HANDLING for ROCm as it is handled in rocm.py
+                # This env var set by Ray causes exceptions with graph building.
+                os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend

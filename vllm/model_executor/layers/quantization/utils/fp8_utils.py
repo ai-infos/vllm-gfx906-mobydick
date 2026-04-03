@@ -31,6 +31,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_gemm_nt,
@@ -517,9 +518,10 @@ class W8A8BlockFp8LinearOp:
     ) -> torch.Tensor:
         assert input_scale is None
         assert self.input_quant_op is not None
-        q_input, input_scale = self.input_quant_op(input_2d)
+        if not on_gfx906():
+            q_input, input_scale = self.input_quant_op(input_2d)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
-            q_input,
+            q_input if not on_gfx906() else input_2d,
             weight,
             input_scale,
             weight_scale,
@@ -1097,6 +1099,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    on_gfx906: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -1119,21 +1122,35 @@ def _w8a8_triton_block_scaled_mm(
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    As_ptrs = As + offs_am * stride_As_m
+    if not on_gfx906: # A is fp16 input for gfx906 so no need to load As
+        As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if on_gfx906:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+        
+            # Bitwise E4M3 -> FP16 dequant for B (b is already uint8)
+            b_sign = (b & 0x80).to(tl.uint16) << 8
+            b_exp = ((b & 0x78) >> 3).to(tl.uint16)
+            b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
+            b_mant = (b & 0x07).to(tl.uint16) << 7
+            b_bits = b_sign | (b_exp << 10) | b_mant
+            b = b_bits.to(tl.float16, bitcast=True)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        if not on_gfx906: # A is fp16 input for gfx906 so no need to load As
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        accumulator += tl.dot(a, b) * b_s[None, :] if on_gfx906 else tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -1216,9 +1233,10 @@ def w8a8_triton_block_scaled_mm(
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
-    assert A.shape[-1] == B.shape[-1]
-    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    if not on_gfx906(): # As is none for gfx906 (we kept initial A in fp16)
+        assert A.shape[-1] == B.shape[-1]
+        assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     M = A.numel() // A.shape[-1]
 
     assert B.ndim == 2 and Bs.ndim == 2
@@ -1229,6 +1247,14 @@ def w8a8_triton_block_scaled_mm(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
+    # ── GFX906: bitwise Triton dequant + triton matmul with A as fp16 ──────────────
+    if on_gfx906():
+        logger.info_once(
+            "GFX906: bitwise FP8 dequant + triton matmul with A as fp16 "
+            "in w8a8_triton_block_scaled_mm (FP8 linear layer)",
+        )
+        if not A.dtype == torch.float16: # A can be fp32 or fp16
+            A = A.to(torch.float16)
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:
         # Get the optimal config if there is one
@@ -1237,14 +1263,39 @@ def w8a8_triton_block_scaled_mm(
         # Default config
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
         # BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 2,
-        }
+        if on_gfx906():
+            # Optimize for gfx906 (MI50)
+            # BLOCK_SIZE_M should be smaller for small batch sizes to improve
+            # occupancy. Logic based on benchmarking results.
+            if M <= 1:
+                bm, gm, nw, ns = 16, 16, 4, 1
+            elif M <= 8:
+                bm, gm, nw, ns = 16, 1, 4, 1
+            elif M <= 16:
+                bm, gm, nw, ns = 16, 8, 4, 1
+            elif M <= 64:
+                bm, gm, nw, ns = 32, 4, 4, 1
+            else:
+                bm, gm, nw, ns = 32, 8, 4, 1
+
+            config = {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": gm,
+                "num_warps": nw,
+                "num_stages": ns,
+            }
+
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
 
     def grid(META):
         return (
@@ -1253,7 +1304,7 @@ def w8a8_triton_block_scaled_mm(
 
     _w8a8_triton_block_scaled_mm[grid](
         A,
-        B,
+        B.view(torch.uint8) if B.element_size() == 1 else B,
         C,
         As,
         Bs,
@@ -1268,11 +1319,12 @@ def w8a8_triton_block_scaled_mm(
         B.stride(0),
         C.stride(-2),
         C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
+        As.stride(-2) if not on_gfx906() else None,
+        As.stride(-1) if not on_gfx906() else None,
         Bs.stride(1),
         Bs.stride(0),
         **config,
+        on_gfx906=on_gfx906(),
     )
 
     return C

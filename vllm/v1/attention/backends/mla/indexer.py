@@ -86,7 +86,7 @@ class DeepseekV32IndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1 if current_platform.is_rocm() else 64]
+        return [1, 64]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -125,7 +125,6 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
     cu_seq_lens: torch.Tensor
-    token_to_seq: torch.Tensor
     total_seq_lens: int
     token_start: int
     token_end: int
@@ -359,7 +358,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             cu_seqlen_ks=cu_seqlen_ks[query_slice],
             cu_seqlen_ke=cu_seqlen_ke[query_slice],
             cu_seq_lens=cu_seq_lens,
-            token_to_seq=token_to_seq,
             total_seq_lens=total_seq_lens,
             block_table=block_table[req_slice],
             token_start=token_start + query_slice.start,

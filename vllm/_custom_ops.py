@@ -743,6 +743,8 @@ if hasattr(torch.ops._C, "gptq_gemm"):
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
     torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
+def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
+    torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
 
 if hasattr(torch.ops._C, "allspark_w8a16_gemm"):
 
@@ -2275,9 +2277,9 @@ def moe_wna16_gemm(
     BLOCK_SIZE_K: int,
     bit: int,
 ) -> torch.Tensor:
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         raise NotImplementedError(
-            "The optimized moe_wna16_gemm kernel is only available on CUDA platforms"
+            "The optimized moe_wna16_gemm kernel is only available on CUDA platforms or ROCm platforms"
         )
     torch.ops._moe_C.moe_wna16_gemm(
         input,
@@ -2759,6 +2761,27 @@ def cp_gather_indexer_k_quant_cache(
 ) -> None:
     torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
         kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+    )
+
+
+def indexer_k_cache_fp16(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.indexer_k_cache_fp16(
+        k, kv_cache, slot_mapping
+    )
+
+
+def cp_gather_indexer_k_cache_fp16(
+    kv_cache: torch.Tensor,
+    dst_k: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.cp_gather_indexer_k_cache_fp16(
+        kv_cache, dst_k, block_table, cu_seq_lens
     )
 
 

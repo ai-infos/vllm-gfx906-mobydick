@@ -421,6 +421,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
+  ops.def("gptq_shuffle_awq_qweight(Tensor! q_weight, int bit) -> ()");
+  ops.impl("gptq_shuffle_awq_qweight", torch::kCUDA, &gptq_shuffle_awq_qweight);
+  
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
   // scaling. Optional group_m/group_n specify the group shape explicitly;
@@ -605,6 +608,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
   cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
                  &cp_gather_indexer_k_quant_cache);
+
+  cache_ops.def(
+      "indexer_k_cache_fp16(Tensor k, Tensor! kv_cache, Tensor "
+      "slot_mapping) -> ()");
+  cache_ops.impl("indexer_k_cache_fp16", torch::kCUDA,
+                 &indexer_k_cache_fp16);
+
+  cache_ops.def(
+      "cp_gather_indexer_k_cache_fp16(Tensor kv_cache, Tensor! dst_k, "
+      "Tensor block_table, Tensor cu_seq_lens) -> ()");
+  cache_ops.impl("cp_gather_indexer_k_cache_fp16", torch::kCUDA,
+                 &cp_gather_indexer_k_cache_fp16);               
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {

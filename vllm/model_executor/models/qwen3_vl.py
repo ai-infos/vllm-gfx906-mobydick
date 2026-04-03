@@ -1053,8 +1053,33 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
         image_overrides = mm_options.get("image")
         video_overrides = mm_options.get("video")
 
+        hf_config = self.info.get_hf_config()
+        vision_config = hf_config.vision_config
+        patch_size = getattr(vision_config, "patch_size", 14)
+        merge_size = getattr(vision_config, "spatial_merge_size", 2)
+        unit = patch_size * merge_size
+        
+        # Calculate maximum tokens we can allocate per media item to fit in seq_len
+        item_max_tokens = max(1, seq_len // max(num_images + num_videos, 1))
+
+        image_processor = self.info.get_image_processor()
+        mm_kwargs = self.info.ctx.get_merged_mm_kwargs({})
+        
+        # Determine image_max_pixels bounds
+        image_size = mm_kwargs.get("size") or getattr(image_processor, "size", {})
+        try:
+            image_max_pixels = int(
+                mm_kwargs.get("max_pixels") or 
+                image_size.get("longest_edge") or 
+                3145728
+            )
+        except Exception:
+            image_max_pixels = 3145728
+            
+        image_max_pixels = min(image_max_pixels, item_max_tokens * unit * unit)
+
         target_image_width, target_image_height = (
-            self.info.get_image_size_with_most_features()
+            self.info.get_image_size_with_most_features(max_pixels=image_max_pixels)
         )
 
         # treat videos as special images
@@ -1081,18 +1106,28 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 
         video_processor = self.info.get_video_processor()
 
-        mm_kwargs = self.info.ctx.get_merged_mm_kwargs({})
-        video_size = mm_kwargs.get("size", video_processor.size)
+        video_size = mm_kwargs.get("size") or getattr(video_processor, "size", {})
         temporal_patch_size = mm_kwargs.get(
-            "temporal_patch_size", video_processor.temporal_patch_size
+            "temporal_patch_size", getattr(video_processor, "temporal_patch_size", 2)
         )
 
-        # video_max_pixels contains the temporal compression factor,
-        # so we divide by 2 to get the maximum number of image pixels.
-        video_max_pixels = video_size["longest_edge"]
+        try:
+            video_max_pixels = int(
+                mm_kwargs.get("max_pixels") or 
+                video_size.get("longest_edge") or 
+                100000000
+            )
+        except Exception:
+            video_max_pixels = 100000000
+            
+        # Bounding max pixels of video frames dynamically by max_tokens limits per item.
+        # NOTE: it will fix the issue ValueError("value too large") in vllm/multimodal/cache.py - get_and_update_item during init dummy load
+        video_item_max_pixels = item_max_tokens * unit**2 // max(target_num_frames // temporal_patch_size, 1)
+        video_max_pixels_per_frame = min(video_max_pixels // temporal_patch_size, video_item_max_pixels)
+        
         target_video_width, target_video_height = (
             self.info.get_image_size_with_most_features(
-                max_pixels=video_max_pixels // temporal_patch_size
+                max_pixels=video_max_pixels_per_frame
             )
         )
         target_video_size, _ = self.info._get_vision_info(
