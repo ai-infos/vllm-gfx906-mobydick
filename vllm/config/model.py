@@ -1786,8 +1786,6 @@ def str_dtype_to_torch_dtype(type: str):
 # model_type -> reason
 _FLOAT16_NOT_SUPPORTED_MODELS = {
     "gemma2": "Numerical instability. Please use bfloat16 or float32 instead.",
-    "gemma3": "Numerical instability. Please use bfloat16 or float32 instead.",
-    "gemma3_text": "Numerical instability. Please use bfloat16 or float32 instead.",
     "plamo2": "Numerical instability. Please use bfloat16 or float32 instead.",
     "glm4": "Numerical instability. Please use bfloat16 or float32 instead.",
 }
