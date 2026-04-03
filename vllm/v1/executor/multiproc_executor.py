@@ -780,6 +780,16 @@ class WorkerProc:
                 for mq in queues_to_shutdown:
                     if mq is not None:
                         mq.shutdown()
+                
+                # If the parent died abruptly (e.g. multiple Ctrl+C), peers might also be dead,
+                # causing `destroy_distributed_environment()` to hang indefinitely.
+                # Since we received EOFError, if the main thread hasn't exited cleanly after 5 seconds,
+                # we force terminate to release GPU VRAM.
+                import time
+                import os
+                time.sleep(5.0)
+                logger.warning_once("WorkerProc graceful shutdown timed out after parent death. Force terminating.")
+                os._exit(1)
             except Exception as e:
                 logger.warning("Death monitoring error: %s", e)
 

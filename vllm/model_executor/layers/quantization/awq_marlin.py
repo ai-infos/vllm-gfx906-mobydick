@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.platforms.rocm import on_gfx906
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -310,7 +311,9 @@ class AWQMarlinConfig(QuantizationConfig):
         group_size = quant_config.get("group_size")
         zero_point = quant_config.get("zero_point")
 
-        if not current_platform.is_cuda_alike():
+        from vllm.platforms.rocm import on_gfx906
+        if not current_platform.is_cuda_alike() or on_gfx906(): 
+            # NOTE: awq marlin with conch kernel will work on gfx906 but it's not optimized at all (TG tok/s is ~10x slower) so it's disabled for now
             return False
 
         if quant_method != "awq":

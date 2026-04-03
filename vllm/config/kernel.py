@@ -79,9 +79,9 @@ class IrOpPriorityConfig:
                 assert op_priority is not None, (
                     f"IR op priority for {field.name} must be set"
                 )
-                logger.debug(
-                    "Setting IR op priority for %s to %s", field.name, op_priority
-                )
+                # logger.debug(
+                #     "Setting IR op priority for %s to %s", field.name, op_priority
+                # )
                 ir_op = IrOp.registry[field.name]
                 stack.enter_context(ir_op.set_priority(op_priority))
 
