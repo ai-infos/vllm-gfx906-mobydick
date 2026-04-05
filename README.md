@@ -37,14 +37,62 @@ pyenv install 3.12.11
 pyenv virtualenv 3.12.11 venv312
 pyenv activate venv312
 
-# TRITON-GFX906  v3.5.1
+# PYTORCH 2.10.0
 
-git clone --branch v3.5.1+gfx906 https://github.com/ai-infos/triton-gfx906.git
-cd triton-gfx906
-pip install 'torch==2.9.1' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3  
+git clone --branch v2.10.0 --recursive https://github.com/pytorch/pytorch.git
+cd pytorch
+
+# Install Python Dependencies
+pip install -r requirements.txt
+pip install mkl-static mkl-include
+
+# Hipify the Source (Convert CUDA to ROCm code)
+python tools/amd_build/build_amd.py
+
+# Build the wheel and install
+export MAX_JOBS=96 # to be adjusted according to your setup to avoid OOM / freeze / crash
+export USE_ROCM=1
+export PYTORCH_ROCM_ARCH=gfx906
+export CMAKE_PREFIX_PATH="${VIRTUAL_ENV}:${CMAKE_PREFIX_PATH}"
+
+pip wheel --no-build-isolation -v -w dist -e . 2>&1 | tee build.log
+pip install ./dist/torch*.whl
+
+
+# TORCHVISION 0.25.0
+
+# Install dependencies
+sudo apt-get update && sudo apt-get install -y libpng-dev libjpeg-dev ffmpeg
+
+# Build and Install
+git clone --branch v0.25.0 https://github.com/pytorch/vision.git
+cd vision
+export FORCE_CUDA=1
+export USE_ROCM=1
+export PYTORCH_ROCM_ARCH=gfx906
+
+python setup.py install
+
+
+# TORCHAUDIO 2.10.0
+
+# Build and Install
+git clone --branch v2.10.0 https://github.com/pytorch/audio.git
+cd audio
+export PYTORCH_ROCM_ARCH=gfx906
+export USE_ROCM=1
+
+python setup.py install
+
+
+# TRITON-GFX906 V3.6.0
+
+git clone --branch v3.6.0+gfx906 https://github.com/ai-infos/triton-gfx906.git
+cd triton-gfx906 
 pip install -r python/requirements.txt
-pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
+TRITON_CODEGEN_BACKENDS="amd" pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
 pip install ./dist/triton-*.whl  
+
 
 # FLASH-ATTENTION-GFX906 (triton backend)
 
@@ -67,7 +115,7 @@ pip install ./dist/vllm-*.whl
 ```code
 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE VLLM_LOGGING_LEVEL=DEBUG vllm serve \
   --dtype float16 \
-  --swap-space 0 2>&1 | tee log.txt
+  2>&1 | tee log.txt
 ```
 
 NB: --dtype float16 is recommended to add for this gfx906 fork. If not set, vllm will take the dtype from config.json model which might be bfloat16, not natively supported on gfx906 (with potential fallback to float32, leading to slower inference)
