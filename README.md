@@ -127,6 +127,9 @@ pip install 'cmake>=3.26.1,<4' 'packaging>=24.2' 'setuptools>=77.0.3,<80.0.0' 's
 pip install -r requirements/rocm.txt
 pip wheel --no-build-isolation -v -w dist . 2>&1 | tee build.log
 pip install ./dist/vllm-*.whl
+
+# TRANSFORMERS (v5.5.0 or any other version <6 supporting your model) and NUMPY (v<2)
+pip install transformers==5.5.0 "numpy<2"
 ```
 
 ### Quickstart example (with Qwen3 0.6B)
