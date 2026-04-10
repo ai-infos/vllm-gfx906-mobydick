@@ -378,7 +378,7 @@ class SparseAttnIndexer(CustomOp):
                 hidden_states,
                 self.k_cache.prefix,
                 self.k_cache.kv_cache,
-                q_fp8,
+                q,
                 k,
                 weights,
                 self.quant_block_size,
