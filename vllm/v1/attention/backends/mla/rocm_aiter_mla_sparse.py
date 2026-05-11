@@ -406,7 +406,6 @@ def reference_mla_sparse_prefill(
     indices: torch.Tensor, # [s_q, 1, topk]
     sm_scale: float,
     d_v: int,
-    chunk_size: int = 512,
 ) -> torch.Tensor:
     #GPU reference that chunks over QUERY tokens to avoid OOM.
     #Memory per chunk: chunk_size * topk * d_qk * 4 bytes (FP32)
@@ -420,8 +419,8 @@ def reference_mla_sparse_prefill(
 
     out = torch.empty(s_q, h_q, d_v, device=q.device, dtype=kv.dtype)
     
-    for start in range(0, s_q, chunk_size):
-        end = min(start + chunk_size, s_q)
+    for start in range(0, s_q, envs.VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE):
+        end = min(start + envs.VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE, s_q)
 
         idx_chunk = indices[start:end]  # [cs, topk]
 
@@ -478,9 +477,8 @@ def mla_sparse(
         if envs.VLLM_ROCM_MLA_SPARSE_FP16_TRITON:
             return triton_mla_sparse_vec(q, kv, indices, sm_scale, d_v)
         else:
-            # By default, use chunked PyTorch. 
-            # Note: 512 is the sweet-spot for MI50 rocBLAS performance!
-            return reference_mla_sparse_prefill(q, kv, indices, sm_scale, d_v, chunk_size=512)
+            # By default, use chunked PyTorch.
+            return reference_mla_sparse_prefill(q, kv, indices, sm_scale, d_v)
 
 
 class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata]):

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MLA_SPARSE_FP16: bool = False
     VLLM_ROCM_MLA_SPARSE_FP16_TRITON: bool = False
     VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE: int = 4
+    VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE: int = 512 # Note: 512 is the sweet-spot for MI50 rocBLAS performance
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
@@ -985,6 +986,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE": lambda: int(
         os.environ.get("VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE", "4")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE", "512")
     ),
     "VLLM_ROCM_MLA_SPARSE_FP16": lambda: (
         os.getenv("VLLM_ROCM_MLA_SPARSE_FP16", "False").lower() in ("true", "1")

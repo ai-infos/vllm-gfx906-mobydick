@@ -1375,6 +1375,11 @@ __global__ void cp_gather_indexer_k_cache_fp16_kernel(
     const int head_idx = (blockIdx.y * blockDim.x + threadIdx.x) * VEC_SIZE;
 
     __shared__ int batch_idx[BLOCK_Y_SIZE];
+    if (threadIdx.x == 0) {
+        batch_idx[threadIdx.y] = -1;
+    }
+    __syncthreads();
+
     for (int iter = 0; iter < cuda_utils::ceil_div(batch_size, int(blockDim.x)); iter++) {
         int tid = iter * blockDim.x + threadIdx.x;
         if (tid < batch_size) {
@@ -1387,10 +1392,13 @@ __global__ void cp_gather_indexer_k_cache_fp16_kernel(
     }
     __syncthreads();
 
-    if (head_idx >= head_dim || token_idx >= num_tokens) return;
+    // num_tokens may be an allocation upper bound when Python avoids a D2H sync.
+    // Only tokens covered by the exact device-side cu_seq_lens are valid to gather.
+    const int batch = batch_idx[threadIdx.y];
+    if (head_idx >= head_dim || token_idx >= num_tokens || batch < 0) return;
 
-    const int inbatch_seq_idx = token_idx - cu_seq_lens[batch_idx[threadIdx.y]];
-    const int block_idx_val = block_table[batch_idx[threadIdx.y] * num_blocks +
+    const int inbatch_seq_idx = token_idx - cu_seq_lens[batch];
+    const int block_idx_val = block_table[batch * num_blocks +
                                         inbatch_seq_idx / cache_block_size];
     
     const int64_t src_offset = block_idx_val * block_stride + 

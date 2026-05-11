@@ -171,6 +171,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
     cu_seq_lens: torch.Tensor
+    token_to_seq: torch.Tensor
     total_seq_lens: int
     token_start: int
     token_end: int
