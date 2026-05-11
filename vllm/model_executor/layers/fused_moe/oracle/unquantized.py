@@ -63,6 +63,10 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
             UnquantizedMoeBackend.TRITON,
             UnquantizedMoeBackend.BATCHED_TRITON,
         ]
+        # on gfx906, only triton backend has been tested and is supported for now
+        from vllm.platforms.rocm import on_gfx906
+        if on_gfx906():
+            _move_to_back(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.AITER)
     elif current_platform.is_cuda():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.FLASHINFER_TRTLLM,

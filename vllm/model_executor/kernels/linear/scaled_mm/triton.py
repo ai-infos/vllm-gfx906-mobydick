@@ -163,6 +163,42 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return False, "only cuda like devices are supported."
         return True, None
 
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        from vllm.platforms.rocm import on_gfx906
+        if on_gfx906():
+            out_dtype = self.config.out_dtype
+            params = self._get_layer_params(layer)
+            weight = params.weight
+            weight_scale = (
+                params.weight_scale
+                if params.weight_scale_inv is None
+                else params.weight_scale_inv
+            )
+            input_scale = params.input_scale
+
+            # View input as 2D matrix for fp8 methods
+            input_2d = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], weight.shape[0]]
+
+            output = self.apply_block_scaled_mm(
+                A=input_2d,
+                B=weight,
+                As=input_scale,
+                Bs=weight_scale,
+            )
+
+            if bias is not None:
+                output = output + bias
+            return output.to(dtype=out_dtype).view(*output_shape)
+            
+        return super().apply_weights(layer, x, bias, **kwargs)
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -186,7 +222,7 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 def _w8a8_triton_block_scaled_mm_func(
     qx: torch.Tensor,
     weight: torch.Tensor,
-    x_scale: torch.Tensor,
+    x_scale: torch.Tensor | None,
     weight_scale: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype,
@@ -203,7 +239,7 @@ def _w8a8_triton_block_scaled_mm_func(
 def _w8a8_triton_block_scaled_mm_fake(
     qx: torch.Tensor,
     weight: torch.Tensor,
-    x_scale: torch.Tensor,
+    x_scale: torch.Tensor | None,
     weight_scale: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype,

@@ -129,6 +129,26 @@ def _sync_hip_cuda_env_vars():
 # Sync at import time - catches misconfigurations from process start.
 _sync_hip_cuda_env_vars()
 
+
+def _set_rocm_nccl_workarounds():
+    """Disable NCCL watchdog/monitoring threads on ROCm to prevent
+    hipErrorCapturedEvent during CUDA graph capture with tensor parallelism.
+
+    The PyTorch NCCL watchdog thread queries HIP events via hipEventQuery,
+    which throws hipErrorCapturedEvent when events belong to a capturing
+    stream. TORCH_NCCL_BLOCKING_WAIT=1 is the only way to prevent the
+    watchdog from starting (TORCH_NCCL_ASYNC_ERROR_HANDLING=0 only changes
+    the error handling mode but does NOT stop the watchdog).
+    (Workadounds implemented during Qwen 3.5 27b AWQ MTP+TP2 testing)
+    """
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+
+
+_set_rocm_nccl_workarounds()
+
 # AMDSMI utils
 # Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
 # all the related functions work on real physical device ids.
@@ -147,6 +167,14 @@ def with_amdsmi_context(fn):
     return wrapper
 
 
+# Known amdsmi target_graphics_version quirks.
+# Some ROCm versions (e.g. 6.3.4) return non-standard names like
+# "gfx9006" instead of "gfx906".  Map them to canonical names here.
+_AMDSMI_GFX_NORMALIZATION: dict[str, str] = {
+    "gfx9006": "gfx906",
+}
+
+
 @with_amdsmi_context
 def _query_gcn_arch_from_amdsmi() -> str:
     """Query GCN arch from amdsmi. Raises if not available."""
@@ -157,7 +185,15 @@ def _query_gcn_arch_from_amdsmi() -> str:
         # e.g., 'gfx942' for MI300X/MI325X
         target_gfx = asic_info.get("target_graphics_version", "")
         if target_gfx:
-            return target_gfx
+            normalized = _AMDSMI_GFX_NORMALIZATION.get(target_gfx, target_gfx)
+            if normalized != target_gfx:
+                logger.warning(
+                    "amdsmi returned non-standard GCN arch '%s', "
+                    "normalizing to '%s'.",
+                    target_gfx,
+                    normalized,
+                )
+            return normalized
     raise RuntimeError("amdsmi did not return valid GCN arch")
 
 
@@ -191,6 +227,7 @@ _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 _ON_GFX90A = "gfx90a" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
+_ON_GFX906 = "gfx906" in _GCN_ARCH
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -276,6 +313,10 @@ def on_mi3xx() -> bool:
     return _ON_MI3XX
 
 
+def on_gfx906() -> bool:
+    return _ON_GFX906
+
+
 def on_gfx9() -> bool:
     return _ON_GFX9
 
@@ -334,8 +375,6 @@ def use_rocm_custom_paged_attention(
 
 @cache
 def flash_attn_triton_available() -> bool:
-    if not on_gfx1x():
-        return False
     try:
         from importlib.util import find_spec
 
@@ -346,7 +385,7 @@ def flash_attn_triton_available() -> bool:
         if os.environ.get("FLASH_ATTENTION_TRITON_AMD_ENABLE") != "TRUE":
             logger.info_once(
                 "Set FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE to enable "
-                "Flash Attention Triton backend on RDNA."
+                "Flash Attention Triton backend on RDNA or GFX906."
             )
             return False
         return True
@@ -365,11 +404,16 @@ def _get_backend_priorities(
 
     if use_mla:
         if rocm_aiter_ops.is_mla_enabled():
-            return [
+            backends = [
                 AttentionBackendEnum.ROCM_AITER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.ROCM_AITER_TRITON_MLA,
             ]
+            # on gfx906, triton mla is the only one that has been well tested so it has the highest priority
+            if on_gfx906():
+                backends.remove(AttentionBackendEnum.TRITON_MLA)
+                backends.insert(0, AttentionBackendEnum.TRITON_MLA)
+            return backends
         else:
             return [
                 AttentionBackendEnum.TRITON_MLA,
@@ -384,6 +428,11 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
+
+    # on gfx906, triton attn is the fastest (e.g. 2x faster than rocm attn for Minimax M2.5 AWQ in TG) so it has the highest priority
+    if on_gfx906():
+        backends.remove(AttentionBackendEnum.TRITON_ATTN)
+        backends.insert(0, AttentionBackendEnum.TRITON_ATTN)
 
     return backends
 
@@ -416,7 +465,9 @@ class RocmPlatform(Platform):
         "mxfp4",
         "mxfp8",
         "torchao",
+        "inc",
         "bitsandbytes",
+        "moe_wna16",
         "modelopt",
         "modelopt_fp4",
         "modelopt_mxfp8",
@@ -601,12 +652,12 @@ class RocmPlatform(Platform):
 
         # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
         if (
-            on_gfx1x()
+            (on_gfx1x() or on_gfx906())
             and flash_attn_triton_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
             logger.info_once(
-                "Using Flash Attention (Triton backend) for ViT model on RDNA."
+                "Using Flash Attention (Triton backend) for ViT model on RDNA or GFX906."
             )
             return AttentionBackendEnum.FLASH_ATTN
 
@@ -808,7 +859,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_gfx9() or on_gfx12x()
+        return on_gfx9() or on_gfx12x() or on_gfx906() # experimental for gfx906 (test OK only done with Qwen3 Coder Next fp8)
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:

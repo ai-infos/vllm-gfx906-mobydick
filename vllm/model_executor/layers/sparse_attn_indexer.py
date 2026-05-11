@@ -81,6 +81,7 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+# For CUDA:
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -506,7 +507,7 @@ class SparseAttnIndexer(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if rocm_aiter_ops.is_enabled():
+        if rocm_aiter_ops.is_enabled() or envs.VLLM_ROCM_MLA_SPARSE_FP16:
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),

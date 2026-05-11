@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+import vllm.envs as envs
 import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
@@ -84,6 +85,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
@@ -624,16 +626,32 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.head_dim, self.n_head],
-            bias=False,
-            quant_config=None,
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
-        )
+        if not on_gfx906(): # fused wk (using fp8/bf16) not supported on gfx906 which uses awq/gptq quant for deepseek
+            # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
+            # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
+            self.wk_weights_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [self.head_dim, self.n_head],
+                bias=False,
+                quant_config=None,
+                disable_tp=True,
+                prefix=f"{prefix}.wk_weights_proj",
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wk",
+            )
+            self.weights_proj = ReplicatedLinear(
+                hidden_size,
+                self.n_head,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.weights_proj",
+            )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -645,8 +663,8 @@ class Indexer(nn.Module):
         #       where we store value in fp8 and scale in fp32
         #       per self.quant_block_size element
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+            head_dim=self.head_dim if envs.VLLM_ROCM_MLA_SPARSE_FP16 else self.head_dim + self.head_dim // self.quant_block_size * 4,
+            dtype=torch.float16 if envs.VLLM_ROCM_MLA_SPARSE_FP16 else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -674,10 +692,14 @@ class Indexer(nn.Module):
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        # Fused wk + weights_proj: one GEMM, then split
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        weights = kw[:, self.head_dim :]
+        if not on_gfx906():
+            # Fused wk + weights_proj: one GEMM, then split
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
+            weights = kw[:, self.head_dim :]
+        else:
+            k, _ = self.wk(hidden_states)
+            weights, _ = self.weights_proj(hidden_states)
 
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(
@@ -697,22 +719,65 @@ class Indexer(nn.Module):
         k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q,
-            self.quant_block_size,
-            column_major_scales=False,
-            use_ue8m0=self.scale_fmt is not None,
-        )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        if not envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            q = q.view(-1, self.head_dim)
+            q, q_scale = per_token_group_quant_fp8(
+                q,
+                self.quant_block_size,
+                column_major_scales=False,
+                use_ue8m0=self.scale_fmt is not None,
+            )
+            q = q.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+        else:
+            q_scale = 1
 
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
         weights = weights.squeeze(-1)
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        return self.indexer_op(hidden_states, q, k, weights)
+
+
+def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+    """
+    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
+    in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
+    Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK
+    weights and scale, and when both are available, dequantizes to BF16 and stores into
+    the fused wk_weights_proj.weight parameter.
+    """
+    if "indexer.wk." not in name or "wk_weights" in name:
+        return False  # Weight is not an isolated WK weight for the indexer, ignore.
+    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+    is_scale = "weight_scale_inv" in name
+    if not is_weight and not is_scale:
+        return False  # WK is not in FP8 format, ignore.
+    # Buffer this tensor (weight or scale) until both have arrived.
+    layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
+    entry = buf.setdefault(layer_prefix, {})
+    entry["weight" if is_weight else "scale"] = tensor
+    if "weight" not in entry or "scale" not in entry:
+        return True  # still waiting for the other param
+
+    # We have both weight and scale: dequantize FP8 to BF16.
+    weight_fp8, scale_inv = entry["weight"], entry["scale"]
+    del buf[layer_prefix]
+    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+    weight_bf16 = scaled_dequantize(
+        weight_fp8,
+        scale_inv,
+        group_shape=GroupShape(block_size, block_size),
+        out_dtype=torch.bfloat16,
+    )
+
+    # Load the dequantized weight into shard 0 of the fused buffer.
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    param = params_dict[fused_name]
+    param.weight_loader(param, weight_bf16, 0)
+    loaded_params.add(fused_name)
+    return True
 
 
 def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
@@ -961,7 +1026,8 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        # MLA Sparse (with Indexer) introduced by DS v3.2 can be enabled or not (EXPERIMENTAL)
+        self.is_v32 = False if envs.VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL else hasattr(config, "index_topk")
 
         if self.is_v32:
             self.indexer_rope_emb = get_rope(
@@ -1338,6 +1404,10 @@ class DeepseekV2ForCausalLM(
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.is_fp4_ckpt = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_fp4"
+        )
 
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
@@ -1463,13 +1533,14 @@ class DeepseekV2ForCausalLM(
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
         _pending_wk_fp8: dict = {}  # When WK is in FP8, we dequant to BF16 for fusion
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
+        if not on_gfx906():
+            # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
+            indexer_fused_mapping = [
+                ("wk_weights_proj", "wk", 0),
+                ("wk_weights_proj", "weights_proj", 1),
+            ]
+            stacked_params_mapping.extend(indexer_fused_mapping)
 
         if self.use_mha:
             stacked_params_mapping.extend(mha_params_mapping)
@@ -1653,6 +1724,15 @@ class DeepseekV2ForCausalLM(
 
                         if is_pp_missing_parameter(name, self):
                             continue
+
+                        # ========================================================
+                        # Ignore Indexer Weights of MLA Sparse if VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL 
+                        # (it might disable MTP as well which depends on indexer)
+                        # ========================================================
+                        if envs.VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL and name not in params_dict:
+                            if "indexer" in name:
+                                continue
+                        # ========================================================
 
                         param = params_dict[name]
                         weight_loader = getattr(

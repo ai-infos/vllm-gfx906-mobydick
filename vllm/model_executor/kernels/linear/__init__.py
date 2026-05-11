@@ -227,9 +227,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        ExllamaLinearKernel, # Uses ops.gptq_gemm which is optimized for gfx906 whereas TritonW4A16LinearKernel and ConchLinearKernel are not (~1/10th speed of gptq_gemm)
         TritonW4A16LinearKernel,
         ConchLinearKernel,
-        ExllamaLinearKernel,
     ],
     PlatformEnum.XPU: [
         XPUW4A8IntLinearKernel,

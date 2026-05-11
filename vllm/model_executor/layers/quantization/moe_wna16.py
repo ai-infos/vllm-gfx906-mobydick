@@ -91,7 +91,7 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16, torch.half]
+        return [torch.half, torch.float32] # moe_wna16_gemm kernel has been updated to support only fp16 and fp32 (for gfx906)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -203,6 +203,13 @@ class MoeWNA16Config(QuantizationConfig):
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, FusedMoE):
+            if self.linear_quant_method == "gptq":
+                from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+                from vllm.model_executor.layers.quantization.utils.gptq_utils import get_dynamic_override
+                temp_config = GPTQConfig.from_config(self.full_config)
+                if get_dynamic_override(temp_config, layer_name=prefix) == False:
+                    return UnquantizedFusedMoEMethod(layer.moe_config)
+            
             return MoeWNA16Method(self, layer.moe_config)
         return None
 

@@ -61,9 +61,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
-        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-            FlashInferAllReduce,
-        )
+        if not current_platform.is_rocm():
+            from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+                FlashInferAllReduce,
+            )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -90,7 +91,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if self.use_flashinfer_allreduce and self.world_size > 1:
+        if self.use_flashinfer_allreduce and self.world_size > 1 and not current_platform.is_rocm():
             self.fi_ar_comm = FlashInferAllReduce(
                 group=self.cpu_group,
                 device=self.device,
