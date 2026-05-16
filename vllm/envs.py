@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     VLLM_ROCM_MLA_SPARSE_FP16_TRITON: bool = False
     VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE: int = 4
     VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE: int = 512 # Note: 512 is the sweet-spot for MI50 rocBLAS performance
+    VLLM_TORCH_SDPA_PREFILL: bool = False
+    VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS: int = 0
+    VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS: int = 0
+    VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE: int = 0
+    VLLM_TORCH_SDPA_PREFILL_BACKEND: str = "math" # auto, math, flash
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
@@ -989,6 +994,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE": lambda: int(
         os.environ.get("VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL", "False").lower() in ("true", "1")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_BACKEND": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_BACKEND", "math").lower()
     ),
     "VLLM_ROCM_MLA_SPARSE_FP16": lambda: (
         os.getenv("VLLM_ROCM_MLA_SPARSE_FP16", "False").lower() in ("true", "1")

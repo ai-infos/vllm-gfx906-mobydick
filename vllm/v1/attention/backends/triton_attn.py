@@ -20,7 +20,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.platforms.rocm import on_gfx906
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
@@ -46,87 +45,18 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
     kv_cache_uses_per_token_head_scales,
 )
+from vllm.v1.attention.ops.torch_prefill_attention import (
+    can_use_torch_sdpa_prefill, torch_sdpa_prefill_attention)
 
 logger = init_logger(__name__)
 
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-except (ImportError, AttributeError):
-    SDPBackend = None
-    sdpa_kernel = None
-
-try:
-    from torch.nn.attention.bias import causal_lower_right
-except (ImportError, AttributeError):
-    causal_lower_right = None
 
 
-def _read_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except ValueError:
-        logger.warning("Invalid %s=%r; using %d", name, os.environ.get(name), default)
-        return default
 
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
-ENABLE_GFX906_TORCH_SDPA_PREFILL = (
-    os.environ.get("VLLM_GFX906_TORCH_SDPA_PREFILL", "1").lower()
-    not in ("0", "false", "off", "no")
-)
-GFX906_TORCH_SDPA_PREFILL_MIN_TOKENS = _read_int_env(
-    "VLLM_GFX906_TORCH_SDPA_PREFILL_MIN_TOKENS", 0)
-GFX906_TORCH_SDPA_PREFILL_MAX_TOKENS = _read_int_env(
-    "VLLM_GFX906_TORCH_SDPA_PREFILL_MAX_TOKENS", 0)
-GFX906_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE = _read_int_env(
-    "VLLM_GFX906_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE", 0)
-GFX906_TORCH_SDPA_PREFILL_BACKEND = os.environ.get(
-    "VLLM_GFX906_TORCH_SDPA_PREFILL_BACKEND", "math").lower()
-_LOGGED_GFX906_TORCH_SDPA_PREFILL = False
-
-
-@contextlib.contextmanager
-def _torch_sdpa_prefill_backend() -> Iterator[None]:
-    if GFX906_TORCH_SDPA_PREFILL_BACKEND == "auto" or sdpa_kernel is None:
-        yield
-        return
-    if GFX906_TORCH_SDPA_PREFILL_BACKEND == "math" and SDPBackend is not None:
-        with sdpa_kernel([SDPBackend.MATH]):
-            yield
-        return
-    yield
-
-
-def _causal_lower_right_mask(
-    query_len: int,
-    kv_len: int,
-    device: torch.device,
-    query_start_pos: int = 0,
-    full_query_len: int | None = None,
-) -> torch.Tensor:
-    if full_query_len is None:
-        full_query_len = query_len
-    context_len = kv_len - full_query_len
-    query_pos = query_start_pos + torch.arange(query_len, device=device)[:, None]
-    kv_pos = torch.arange(kv_len, device=device)[None, :]
-    return kv_pos <= context_len + query_pos
-
-
-def _log_gfx906_torch_sdpa_prefill_once() -> None:
-    global _LOGGED_GFX906_TORCH_SDPA_PREFILL
-    if _LOGGED_GFX906_TORCH_SDPA_PREFILL:
-        return
-    _LOGGED_GFX906_TORCH_SDPA_PREFILL = True
-    logger.info(
-        "Using experimental gfx906 Torch SDPA prefill path "
-        "(backend=%s, min_tokens=%d, max_tokens=%d, q_chunk_size=%d)",
-        GFX906_TORCH_SDPA_PREFILL_BACKEND,
-        GFX906_TORCH_SDPA_PREFILL_MIN_TOKENS,
-        GFX906_TORCH_SDPA_PREFILL_MAX_TOKENS,
-        GFX906_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE,
-    )
 
 
 @dataclass
@@ -601,7 +531,7 @@ class TritonAttentionImpl(AttentionImpl):
             seq_lens_cpu = query_lens_cpu
         return seq_lens_cpu
 
-    def _can_use_gfx906_torch_sdpa_prefill(
+    def _can_use_torch_sdpa_prefill(
         self,
         q: torch.Tensor,
         key_cache: torch.Tensor,
@@ -610,55 +540,33 @@ class TritonAttentionImpl(AttentionImpl):
         output_scale: torch.Tensor | None,
         mm_prefix_range_tensor: torch.Tensor | None,
     ) -> bool:
-        if not (ENABLE_GFX906_TORCH_SDPA_PREFILL and on_gfx906()):
-            return False
-        if self.attn_type != AttentionType.DECODER:
-            return False
-        if attn_metadata.max_query_len <= 1:
-            return False
-        if output_scale is not None:
-            return False
-        if self._kv_quant_mode != KVQuantMode.NONE:
-            return False
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            return False
-        if key_cache.dtype != q.dtype or value_cache.dtype != q.dtype:
-            return False
-        if self.alibi_slopes is not None or self.use_alibi_sqrt:
-            return False
-        if self.sinks is not None:
-            return False
-        if self.logits_soft_cap != 0:
-            return False
-        if self.sliding_window != (-1, -1):
-            return False
-        if self.chunk_lookback != -1:
-            return False
-        if mm_prefix_range_tensor is not None:
-            return False
-
         query_lens_cpu = (
             attn_metadata.query_start_loc_cpu[1:]
             - attn_metadata.query_start_loc_cpu[:-1]
         )
-        if (query_lens_cpu <= 1).any().item():
-            return False
-
-        total_prefill_tokens = int(query_lens_cpu.sum().item())
-        if total_prefill_tokens < GFX906_TORCH_SDPA_PREFILL_MIN_TOKENS:
-            return False
-        if (GFX906_TORCH_SDPA_PREFILL_MAX_TOKENS > 0
-                and total_prefill_tokens > GFX906_TORCH_SDPA_PREFILL_MAX_TOKENS):
-            return False
-
         seq_lens_cpu = self._torch_sdpa_prefill_seq_lens_cpu(attn_metadata)
-        if seq_lens_cpu is None:
-            return False
-        if (seq_lens_cpu < query_lens_cpu).any().item():
-            return False
-        return True
 
-    def _forward_gfx906_torch_sdpa_prefill(
+        return can_use_torch_sdpa_prefill(
+            num_actual_tokens=attn_metadata.num_actual_tokens,
+            max_query_len=attn_metadata.max_query_len,
+            query_lens_cpu=query_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            attn_type=self.attn_type,
+            kv_quant_mode=self._kv_quant_mode,
+            q_dtype=q.dtype,
+            k_dtype=key_cache.dtype,
+            v_dtype=value_cache.dtype,
+            alibi_slopes=self.alibi_slopes,
+            use_alibi_sqrt=self.use_alibi_sqrt,
+            sinks=self.sinks,
+            logits_soft_cap=self.logits_soft_cap,
+            sliding_window=self.sliding_window,
+            chunk_lookback=self.chunk_lookback,
+            output_scale=output_scale,
+            mm_prefix_range_tensor=mm_prefix_range_tensor,
+        )
+
+    def _forward_torch_sdpa_prefill(
         self,
         q: torch.Tensor,
         key_cache: torch.Tensor,
@@ -667,82 +575,21 @@ class TritonAttentionImpl(AttentionImpl):
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        query_start_loc_cpu = attn_metadata.query_start_loc_cpu
-        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         seq_lens_cpu = self._torch_sdpa_prefill_seq_lens_cpu(attn_metadata)
         assert seq_lens_cpu is not None
 
-        block_size = key_cache.shape[1]
-        num_kv_heads = key_cache.shape[2]
-        head_size = key_cache.shape[3]
-
-        with _torch_sdpa_prefill_backend():
-            for seq_idx in range(query_lens_cpu.shape[0]):
-                query_start = int(query_start_loc_cpu[seq_idx].item())
-                query_end = int(query_start_loc_cpu[seq_idx + 1].item())
-                query_len = int(query_lens_cpu[seq_idx].item())
-                kv_len = int(seq_lens_cpu[seq_idx].item())
-                num_kv_blocks = (kv_len + block_size - 1) // block_size
-
-                block_ids = block_table[seq_idx, :num_kv_blocks].to(torch.long)
-                k = key_cache.index_select(0, block_ids).reshape(
-                    -1, num_kv_heads, head_size)[:kv_len]
-                v = value_cache.index_select(0, block_ids).reshape(
-                    -1, num_kv_heads, head_size)[:kv_len]
-                if self.num_queries_per_kv != 1:
-                    k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
-                    v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
-
-                k_seq = k.transpose(0, 1).unsqueeze(0)
-                v_seq = v.transpose(0, 1).unsqueeze(0)
-
-                chunk_size = GFX906_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE
-                if chunk_size <= 0 or chunk_size >= query_len:
-                    q_seq = q[query_start:query_end].transpose(0, 1).unsqueeze(0)
-                    attn_mask = None
-                    is_causal = True
-                    if kv_len != query_len:
-                        is_causal = False
-                        if causal_lower_right is not None:
-                            attn_mask = causal_lower_right(query_len, kv_len)
-                        else:
-                            attn_mask = _causal_lower_right_mask(
-                                query_len, kv_len, q.device)
-
-                    out = F.scaled_dot_product_attention(
-                        q_seq,
-                        k_seq,
-                        v_seq,
-                        attn_mask=attn_mask,
-                        is_causal=is_causal,
-                        scale=self.scale,
-                    )
-                    output[query_start:query_end].copy_(
-                        out.squeeze(0).transpose(0, 1))
-                    continue
-
-                for local_start in range(0, query_len, chunk_size):
-                    local_end = min(local_start + chunk_size, query_len)
-                    q_start = query_start + local_start
-                    q_end = query_start + local_end
-                    q_seq = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
-                    attn_mask = _causal_lower_right_mask(
-                        local_end - local_start,
-                        kv_len,
-                        q.device,
-                        query_start_pos=local_start,
-                        full_query_len=query_len,
-                    )
-                    out = F.scaled_dot_product_attention(
-                        q_seq,
-                        k_seq,
-                        v_seq,
-                        attn_mask=attn_mask,
-                        is_causal=False,
-                        scale=self.scale,
-                    )
-                    output[q_start:q_end].copy_(out.squeeze(0).transpose(0, 1))
-        return output
+        return torch_sdpa_prefill_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            num_kv_heads=self.num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            scale=self.scale,
+            output=output,
+        )
 
     def forward(
         self,
@@ -849,7 +696,7 @@ class TritonAttentionImpl(AttentionImpl):
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
         
 
-        if self._can_use_gfx906_torch_sdpa_prefill(
+        if self._can_use_torch_sdpa_prefill(
                 query[:num_actual_tokens],
                 key_cache,
                 value_cache,
@@ -857,8 +704,7 @@ class TritonAttentionImpl(AttentionImpl):
                 output_scale,
                 mm_prefix_range_tensor,
         ):
-            _log_gfx906_torch_sdpa_prefill_once()
-            self._forward_gfx906_torch_sdpa_prefill(
+            self._forward_torch_sdpa_prefill(
                 query[:num_actual_tokens],
                 key_cache,
                 value_cache,
