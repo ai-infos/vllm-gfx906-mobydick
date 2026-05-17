@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
@@ -56,7 +57,7 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+NUM_PAR_SOFTMAX_SEGMENTS = envs.VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS
 
 
 @dataclass

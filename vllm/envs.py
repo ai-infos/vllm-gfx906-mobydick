@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     VLLM_TORCH_SDPA_DECODE: bool = False
     VLLM_TORCH_SDPA_DECODE_MAX_SEQS: int = 1
     VLLM_TORCH_SDPA_MTP_DECODE: bool = False
+    VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS: int = 16 # 64 or 128 is better for gfx906 with Qwen3.6 27B MTP (but needs more vram)
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
@@ -1172,6 +1173,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TTFT and overall throughput.
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
+    ),
+    # Number of parallel tiled softmax segments allocated for the Triton
+    # attention 3D decode path.
+    "VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": lambda: int(
+        os.getenv("VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS", "16")
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),

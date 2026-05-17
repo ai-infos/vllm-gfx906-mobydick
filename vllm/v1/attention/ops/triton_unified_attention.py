@@ -505,7 +505,7 @@ def _get_tile_size(
 
     # Default behavior
     if is_prefill:
-        return 32
+        return 32 if not on_gfx906() else 16 # better perf for gfx906
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
 
