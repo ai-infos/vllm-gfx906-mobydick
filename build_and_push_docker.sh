@@ -6,12 +6,13 @@ set -e
 # chmod +x ./build_and_push_docker.sh && docker login -u aiinfos && ./build_and_push_docker.sh 
 # it will default to current branch name: v0.23.1rc0.x or from another branch: e.g. "./build_and_push_docker.sh v0.17.1rc0.x"
 # NB2: you can force ROCM/PyTorch versions with: 
-# sudo ./build_and_push_docker.sh v0.23.1rc0.x 7.2.1 2.11.0
+# MAX_JOBS=16 sudo ./build_and_push_docker.sh v0.23.1rc0.x 7.2.1 2.11.0
 IMAGE_NAME="aiinfos/vllm-gfx906-mobydick"
 IMAGE_TAG="${1:-v0.23.1rc0.x}"
 ROCM_VERSION="${2:-6.3.3}"
 PYTORCH_VERSION="${3:-2.11.0}"
 TRANSFORMERS_VERSION="5.7.0"
+MAX_JOBS="${MAX_JOBS:-16}"
 
 # Determine amdsmi package version based on ROCm version
 if [[ $ROCM_VERSION == 7* ]]; then
@@ -24,6 +25,7 @@ fi
 BASE_IMAGE="docker.io/mixa3607/pytorch-gfx906:v${PYTORCH_VERSION}-rocm-${ROCM_VERSION}"
 
 echo "Using base image: ${BASE_IMAGE}"
+echo "Limiting native builds to ${MAX_JOBS} parallel jobs per build stage."
 echo "Creating Dockerfile..."
 
 cat << EOF > Dockerfile
@@ -45,6 +47,10 @@ RUN pip install "${AMDSMI_PKG}"
 # Build stage: Install build dependencies
 # ==========================================
 FROM rocm_base AS build_base
+
+# Limit concurrent compiler processes to avoid exhausting host memory.
+ENV MAX_JOBS=${MAX_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS}
 
 # Install necessary build tools
 RUN apt-get update && apt-get install -y \\
