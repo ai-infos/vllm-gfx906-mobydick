@@ -14,6 +14,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
@@ -30,9 +31,9 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
 
-logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -54,10 +55,6 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     return data.to(Q.dtype)
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_stages=1, num_warps=2)],
-    key=[]
-)
 @triton.jit
 def kernel_unified_attention(
     # Output destinations.  In 2D mode we write the final result into
@@ -133,6 +130,7 @@ def kernel_unified_attention(
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
     # per-segment partials, finalized by ``reduce_segments``.
     IS_3D: tl.constexpr,
+    CAUSAL: tl.constexpr,
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
     # FP8_PER_TOKEN_HEAD (3).
@@ -175,9 +173,10 @@ def kernel_unified_attention(
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_head_mask = offs_m < BLOCK_Q * num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
@@ -186,7 +185,9 @@ def kernel_unified_attention(
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    query_mask_1 = (
+        (query_offset_1 < num_query_heads) & query_head_mask
+    ).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     Q = tl.load(
@@ -232,6 +233,7 @@ def kernel_unified_attention(
         SLIDING_WINDOW,
         USE_MM_PREFIX,
         IS_3D,
+        CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
     )
@@ -295,11 +297,13 @@ def kernel_unified_attention(
         seq_mask = compute_kv_seq_mask(
             query_abs_pos,
             seq_offset,
+            seq_len,
             seq_idx,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
+            CAUSAL,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
         )
@@ -505,7 +509,7 @@ def _get_tile_size(
 
     # Default behavior
     if is_prefill:
-        return 32
+        return 32 if not on_gfx906() else 16 # better perf for gfx906
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
 
@@ -547,7 +551,6 @@ def unified_attention(
     # Chunked attention: restrict attention to aligned blocks with lookback.
     chunk_lookback=-1,
 ):
-    assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
@@ -582,8 +585,6 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
-    head_size_padded = triton.next_power_of_2(head_size)
-    
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
@@ -610,78 +611,29 @@ def unified_attention(
     elif sliding_window_val <= 0:
         chunk_lookback = -1
 
-    # Tile sizes for prefill and decode.
-    # Note: tile size must be at least 32 for fp8 (element_size == 1).
-    is_fp8 = q.element_size() == 1
-    min_tile_size = 32 if is_fp8 else 16
-    abs_min_tile_size = 32 if is_fp8 else 8
+    TILE_SIZE_PREFILL = _get_tile_size(
+        head_size, sliding_window_val, q.element_size(), is_prefill=True
+    )
+    TILE_SIZE_DECODE = _get_tile_size(
+        head_size, sliding_window_val, q.element_size(), is_prefill=False
+    )
+    if on_gfx906():
+        # MI50/MI60 (gfx906) tuned
+        launch_kwargs = {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+        }
+    else:
+        launch_kwargs = {}
 
-    def _next_power_of_two(x: int) -> int:
-        if x <= 1:
-            return 1
-        return 1 << (x - 1).bit_length()
-
-    preferred_prefill = min(_next_power_of_two(block_size), 256)
-    preferred_prefill = max(preferred_prefill, min_tile_size)
-    preferred_decode = max(min_tile_size,
-                           16 if q.element_size() >= 2 else 32)
-    
-    # Gemma3 models use optimized values from upstream
-    if _is_gemma3_attention(head_size, sliding_window_val):
-        preferred_decode = 32
-        
-    preferred_decode = min(preferred_decode, preferred_prefill)
-
-    max_tile_shared = None
-    shared_mem_limit = None
-    try:
-        device_props = torch.cuda.get_device_properties(q.device)
-        shared_mem_limit = max(
-            getattr(device_props, "sharedMemPerBlockOptin", 0),
-            getattr(device_props, "sharedMemPerBlock", 0),
-        )
-        if shared_mem_limit == 0:
-            # Fallback to the architectural minimum when runtime does not report.
-            shared_mem_limit = 64 * 1024
-        if shared_mem_limit and shared_mem_limit > 0:
-            head_bytes = max(2 * head_size_padded *
-                             max(k.element_size(), v.element_size(), 1), 1)
-            softmax_bytes = max(BLOCK_M * 4, 1)
-            max_tile_per_head = shared_mem_limit // head_bytes
-            max_tile_softmax = shared_mem_limit // softmax_bytes
-            if max_tile_per_head > 0:
-                candidates = [max_tile_per_head]
-                if max_tile_softmax > 0:
-                    candidates.append(max_tile_softmax)
-                max_tile_shared = max(abs_min_tile_size, min(candidates))
-    except Exception:  # pragma: no cover
-        max_tile_shared = None
-
-    max_tile_block = min(_next_power_of_two(block_size), 256)
-    kv_elem_bytes = max(k.element_size(), v.element_size(), 1)
-
-    def _estimate_shared(tile: int) -> int:
-        if shared_mem_limit is None or shared_mem_limit <= 0:
-            return 0
-        shared = 0
-        shared += 2 * head_size_padded * tile * kv_elem_bytes
-        shared += 2 * BLOCK_M * tile * 4
-        return shared
-
-    def _final_tile(preferred: int) -> int:
-        tile = max(preferred, min_tile_size)
-        tile = _next_power_of_two(tile)
-        tile = min(tile, max_tile_block)
-        if max_tile_shared is not None and max_tile_shared > 0:
-            while tile > max_tile_shared and tile > abs_min_tile_size:
-                tile //= 2
-        if shared_mem_limit and shared_mem_limit > 0:
-            while tile > abs_min_tile_size and _estimate_shared(tile) > shared_mem_limit:
-                tile //= 2
-        return max(tile, abs_min_tile_size)
-
-    TILE_SIZE_PREFILL = _final_tile(preferred_prefill)
-    TILE_SIZE_DECODE = _final_tile(preferred_decode)
+    max_seqlen_q_3d = (
+        softmax_segm_output.shape[0] // seq_threshold_3D
+        if seq_threshold_3D is not None
+        and seq_threshold_3D > 0
+        and softmax_segm_output is not None
+        else 1
+    )
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
@@ -694,7 +646,8 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or max_seqlen_q > max_seqlen_q_3d
+        or q.shape[0] > softmax_segm_output.shape[0]
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
@@ -704,6 +657,16 @@ def unified_attention(
     # caches and their strides are required arguments; non-per-token-head
     # modes pass dummy zeros (the code path is dead-code eliminated by
     # the ``USE_PER_TOKEN_HEAD_SCALES`` constexpr branch in the kernel).
+    logger.info_once(
+        "unified_attention route: %s "
+        "(max_query_len=%d, q_tokens=%d, num_seqs=%d, max_query_len_3d=%d)",
+        "3d" if use_3d else "2d",
+        max_seqlen_q,
+        q.shape[0],
+        num_seqs,
+        max_seqlen_q_3d,
+    )
+
     if use_per_token_head_scales:
         ks_strides = k_scale_cache.stride()
         vs_strides = v_scale_cache.stride()
@@ -730,7 +693,7 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads)
         tile_size = TILE_SIZE_PREFILL
     else:
-        grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
+        grid = (total_num_q_blocks, num_kv_heads, num_segments)
         tile_size = TILE_SIZE_DECODE
 
     kernel_unified_attention[grid](
@@ -795,9 +758,11 @@ def unified_attention(
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
+        CAUSAL=causal,
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
+        **launch_kwargs,
     )
 
     if use_3d:
@@ -818,6 +783,7 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
             USE_FP8=output_scale is not None,
+            **launch_kwargs,
         )

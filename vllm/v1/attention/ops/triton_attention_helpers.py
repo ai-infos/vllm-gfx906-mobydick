@@ -153,6 +153,7 @@ def compute_tile_loop_bounds(
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
     IS_3D: tl.constexpr,
+    CAUSAL: tl.constexpr,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
 ):
@@ -173,13 +174,11 @@ def compute_tile_loop_bounds(
     """
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-    if USE_MM_PREFIX:
+    if CAUSAL:
+        max_seq_prefix_len = context_len + (q_block_local_idx + 1) * BLOCK_Q
+    else:
+        max_seq_prefix_len = seq_len
+    if USE_MM_PREFIX or not CAUSAL:
         # image bidirectional attention ranges require a full range
         # including q_block padding to make sure doc mask is correct
         max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
@@ -196,10 +195,7 @@ def compute_tile_loop_bounds(
     if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
         # Query rows covered by this Q-block
         qpos_lo = q_block_local_idx * BLOCK_Q
-        qpos_hi = tl.minimum(
-            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
-            cur_batch_query_len - 1,
-        )
+        qpos_hi = tl.minimum(qpos_lo + BLOCK_Q - 1, cur_batch_query_len - 1)
         # For sliding window, each query position q can only attend to
         # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
         # where q_abs = context_len + q
@@ -212,7 +208,10 @@ def compute_tile_loop_bounds(
             first_allowed_key = ((q_abs // CHUNK_SIZE) - CHUNK_LOOKBACK) * CHUNK_SIZE
         else:
             first_allowed_key = q_abs - SLIDING_WINDOW + 1
-        last_allowed_key = context_len + qpos_hi
+        if CAUSAL:
+            last_allowed_key = context_len + qpos_hi
+        else:
+            last_allowed_key = seq_len - 1
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
@@ -261,11 +260,13 @@ def store_segm_reduce_scalars(
 def compute_kv_seq_mask(
     query_abs_pos,
     seq_offset,
+    seq_len,
     seq_idx,
     mm_prefix_range_ptr,
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
     MAX_MM_RANGES: tl.constexpr,
+    CAUSAL: tl.constexpr,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
 ):
@@ -280,8 +281,12 @@ def compute_kv_seq_mask(
     are non-default — the launcher zeros ``CHUNK_LOOKBACK`` whenever
     sliding window is disabled.
     """
-    # Compute attention mask: causal by default (key <= query)
-    seq_mask = seq_offset[None, :] <= query_abs_pos
+    # Compute attention mask: causal by default (key <= query), or all valid
+    # cached K/V positions when DFlash-style non-causal drafting is requested.
+    if CAUSAL:
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+    else:
+        seq_mask = seq_offset[None, :] < seq_len
 
     # Apply sliding window / chunked attention to base mask
     # BEFORE mm_prefix OR.

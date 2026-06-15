@@ -1287,6 +1287,7 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
@@ -1299,6 +1300,7 @@ class SpecDecodeBaseProposer:
         )
 
         return base
+
 
     def _get_model(self) -> nn.Module:
         """

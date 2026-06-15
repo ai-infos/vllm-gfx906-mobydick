@@ -11,9 +11,10 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.triton_utils import triton
 from vllm.triton_utils import tl
+from vllm.triton_utils import triton
+from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -27,12 +28,84 @@ MOE_LAYER_ROUTER_GATE_SUFFIXES = {
 
 def get_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_stages=3, num_warps=2),
+        # Decode/MTP uses this path for skinny GEMMs (M <= 16).  On gfx906,
+        # smaller N tiles expose more work when TP makes each shard narrow,
+        # while larger K/N tiles still win for wider projections.
+        triton.Config(
+            {"BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=1,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=1,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=1,
+            num_warps=4,
+        ),
+        # Keep the previous schedule in the search space. Some non-gfx906
+        # environments can still prefer deeper pipelining.
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1},
+            num_stages=3,
+            num_warps=2,
+        ),
     ]
 
 def get_heuristics():
     return {
-        'BLOCK_SIZE_M': lambda args: min(16, triton.next_power_of_2(args['M']))
+        # gfx906 matrix instructions naturally operate on 16-row tiles. This
+        # path is only selected for M <= 16, so use the full tile instead of
+        # emitting separate 8-row variants for batches 5..8.
+        "BLOCK_SIZE_M": lambda args: 16
     }
 
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
@@ -61,8 +134,8 @@ def triton_matmul_kernel(
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
         GROUP_SIZE_M: tl.constexpr  #
 ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """Kernel for computing the matmul C = A x B.T.
+    A has shape (M, K), B has shape (N, K) and C has shape (M, N)
     """
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -107,7 +180,7 @@ def triton_matmul_kernel(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.float16)
+    c = accumulator.to(tl.float16) # acc in fp32 back to fp16
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
@@ -120,9 +193,13 @@ def triton_matmul_kernel(
 def triton_matmul(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[1], "Incompatible dimensions" # NOTE(gfx906): b.shape inv
+    assert a.dtype == b.dtype, "Matrices A and B must have the same dtype (assuming fp16)"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     N, K = b.shape # NOTE(gfx906): b.shape inv
+    launch_kwargs = {}
+    launch_kwargs["waves_per_eu"] = 1 # best for gfx906
+
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     # 1D launch kernel where each block gets its own program.
@@ -133,6 +210,7 @@ def triton_matmul(a, b):
         a.stride(0), a.stride(1),  #
         b.stride(1), b.stride(0),  # NOTE(gfx906): b.stride inv
         c.stride(0), c.stride(1),  #
+        **launch_kwargs,
     )
     return c
 
@@ -233,23 +311,93 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    use_skinny = (x.dtype in [torch.float16, torch.bfloat16] \
-                  and bias is None)
-    if use_skinny is not True:
-        return torch.nn.functional.linear(x, weight, bias)
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx906, on_gfx950
 
-    x_view = x.reshape(-1, x.size(-1))
-    n = x_view.shape[0]
+    n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
 
-    # prefer skinny GEMV kernel
-    if m % 4 == 0 and n == 1 and k <= 8192 and k % 8 == 0:
-        out = ops.LLMM1(weight, x_view, 4)
-        return out.view(*x.shape[:-1], weight.shape[0])
+    if not on_gfx906():
+        cu_count = num_compute_units()
 
+        # Next ^2 of n
+        N_p2 = 1 << (n - 1).bit_length()
+        # With 64 Ms per CU (each of 4 SIMDs working on a 16x16 tile),
+        # and each working on a 512-shard of K, how many CUs would we need?
+        rndup_cus = ((m + 64 - 1) // 64) * ((k + 512 - 1) // 512)
+        # How many of 4 waves in a group can work on same 16 Ms at same time?
+        # This reduces the Ms each group works on, i.e. increasing the number of CUs
+        # needed.
+        GrpsShrB = min(N_p2 // 16, 4)
+        # Given the above, how many CUs would we need?
+        CuNeeded = rndup_cus * GrpsShrB
+        # candidate for atomic reduce count splitk?
+        fits_wvsplitkrc = (
+            N_p2 * m * ((k + 512 - 1) // 512)
+        ) <= 128 * 1024 * 12  # deterministic
+        fits_wvsplitkrc &= CuNeeded <= cu_count
+
+        use_skinny_reduce_counting = (
+            envs.VLLM_ROCM_USE_SKINNY_GEMM
+            and on_gfx950()
+            and x.dtype in [torch.float16, torch.bfloat16]
+            and (
+                10 <= n <= 128
+                and k % 8 == 0
+                and k > 512
+                and m % 16 == 0
+                and fits_wvsplitkrc
+                and weight.is_contiguous()
+            )
+        )
+        if use_skinny_reduce_counting:
+            out = ops.wvSplitKrc(weight, x.reshape(-1, x.size(-1)), cu_count, bias)
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+
+        if use_aiter_triton_gemm(n, m, k, x.dtype):
+            from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+
+            return gemm_a16w16(x, weight, bias)
+
+    use_skinny = (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and (on_gfx906() or on_gfx9() or on_gfx1x())
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and k % 8 == 0
+    )
+
+    if not use_skinny:
+        return torch.nn.functional.linear(x, weight, bias)
+
+    x_view = x.reshape(-1, x.size(-1))
+    # Prefer skinny GEMV kernel
+    if (
+        m % 4 == 0
+        and n == 1
+        and k <= 8192
+        and bias is None
+    ):
+        out = ops.LLMM1(weight, x_view, 4)
+        return out.reshape(*x.shape[:-1], weight.shape[0])
+    elif m > 8 and 0 < n <= 4 and (on_gfx9() or on_gfx1x()):
+        out = ops.wvSplitK(weight, x_view, cu_count, bias) # matrix cores not supported by gfx906 so excluded here
+        return out.reshape(*x.shape[:-1], weight.shape[0])
     # low batch size, use triton matmul
-    if n <= 16:
+    elif n <= 16 and bias is None:
+        # gfx906 / MI50:
+        # For Qwen3.6 TP=8 MLP down projection, the shape is typically:
+        #   x:      [n, 2176]
+        #   weight: [5120, 2176]
+        #   out:    [n, 5120]
+        #
+        # Focused benchmark showed torch/hipBLAS is faster than this Triton
+        # skinny GEMM for m=5120 and k in roughly 2048..2304, for n=2..16.
+        #
+        # But for k >= 2560, Triton becomes much faster again, so do not
+        # disable Triton for all m=5120 row projections.
+        if on_gfx906() and n > 1 and m == 5120 and 2048 <= k <= 2304:
+            return torch.nn.functional.linear(x, weight, bias)
+
         return triton_matmul(x if x.is_contiguous() else x.contiguous(), weight)
 
     # otherwise, use native torch

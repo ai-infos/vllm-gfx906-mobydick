@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
@@ -38,8 +39,17 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVQuantMode,
     get_kv_quant_mode,
     kv_cache_uses_per_token_head_scales,
+)
+from vllm.v1.attention.ops.torch_attention import (
+    can_use_torch_sdpa_decode,
+    can_use_torch_sdpa_mtp_decode,
+    can_use_torch_sdpa_prefill,
+    torch_sdpa_decode_attention,
+    torch_sdpa_mtp_decode_attention,
+    torch_sdpa_prefill_attention,
 )
 
 logger = init_logger(__name__)
@@ -47,7 +57,7 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+NUM_PAR_SOFTMAX_SEGMENTS = envs.VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS
 
 
 @dataclass
@@ -62,9 +72,14 @@ class TritonAttentionMetadata:
 
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
+    max_decode_query_len: int
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor | None
+    seq_lens_cpu_upper_bound: torch.Tensor | None
+    is_prefilling: torch.Tensor | None
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -73,6 +88,7 @@ class TritonAttentionMetadata:
     softmax_segm_output: torch.Tensor
     softmax_segm_max: torch.Tensor
     softmax_segm_expsum: torch.Tensor
+    causal: bool
 
     # For cascade attention.
     use_cascade: bool
@@ -177,9 +193,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
         headdim_padded = next_power_of_2(self.headdim)
+        self.max_decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+        self.max_3d_query_tokens = (
+            self.seq_threshold_3D * self.max_decode_query_len
+        )
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                self.max_3d_query_tokens,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -188,12 +208,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (
+                self.max_3d_query_tokens,
+                self.num_heads_q,
+                self.num_par_softmax_segments,
+            ),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (
+                self.max_3d_query_tokens,
+                self.num_heads_q,
+                self.num_par_softmax_segments,
+            ),
             dtype=torch.float32,
             device=device,
         )
@@ -243,9 +271,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
+            max_decode_query_len=self.max_decode_query_len,
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
+            is_prefilling=common_attn_metadata.is_prefilling,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
@@ -259,6 +292,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            causal=common_attn_metadata.causal,
         )
         return attn_metadata
 
@@ -298,6 +332,10 @@ class TritonAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
         return True
 
     @staticmethod
@@ -503,6 +541,202 @@ class TritonAttentionImpl(AttentionImpl):
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
 
+    def _torch_sdpa_seq_lens_cpu(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        query_lens_cpu = (
+            attn_metadata.query_start_loc_cpu[1:]
+            - attn_metadata.query_start_loc_cpu[:-1]
+        )
+        seq_lens_cpu = attn_metadata.seq_lens_cpu_upper_bound
+        if seq_lens_cpu is None:
+            if attn_metadata.max_seq_len != attn_metadata.max_query_len:
+                return None
+            seq_lens_cpu = query_lens_cpu
+        return seq_lens_cpu
+
+    def _torch_sdpa_decode_seq_lens_cpu(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        return attn_metadata.seq_lens_cpu
+
+    def _torch_sdpa_mtp_decode_seq_lens_cpu(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        return attn_metadata.seq_lens_cpu
+
+    def _can_use_torch_sdpa_decode(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output_scale: torch.Tensor | None,
+        mm_prefix_range_tensor: torch.Tensor | None,
+    ) -> bool:
+        return can_use_torch_sdpa_decode(
+            q,
+            key_cache,
+            value_cache,
+            self.attn_type,
+            attn_metadata.max_query_len,
+            self._kv_quant_mode,
+            self.alibi_slopes,
+            self.use_alibi_sqrt,
+            self.sinks,
+            self.logits_soft_cap,
+            self.sliding_window,
+            self.chunk_lookback,
+            self._torch_sdpa_decode_seq_lens_cpu(attn_metadata),
+            attn_metadata.query_start_loc_cpu,
+            output_scale,
+            mm_prefix_range_tensor,
+        )
+
+    def _can_use_torch_sdpa_mtp_decode(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output_scale: torch.Tensor | None,
+        mm_prefix_range_tensor: torch.Tensor | None,
+    ) -> bool:
+        return can_use_torch_sdpa_mtp_decode(
+            q,
+            key_cache,
+            value_cache,
+            self.attn_type,
+            attn_metadata.max_query_len,
+            attn_metadata.max_decode_query_len,
+            self._kv_quant_mode,
+            self.alibi_slopes,
+            self.use_alibi_sqrt,
+            self.sinks,
+            self.logits_soft_cap,
+            self.sliding_window,
+            self.chunk_lookback,
+            self._torch_sdpa_mtp_decode_seq_lens_cpu(attn_metadata),
+            attn_metadata.query_start_loc_cpu,
+            attn_metadata.is_prefilling,
+            output_scale,
+            mm_prefix_range_tensor,
+        )
+
+    def _can_use_torch_sdpa_prefill(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output_scale: torch.Tensor | None,
+        mm_prefix_range_tensor: torch.Tensor | None,
+    ) -> bool:
+        query_lens_cpu = (
+            attn_metadata.query_start_loc_cpu[1:]
+            - attn_metadata.query_start_loc_cpu[:-1]
+        )
+        seq_lens_cpu = self._torch_sdpa_seq_lens_cpu(attn_metadata)
+
+        return can_use_torch_sdpa_prefill(
+            num_actual_tokens=attn_metadata.num_actual_tokens,
+            max_query_len=attn_metadata.max_query_len,
+            query_lens_cpu=query_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            attn_type=self.attn_type,
+            kv_quant_mode=self._kv_quant_mode,
+            q_dtype=q.dtype,
+            k_dtype=key_cache.dtype,
+            v_dtype=value_cache.dtype,
+            alibi_slopes=self.alibi_slopes,
+            use_alibi_sqrt=self.use_alibi_sqrt,
+            sinks=self.sinks,
+            logits_soft_cap=self.logits_soft_cap,
+            sliding_window=self.sliding_window,
+            chunk_lookback=self.chunk_lookback,
+            output_scale=output_scale,
+            mm_prefix_range_tensor=mm_prefix_range_tensor,
+        )
+
+    def _forward_torch_sdpa_decode(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_lens_cpu = self._torch_sdpa_decode_seq_lens_cpu(attn_metadata)
+        assert seq_lens_cpu is not None
+
+        return torch_sdpa_decode_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            num_kv_heads=self.num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            scale=self.scale,
+            output=output,
+        )
+
+
+    def _forward_torch_sdpa_mtp_decode(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_lens_cpu = self._torch_sdpa_mtp_decode_seq_lens_cpu(attn_metadata)
+        assert seq_lens_cpu is not None
+
+        return torch_sdpa_mtp_decode_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            num_kv_heads=self.num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            scale=self.scale,
+            output=output,
+        )
+
+    def _forward_torch_sdpa_prefill(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_lens_cpu = self._torch_sdpa_seq_lens_cpu(attn_metadata)
+        assert seq_lens_cpu is not None
+
+        return torch_sdpa_prefill_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            num_kv_heads=self.num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            scale=self.scale,
+            output=output,
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -607,6 +841,93 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        if (
+            attn_metadata.causal
+            and self._can_use_torch_sdpa_mtp_decode(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output_scale,
+                mm_prefix_range_tensor,
+            )
+        ):
+            logger.info_once(
+                "TritonAttentionImpl route: torch_sdpa_mtp_decode "
+                "(max_query_len=%d, num_tokens=%d)",
+                attn_metadata.max_query_len,
+                num_actual_tokens,
+            )
+            self._forward_torch_sdpa_mtp_decode(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                attn_metadata,
+                output[:num_actual_tokens],
+            )
+            return output
+
+        if (
+            attn_metadata.causal
+            and self._can_use_torch_sdpa_prefill(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output_scale,
+                mm_prefix_range_tensor,
+            )
+        ):
+            logger.info_once(
+                "TritonAttentionImpl route: torch_sdpa_prefill "
+                "(max_query_len=%d, num_tokens=%d)",
+                attn_metadata.max_query_len,
+                num_actual_tokens,
+            )
+            self._forward_torch_sdpa_prefill(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                attn_metadata,
+                output[:num_actual_tokens],
+            )
+            return output
+
+        if (
+            attn_metadata.causal
+            and self._can_use_torch_sdpa_decode(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output_scale,
+                mm_prefix_range_tensor,
+            )
+        ):
+            logger.info_once(
+                "TritonAttentionImpl route: torch_sdpa_decode "
+                "(max_query_len=%d, num_tokens=%d)",
+                attn_metadata.max_query_len,
+                num_actual_tokens,
+            )
+            self._forward_torch_sdpa_decode(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                attn_metadata,
+                output[:num_actual_tokens],
+            )
+            return output
+
+        logger.info_once(
+            "TritonAttentionImpl route: unified_attention "
+            "(max_query_len=%d, num_tokens=%d)",
+            attn_metadata.max_query_len,
+            num_actual_tokens,
+        )
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -617,7 +938,7 @@ class TritonAttentionImpl(AttentionImpl):
             seqused_k=seqused_k,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
-            causal=True,
+            causal=attn_metadata.causal,
             alibi_slopes=self.alibi_slopes,
             use_alibi_sqrt=self.use_alibi_sqrt,
             window_size=self.sliding_window,

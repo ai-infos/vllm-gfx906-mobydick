@@ -15,6 +15,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .prefix_prefill import context_attention_fwd
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import get_kv_quant_mode
+from vllm.v1.attention.ops.torch_attention import (
+    can_use_torch_sdpa_prefill, torch_sdpa_prefill_attention)
+from vllm.platforms.rocm import on_gfx906
 
 logger = init_logger(__name__)
 
@@ -270,6 +275,9 @@ def chunked_prefill_paged_decode(
     sinks=None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
+    query_start_loc_cpu: torch.Tensor | None = None,
+    seq_lens_cpu: torch.Tensor | None = None,
+    attn_type: AttentionType = AttentionType.DECODER,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
@@ -279,37 +287,94 @@ def chunked_prefill_paged_decode(
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
 
-    if max_query_len > 1:
-        context_attention_fwd(
-            q=query,
-            k=key,
-            v=value,
-            o=output,
-            kv_cache_dtype=kv_cache_dtype,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            b_loc=block_table,
-            b_start_loc=query_start_loc,
-            b_seq_len=seq_lens,
-            max_seq_len=max_seq_len,
-            max_input_len=max_query_len,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            alibi_slopes=alibi_slopes,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            skip_decode=True,
-            fp8_out_scale=output_scale,
-            sinks=sinks,
-            causal=causal,
-        )
-
-    block_size = value_cache.shape[3]
-    num_seqs = len(seq_lens)
     num_query_heads = query.shape[1]
     # key may be None in cross-attention decode (already cached from encoder)
     num_kv_heads = key.shape[1] if key is not None else key_cache.shape[1]
     num_queries_per_kv = num_query_heads // num_kv_heads
+
+    if max_query_len > 1:
+        prefill_handled = False
+        if on_gfx906():
+            q_dtype = query.dtype
+            k_dtype = key_cache.dtype
+            v_dtype = value_cache.dtype
+            kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+
+            if query_start_loc_cpu is not None:
+                q_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            else:
+                q_lens_cpu = (query_start_loc[1:] - query_start_loc[:-1]).cpu()
+
+            if seq_lens_cpu is None:
+                if max_seq_len == max_query_len:
+                    seq_lens_cpu = q_lens_cpu
+                else:
+                    seq_lens_cpu = seq_lens.cpu()
+
+            if can_use_torch_sdpa_prefill(
+                    num_actual_tokens=query.shape[0],
+                    max_query_len=max_query_len,
+                    query_lens_cpu=q_lens_cpu,
+                    seq_lens_cpu=seq_lens_cpu,
+                    attn_type=attn_type,
+                    kv_quant_mode=kv_quant_mode,
+                    q_dtype=q_dtype,
+                    k_dtype=k_dtype,
+                    v_dtype=v_dtype,
+                    alibi_slopes=alibi_slopes,
+                    use_alibi_sqrt=False,
+                    sinks=sinks,
+                    logits_soft_cap=0,
+                    sliding_window=(sliding_window - 1, 0)
+                    if sliding_window > 0 else (-1, -1),
+                    chunk_lookback=-1,
+                    output_scale=output_scale,
+                    mm_prefix_range_tensor=None,
+            ):
+                if query_start_loc_cpu is None:
+                    query_start_loc_cpu = query_start_loc.cpu()
+
+                torch_sdpa_prefill_attention(
+                    q=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=block_table,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    seq_lens_cpu=seq_lens_cpu,
+                    num_kv_heads=num_kv_heads,
+                    num_queries_per_kv=num_queries_per_kv,
+                    scale=sm_scale,
+                    output=output,
+                )
+                prefill_handled = True
+
+        if not prefill_handled:
+            context_attention_fwd(
+                q=query,
+                k=key,
+                v=value,
+                o=output,
+                kv_cache_dtype=kv_cache_dtype,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                b_loc=block_table,
+                b_start_loc=query_start_loc,
+                b_seq_len=seq_lens,
+                max_seq_len=max_seq_len,
+                max_input_len=max_query_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                alibi_slopes=alibi_slopes,
+                sliding_window=sliding_window,
+                sm_scale=sm_scale,
+                skip_decode=True,
+                fp8_out_scale=output_scale,
+                sinks=sinks,
+                causal=causal,
+            )
+
+    block_size = value_cache.shape[3]
+    num_seqs = len(seq_lens)
     head_size = query.shape[2]
 
     # Conversion of FP8 Tensor from uint8 storage to
@@ -331,7 +396,12 @@ def chunked_prefill_paged_decode(
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)
 
-    num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
+    if on_gfx906():
+        num_queries_per_kv_padded = triton.next_power_of_2(num_queries_per_kv)
+    else:
+        num_queries_per_kv_padded = max(
+            triton.next_power_of_2(num_queries_per_kv), 16
+        )
 
     from vllm.platforms.rocm import use_rocm_custom_paged_attention
 
@@ -355,6 +425,17 @@ def chunked_prefill_paged_decode(
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2:
         use_custom = False
+
+    triton_launch_kwargs = {}
+    if on_gfx906():
+        # MI50/gfx906 is sensitive to Triton default launch choices here.
+        # Match the conservative decode settings used by the newer Triton
+        # attention path to keep register/LDS pressure low on the fallback.
+        triton_launch_kwargs = {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+        }
 
     if use_custom:
         _PARTITION_SIZE_ROCM = 256
@@ -466,4 +547,5 @@ def chunked_prefill_paged_decode(
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
+            **triton_launch_kwargs,
         )
