@@ -1,6 +1,8 @@
 
 #include <cuda_fp16.h>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#endif
 
 template <typename scalar_t>
 class ScalarType {};
@@ -40,6 +42,38 @@ class ScalarType<half> {
   }
 };
 
+#ifdef USE_ROCM
+template <>
+class ScalarType<float> {
+ public:
+  using scalar_t = float;
+  using scalar_t2 = float2;
+
+  static __device__ float inline num2float(const float x) { return x; }
+
+  static __device__ float2 inline num2num2(const float x) {
+    return make_float2(x, x);
+  }
+
+  static __device__ float2 inline nums2num2(const float x1, const float x2) {
+    return make_float2(x1, x2);
+  }
+
+  static __host__ __device__ float inline float2num(const float x) { return x; }
+
+  static __host__ __device__ float inline int2num(const int x) {
+    return static_cast<float>(x);
+  }
+
+  static __host__ __device__ float2 inline num22float2(const float2 x) {
+    return x;
+  }
+
+  static __host__ __device__ float2 inline float22num2(const float2 x) {
+    return x;
+  }
+};
+#else
 template <>
 class ScalarType<nv_bfloat16> {
  public:
@@ -64,7 +98,7 @@ class ScalarType<nv_bfloat16> {
     return __float2bfloat16(x);
   }
 
-  static __host__ __device__ nv_bfloat16 inline int2num(const float x) {
+  static __host__ __device__ nv_bfloat16 inline int2num(const int x) {
     return __int2bfloat16_rn(x);
   }
 
@@ -77,16 +111,44 @@ class ScalarType<nv_bfloat16> {
   }
 #endif
 };
+#endif
 
-template <int lut>
-__device__ inline int lop3(int a, int b, int c) {
-  int res;
-  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
-               : "=r"(res)
-               : "r"(a), "r"(b), "r"(c), "n"(lut));
-  return res;
+#ifdef USE_ROCM
+__device__ __forceinline__ void atomicAdd_half(half* address, half val) {
+  unsigned int* address_as_ui =
+      (unsigned int*)((char*)address - ((size_t)address & 2));
+  unsigned int old = *address_as_ui;
+  unsigned int assumed;
+
+  do {
+    assumed = old;
+    __half_raw hsum;
+    hsum.x = (size_t)address & 2 ? (old >> 16) : (old & 0xffff);
+    half tmpres = __hadd(hsum, val);
+    hsum = __half_raw(tmpres);
+    old = (size_t)address & 2 ? (old & 0xffff) | (hsum.x << 16)
+                              : (old & 0xffff0000) | hsum.x;
+    old = atomicCAS(address_as_ui, assumed, old);
+  } while (assumed != old);
+}
+#endif
+
+__device__ __forceinline__ uint32_t bfi(const uint32_t S0, const uint32_t S1,
+                                        const uint32_t S2) {
+#if defined(USE_ROCM)
+  uint32_t result;
+  __asm__ (
+    "  v_bfi_b32  %0, %1, %2, %3  \n"
+    : "=v" (result)
+    : "v"(S0), "v"(S1), "v"(S2)
+  );
+  return result;
+#else
+  return (S0 & S1) | (~S0 & S2);
+#endif
 }
 
+#ifndef USE_ROCM
 template <int start_byte, int mask>
 __device__ inline uint32_t prmt(uint32_t a) {
   uint32_t res;
@@ -95,6 +157,7 @@ __device__ inline uint32_t prmt(uint32_t a) {
                : "r"(a), "n"(start_byte), "n"(mask));
   return res;
 }
+#endif
 
 template <typename scalar_t2, int bit>
 __device__ inline void dequant(int q, scalar_t2* res) {}
@@ -108,11 +171,11 @@ __device__ inline void dequant<half2, 4>(int q, half2* res) {
   const int MUL = 0x2c002c00;
   const int ADD = 0xd400d400;
 
-  int lo0 = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
-  int hi0 = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  int lo0 = bfi(LO, q, EX);
+  int hi0 = bfi(HI, q, EX);
   q >>= 8;
-  int lo1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
-  int hi1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  int lo1 = bfi(LO, q, EX);
+  int hi1 = bfi(HI, q, EX);
 
   res[0] = __hsub2(*reinterpret_cast<half2*>(&lo0),
                    *reinterpret_cast<const half2*>(&SUB));
@@ -126,6 +189,19 @@ __device__ inline void dequant<half2, 4>(int q, half2* res) {
                    *reinterpret_cast<const half2*>(&ADD));
 }
 
+#ifdef USE_ROCM
+template <>
+__device__ inline void dequant<float2, 4>(int q, float2* res) {
+  res[0] = make_float2(static_cast<float>((q >> 0) & 0xF),
+                       static_cast<float>((q >> 16) & 0xF));
+  res[1] = make_float2(static_cast<float>((q >> 4) & 0xF),
+                       static_cast<float>((q >> 20) & 0xF));
+  res[2] = make_float2(static_cast<float>((q >> 8) & 0xF),
+                       static_cast<float>((q >> 24) & 0xF));
+  res[3] = make_float2(static_cast<float>((q >> 12) & 0xF),
+                       static_cast<float>((q >> 28) & 0xF));
+}
+#else
 template <>
 __device__ inline void dequant<half2, 8>(int q, half2* res) {
   static constexpr uint32_t mask_for_elt_01 = 0x5250;
@@ -149,13 +225,13 @@ __device__ inline void dequant<nv_bfloat162, 4>(int q, nv_bfloat162* res) {
   static constexpr uint32_t MASK = 0x000f000f;
   static constexpr uint32_t EX = 0x43004300;
 
-  int lo0 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int lo0 = bfi(MASK, q, EX);
   q >>= 4;
-  int hi0 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int hi0 = bfi(MASK, q, EX);
   q >>= 4;
-  int lo1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int lo1 = bfi(MASK, q, EX);
   q >>= 4;
-  int hi1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int hi1 = bfi(MASK, q, EX);
 
   static constexpr uint32_t MUL = 0x3F803F80;
   static constexpr uint32_t ADD = 0xC300C300;
@@ -197,4 +273,5 @@ __device__ inline void dequant<nv_bfloat162, 8>(int q, nv_bfloat162* res) {
   bf16_result_ptr[1] = __byte_perm(fp32_intermediates_casted[2],
                                    fp32_intermediates_casted[3], 0x7632);
 }
+#endif
 #endif

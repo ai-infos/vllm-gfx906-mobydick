@@ -434,6 +434,8 @@ def test_per_head_quant_scales_backend_selection(
     [
         ("FLASH_ATTN", True, True),  # FlashAttn supports non-causal
         ("FLASH_ATTN", False, True),  # FlashAttn also works with causal
+        ("TRITON_ATTN", True, True),  # Triton unified attention supports DFlash
+        ("TRITON_ATTN", False, True),  # Triton also works with causal
         ("FLASHINFER", True, False),  # FlashInfer does not support non-causal
         ("FLASHINFER", False, True),  # FlashInfer works with causal
     ],

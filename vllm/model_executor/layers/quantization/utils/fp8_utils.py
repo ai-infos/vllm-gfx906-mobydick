@@ -27,6 +27,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
@@ -740,6 +741,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    is_gfx906: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -762,21 +764,33 @@ def _w8a8_triton_block_scaled_mm(
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    As_ptrs = As + offs_am * stride_As_m
+    if not is_gfx906:
+        As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+        if is_gfx906:
+            b_u8 = b.to(tl.uint8, bitcast=True)
+            b_sign = (b_u8 & 0x80).to(tl.uint16) << 8
+            b_exp = ((b_u8 & 0x78) >> 3).to(tl.uint16)
+            b_exp = tl.where(b_exp == 0, 0, b_exp + 8)
+            b_mant = (b_u8 & 0x07).to(tl.uint16) << 7
+            b = (b_sign | (b_exp << 10) | b_mant).to(tl.float16, bitcast=True)
+            a = a.to(tl.float16)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if is_gfx906:
+            accumulator += tl.dot(a, b) * b_s[None, :]
+        else:
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -836,7 +850,7 @@ def get_w8a8_block_fp8_configs(
 def w8a8_triton_block_scaled_mm(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: torch.Tensor | None,
     Bs: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype = torch.float16,
@@ -863,14 +877,17 @@ def w8a8_triton_block_scaled_mm(
     # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
     # so decode them to fp32 before launching the kernel.
     if current_platform.is_rocm() or current_platform.is_xpu():
-        if As.dtype == torch.float8_e8m0fnu:
+        if As is not None and As.dtype == torch.float8_e8m0fnu:
             As = _upcast_e8m0_to_fp32(As).contiguous()
         if Bs.dtype == torch.float8_e8m0fnu:
             Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
 
     assert A.shape[-1] == B.shape[-1]
-    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    assert A.is_contiguous()
+    if not on_gfx906():
+        assert As is not None
+        assert A.shape[:-1] == As.shape[:-1]
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     M = A.numel() // A.shape[-1]
 
     assert B.ndim == 2 and Bs.ndim == 2
@@ -881,6 +898,9 @@ def w8a8_triton_block_scaled_mm(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
+    if on_gfx906() and A.dtype == torch.float32:
+        A = A.to(torch.float16)
+
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:
         # Get the optimal config if there is one
@@ -889,14 +909,34 @@ def w8a8_triton_block_scaled_mm(
         # Default config
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
         # BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 2,
-        }
+        if on_gfx906():
+            if M <= 1:
+                block_m, group_m = 16, 16
+            elif M <= 8:
+                block_m, group_m = 16, 1
+            elif M <= 16:
+                block_m, group_m = 16, 8
+            elif M <= 64:
+                block_m, group_m = 32, 4
+            else:
+                block_m, group_m = 32, 8
+            config = {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": group_m,
+                "num_warps": 4,
+                "num_stages": 1,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
 
     def grid(META):
         return (
@@ -907,7 +947,7 @@ def w8a8_triton_block_scaled_mm(
         A,
         B,
         C,
-        As,
+        As if As is not None else A,
         Bs,
         M,
         N,
@@ -920,11 +960,12 @@ def w8a8_triton_block_scaled_mm(
         B.stride(0),
         C.stride(-2),
         C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
+        As.stride(-2) if As is not None else 0,
+        As.stride(-1) if As is not None else 0,
         Bs.stride(1),
         Bs.stride(0),
         **config,
+        is_gfx906=on_gfx906(),
     )
 
     return C

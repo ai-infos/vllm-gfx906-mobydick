@@ -10,6 +10,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.platforms.rocm import on_gfx906
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
@@ -20,6 +21,10 @@ def _quantize_and_setup_dispatch(
 ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor | None]:
     # Defer input quantization to the MoE kernel.
     if defer_input_quant:
+        a1q = a1
+        a1q_scale = None
+    elif on_gfx906() and quant_config.use_fp8_w8a8:
+        # gfx906 consumes FP8 weights through a software dequantization path.
         a1q = a1
         a1q_scale = None
     else:

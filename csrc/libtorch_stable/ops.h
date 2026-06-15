@@ -397,6 +397,8 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
 void gptq_shuffle(torch::stable::Tensor q_weight, torch::stable::Tensor q_perm,
                   int64_t bit);
 
+void gptq_shuffle_awq_qweight(torch::stable::Tensor q_weight, int64_t bit);
+
 void paged_attention_v1(
     torch::stable::Tensor& out, torch::stable::Tensor& query,
     torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
@@ -509,6 +511,10 @@ void indexer_k_quant_and_cache(
     int64_t quant_block_size,             // quantization block size
     const std::string& scale_fmt);
 
+void indexer_k_cache_fp16(
+    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& slot_mapping);
+
 // Concatenate query nope and rope for MLA/DSA attention
 void concat_mla_q(
     torch::stable::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]
@@ -525,3 +531,8 @@ void cp_gather_indexer_k_quant_cache(
                                                 // quant_block_size * 4]
     const torch::stable::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::stable::Tensor& cu_seq_lens);  // [batch_size + 1]
+
+void cp_gather_indexer_k_cache_fp16(
+    const torch::stable::Tensor& kv_cache, torch::stable::Tensor& dst_k,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& cu_seq_lens);

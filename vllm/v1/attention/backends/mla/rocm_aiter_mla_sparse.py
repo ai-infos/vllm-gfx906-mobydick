@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -361,6 +362,7 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.kv_cache_spec = kv_cache_spec
         self.model_config = vllm_config.model_config
         self.model_dtype = vllm_config.model_config.dtype
+        self.use_fp16_sparse = envs.VLLM_ROCM_MLA_SPARSE_FP16
         parallel_config = vllm_config.parallel_config
         self.device = device
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -398,6 +400,20 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+
+        self._prev_req_extent: int = 0
+        self._prev_indices_extent: int = 0
+        self._prev_metadata_key: tuple | None = None
+
+        if self.use_fp16_sparse:
+            self._num_attention_heads = max(16, self.num_heads)
+            self._mla_work_meta_data = None
+            self._mla_work_indptr = None
+            self._mla_work_info_set = None
+            self._mla_reduce_indptr = None
+            self._mla_reduce_final_map = None
+            self._mla_reduce_partial_map = None
+            return
 
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that
@@ -458,10 +474,6 @@ class ROCMAiterMLASparseMetadataBuilder(
             dtype=reduce_partial_map_type,
             device=device,
         )
-
-        self._prev_req_extent: int = 0
-        self._prev_indices_extent: int = 0
-        self._prev_metadata_key: tuple | None = None
 
     def build(
         self,
@@ -536,7 +548,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             self._num_attention_heads,
             clamped_seq_lens.tobytes(),
         )
-        if metadata_key != self._prev_metadata_key:
+        if not self.use_fp16_sparse and metadata_key != self._prev_metadata_key:
             from aiter import get_mla_metadata_v1
 
             get_mla_metadata_v1(
@@ -720,6 +732,26 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         # Get topk indices
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        if envs.VLLM_ROCM_MLA_SPARSE_FP16:
+            output_dtype = q.dtype
+            block_size = attn_metadata.block_size
+            valid = topk_indices >= 0
+            safe_indices = topk_indices.clamp_min(0)
+            logical_blocks = safe_indices // block_size
+            block_offsets = safe_indices % block_size
+            req_ids = attn_metadata.req_id_per_token[:, None].expand_as(topk_indices)
+            physical_blocks = attn_metadata.block_table[req_ids, logical_blocks]
+            global_indices = physical_blocks * block_size + block_offsets
+            global_indices.masked_fill_(~valid, -1)
+            attn_out, _ = reference_mla_sparse_prefill(
+                q.to(kv_c_and_k_pe_cache.dtype),
+                kv_c_and_k_pe_cache.view(-1, 1, kv_c_and_k_pe_cache.shape[-1]),
+                global_indices.unsqueeze(1),
+                self.softmax_scale,
+                self.kv_lora_rank,
+            )
+            return attn_out.to(output_dtype), None
 
         triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,

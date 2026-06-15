@@ -122,7 +122,7 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx906, on_gfx950
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -164,21 +164,21 @@ def rocm_unquantized_gemm_impl(
     if use_skinny_reduce_counting:
         return ops.wvSplitKrc(x, weight, cu_count, bias)
 
-    if use_aiter_triton_gemm(n, m, k, x.dtype):
+    if not on_gfx906() and use_aiter_triton_gemm(n, m, k, x.dtype):
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         return gemm_a16w16(x, weight, bias)
 
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
-        and (on_gfx9() or on_gfx1x())
+        and (on_gfx9() or on_gfx1x() or on_gfx906())
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0
     )
 
     if use_skinny:
         x_view = x.reshape(-1, x.size(-1))
-        if m > 8 and 0 < n <= 5:
+        if not on_gfx906() and m > 8 and 0 < n <= 5:
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
@@ -186,7 +186,7 @@ def rocm_unquantized_gemm_impl(
             out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
 
-    if rocm_aiter_ops.is_tgemm_enabled():
+    if not on_gfx906() and rocm_aiter_ops.is_tgemm_enabled():
         from aiter.tuned_gemm import tgemm
 
         return tgemm.mm(x, weight, bias)

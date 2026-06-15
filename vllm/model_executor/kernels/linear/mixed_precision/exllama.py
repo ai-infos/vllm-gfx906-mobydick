@@ -10,13 +10,18 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
 class ExllamaLinearKernel(MPLinearKernel):
-    SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
+    SUPPORTED_QUANT_TYPES = [
+        scalar_types.uint4b8,
+        scalar_types.uint8b128,
+        scalar_types.uint4,
+    ]
     # In theory supports `scalar_types.uint2b2, scalar_types.uint3b4` too but
     # currently untested so not added to the list
 
@@ -48,7 +53,9 @@ class ExllamaLinearKernel(MPLinearKernel):
                 "pack the zero points",
             )
 
-        if c.act_type != torch.float16:
+        if c.act_type != torch.float16 and not (
+            on_gfx906() and c.act_type == torch.float32
+        ):
             return False, "Exllama only supports float16 activations"
 
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
@@ -58,6 +65,8 @@ class ExllamaLinearKernel(MPLinearKernel):
                 "Exllama, supported types are: "
                 f"{cls.SUPPORTED_QUANT_TYPES}",
             )
+        if c.weight_type == scalar_types.uint4 and not on_gfx906():
+            return False, "AWQ Exllama routing is only enabled on gfx906"
 
         if c.group_size <= 0:
             return (
@@ -78,34 +87,27 @@ class ExllamaLinearKernel(MPLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         c = self.config
+        device = getattr(layer, self.w_q_name).device
 
-        # For Exllama, we need to set a zero-point tensor if there is not one
-        if not c.zero_points:
+        if c.zero_points:
+            def transform_w_zp(x):
+                permute_param_layout_(x, input_dim=0, output_dim=1)
+                return x.data.contiguous()
+
+            self._transform_param(layer, self.w_zp_name, transform_w_zp)
+        else:
+            # For Exllama, we need to set a zero-point tensor if there is not one
             self.w_zp_name = "qzeros"
-            device = getattr(layer, self.w_q_name).device
+            assert c.weight_type.has_bias()
             groups = c.partition_weight_shape[0] // c.group_size
             out_features = c.partition_weight_shape[1]
-
-            if c.weight_type.has_bias():
-                # if the type has a bias we have to create a zeros tensor that
-                # contains the bias values repeated for each group (-1 due to
-                # a bug in the original GPTQ checkpoint format leading to
-                # exllama kernel adding 1 to the zero points during inference)
-                # Documentation of the bug can be found here:
-                #  https://garden.danieldk.eu/GPTQ-Checkpoint-Format
-                zeros = torch.full(
-                    (groups, out_features),
-                    c.weight_type.bias - 1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-            else:
-                raise NotImplementedError(
-                    "A 0 zero-point is not supported by Exllama due to "
-                    "a bug in the original GPTQ checkpoint format leading to "
-                    "exllama kernel adding 1 to the zero points during "
-                    "inference"
-                )
+            zero_bias = c.weight_type.bias if on_gfx906() else c.weight_type.bias - 1
+            zeros = torch.full(
+                (groups, out_features),
+                zero_bias,
+                dtype=torch.int32,
+                device=device,
+            )
             zeros = pack_quantized_values_into_int32(zeros, c.weight_type, packed_dim=1)
             setattr(
                 layer, self.w_zp_name, torch.nn.Parameter(zeros, requires_grad=False)
@@ -140,7 +142,12 @@ class ExllamaLinearKernel(MPLinearKernel):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
             x.data = x.data.contiguous()
-            return x.to(dtype=c.act_type)
+            dtype = (
+                torch.float16
+                if on_gfx906() and c.act_type == torch.float32
+                else c.act_type
+            )
+            return x.to(dtype=dtype)
 
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
@@ -159,16 +166,30 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
 
-        # gptq_gemm supports GPTQv2 format by passing use_v2_format=True.
-        # However, the MPLinearLayerConfig doesn't contain format info.
-        # So hardcode GPTQv1 format here, to keep its behavior unchanged.
-        use_v2_format = False
+        use_v2_format = on_gfx906()
 
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
-        output = ops.gptq_gemm(
-            x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format, c.weight_type.size_bits
+
+        x_2d_fp16 = (
+            x_2d.to(torch.float16)
+            if on_gfx906() and x_2d.dtype == torch.float32
+            else x_2d
         )
+
+        output = ops.gptq_gemm(
+            x_2d_fp16,
+            w_q,
+            w_zp,
+            w_s,
+            w_g_idx,
+            True,
+            use_v2_format,
+            c.weight_type.size_bits,
+        )
+
+        if output.dtype != x.dtype:
+            output = output.to(x.dtype)
 
         if bias is not None:
             output.add_(bias)

@@ -511,6 +511,70 @@ def fp8_mqa_logits_torch(
     return logits
 
 
+def fp16_mqa_logits_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Reference FP16 indexer logits for the opt-in gfx906 sparse path."""
+    offsets = torch.arange(k.shape[0], device=q.device)[None, :]
+    mask = (offsets >= cu_seqlen_ks[:, None]) & (
+        offsets < cu_seqlen_ke[:, None]
+    )
+    scores = torch.einsum("mhd,nd->hmn", q, k).float()
+    logits = (scores.relu() * weights.T.unsqueeze(-1)).sum(dim=0)
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def fp16_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Reference paged FP16 indexer logits for the opt-in gfx906 sparse path."""
+    from vllm.utils.math_utils import cdiv
+
+    batch_size, next_n, _, _ = q.shape
+    block_size = kv_cache.shape[1]
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    for batch_idx in range(batch_size):
+        seq_lens = context_lens[batch_idx]
+        if seq_lens.ndim == 0:
+            max_seq_len = int(seq_lens.item())
+            seq_lens = torch.arange(
+                max_seq_len - next_n + 1,
+                max_seq_len + 1,
+                dtype=torch.int32,
+                device=q.device,
+            )
+        else:
+            max_seq_len = int(seq_lens.max().item())
+        num_blocks = cdiv(max_seq_len, block_size)
+        block_ids = block_tables[batch_idx, :num_blocks].to(torch.long)
+        k = kv_cache.index_select(0, block_ids).reshape(-1, q.shape[-1])
+        scores = torch.einsum("nhd,kd->hnk", q[batch_idx], k).float()
+        scores = (
+            scores.relu()
+            * weights[batch_idx * next_n : (batch_idx + 1) * next_n].T.unsqueeze(-1)
+        ).sum(dim=0)
+        offsets = torch.arange(k.shape[0], device=q.device)
+        scores.masked_fill_(offsets[None, :] >= seq_lens[:, None], float("-inf"))
+        logits[
+            batch_idx * next_n : (batch_idx + 1) * next_n, : k.shape[0]
+        ] = scores
+    return logits
+
+
 @functools.lru_cache
 def mqa_logits_module():
     mqa_logits_module_path = None
@@ -639,6 +703,7 @@ def rocm_aiter_sparse_attn_indexer(
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
+    use_fp16 = envs.VLLM_ROCM_MLA_SPARSE_FP16
     from vllm import _custom_ops as ops
     from vllm.utils.torch_utils import _resolve_layer_name
 
@@ -654,10 +719,15 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Prefill k_fp8 and k_scale buffers, used by
         # rocm_aiter_sparse_attn_indexer's prefill path
-        workspace_manager.get_simultaneous(
-            ((total_seq_lens, head_dim), fp8_dtype),
-            ((total_seq_lens, 4), torch.uint8),
-        )
+        if use_fp16:
+            workspace_manager.get_simultaneous(
+                ((total_seq_lens, head_dim), torch.float16),
+            )
+        else:
+            workspace_manager.get_simultaneous(
+                ((total_seq_lens, head_dim), fp8_dtype),
+                ((total_seq_lens, 4), torch.uint8),
+            )
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
@@ -716,7 +786,9 @@ def rocm_aiter_sparse_attn_indexer(
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
     if not skip_k_cache_insert:
-        if _ON_GFX942:
+        if use_fp16:
+            ops.indexer_k_cache_fp16(k, kv_cache, slot_mapping)
+        elif _ON_GFX942:
             ops.indexer_k_quant_and_cache(
                 k,
                 kv_cache,
@@ -739,14 +811,34 @@ def rocm_aiter_sparse_attn_indexer(
         assert prefill_metadata is not None
 
         workspace_manager = current_workspace_manager()
-        k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
-            ((total_seq_lens, head_dim), fp8_dtype),
-            ((total_seq_lens, 4), torch.uint8),
-        )
+        if use_fp16:
+            (k_fp16_full,) = workspace_manager.get_simultaneous(
+                ((total_seq_lens, head_dim), torch.float16),
+            )
+        else:
+            k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
+                ((total_seq_lens, head_dim), fp8_dtype),
+                ((total_seq_lens, 4), torch.uint8),
+            )
         for chunk in prefill_metadata.chunks:
-            k_fp8 = k_fp8_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
-            if _ON_GFX942:
+            if use_fp16:
+                k_fp16 = k_fp16_full[: chunk.total_seq_lens]
+                ops.cp_gather_indexer_k_cache_fp16(
+                    kv_cache,
+                    k_fp16,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                )
+                logits = fp16_mqa_logits_torch(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    k_fp16,
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+            elif _ON_GFX942:
+                k_fp8 = k_fp8_full[: chunk.total_seq_lens]
+                k_scale = k_scale_full[: chunk.total_seq_lens]
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_fp8,
@@ -754,7 +846,16 @@ def rocm_aiter_sparse_attn_indexer(
                     chunk.block_table,
                     chunk.cu_seq_lens,
                 )
+                logits = rocm_fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             else:
+                k_fp8 = k_fp8_full[: chunk.total_seq_lens]
+                k_scale = k_scale_full[: chunk.total_seq_lens]
                 cp_gather_indexer_k_quant_cache_triton(
                     kv_cache,
                     k_fp8,
@@ -763,13 +864,13 @@ def rocm_aiter_sparse_attn_indexer(
                     chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
                 )
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
+                logits = rocm_fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
@@ -812,15 +913,25 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
-        logits = rocm_fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            decode_metadata.seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-        )
+        if use_fp16:
+            logits = fp16_paged_mqa_logits_torch(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+            )
+        else:
+            logits = rocm_fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+            )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]

@@ -660,6 +660,13 @@ def choose_mp_linear_kernel(
             compute_capability = _cc[0] * 10 + _cc[1]
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906():
+            platform_kernels = list(platform_kernels)
+            platform_kernels.remove(ExllamaLinearKernel)
+            platform_kernels.insert(0, ExllamaLinearKernel)
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()

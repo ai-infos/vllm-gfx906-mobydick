@@ -7,11 +7,27 @@
 #include <torch/headeronly/core/ScalarType.h>
 
 #include <cuda_fp16.h>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#endif
 #include "libtorch_stable/torch_utils.h"
 #include "moe_wna16_utils.h"
 
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
+
+#ifdef USE_ROCM
+__device__ __forceinline__ float2 fma2_float(float2 a, float2 b, float2 c) {
+  return make_float2(a.x * b.x + c.x, a.y * b.y + c.y);
+}
+
+__device__ __forceinline__ float2 mul2_float(float2 a, float2 b) {
+  return make_float2(a.x * b.x, a.y * b.y);
+}
+
+__device__ __forceinline__ float2 sub2_float(float2 a, float2 b) {
+  return make_float2(a.x - b.x, a.y - b.y);
+}
+#endif
 
 template <typename scalar_t, int bit, int GROUPS>
 __global__ void moe_wna16_gemm_kernel(
@@ -28,10 +44,12 @@ __global__ void moe_wna16_gemm_kernel(
     uint32_t size_n, uint32_t size_k, uint16_t BLOCK_SIZE_M,
     uint16_t BLOCK_SIZE_N, uint16_t BLOCK_SIZE_K, bool has_zp,
     bool mul_topk_weight) {
+#ifndef USE_ROCM
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
     return;
   } else {
+#endif
 #endif
 
     using Dtype = ScalarType<scalar_t>;
@@ -45,7 +63,7 @@ __global__ void moe_wna16_gemm_kernel(
     const int32_t expert_id = expert_ids[blockIdx.x];
 
     int32_t num_valid_tokens = 0;
-    extern __shared__ uint16_t block_input_tmp[];
+    extern __shared__ __align__(16) uint8_t block_input_tmp[];
     scalar_t* block_input = reinterpret_cast<scalar_t*>(block_input_tmp);
     scalar_t2* block_input_half2 = reinterpret_cast<scalar_t2*>(block_input);
 
@@ -110,7 +128,14 @@ __global__ void moe_wna16_gemm_kernel(
     scalar_t expert_scales_groups[GROUPS];
     int scales_offset_tmp =
         (offset_n * size_k + offset_k) / group_size / GROUPS;
-    if constexpr (GROUPS == 1) {
+    if constexpr (std::is_same<scalar_t, float>::value) {
+#pragma unroll
+      for (int i = 0; i < GROUPS; i++) {
+        expert_scales_groups[i] =
+            expert_scales[offset_n * size_k / group_size +
+                          offset_k / group_size + i];
+      }
+    } else if constexpr (GROUPS == 1) {
       *expert_scales_groups = expert_scales[scales_offset_tmp];
     } else if constexpr (GROUPS == 2) {
       float* expert_scales_groups_tmp =
@@ -127,6 +152,13 @@ __global__ void moe_wna16_gemm_kernel(
           reinterpret_cast<float4*>(expert_scales_groups);
       *expert_scales_groups_tmp =
           reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
+    } else {
+#pragma unroll
+      for (int i = 0; i < GROUPS; i++) {
+        expert_scales_groups[i] =
+            expert_scales[offset_n * size_k / group_size +
+                          offset_k / group_size + i];
+      }
     }
 
     // load all required qzeros one time
@@ -161,6 +193,14 @@ __global__ void moe_wna16_gemm_kernel(
             reinterpret_cast<uint64_t*>(expert_qzeros_groups);
         *expert_qzeros_groups_tmp =
             reinterpret_cast<const uint64_t*>(expert_qzeros)[qzeros_offset_tmp];
+      } else {
+        uint64_t* expert_qzeros_groups_tmp =
+            reinterpret_cast<uint64_t*>(expert_qzeros_groups);
+        const uint64_t* expert_qzeros_src =
+            reinterpret_cast<const uint64_t*>(expert_qzeros) +
+            qzeros_offset_tmp * 2;
+        expert_qzeros_groups_tmp[0] = expert_qzeros_src[0];
+        expert_qzeros_groups_tmp[1] = expert_qzeros_src[1];
       }
     }
 
@@ -198,8 +238,21 @@ __global__ void moe_wna16_gemm_kernel(
 #pragma unroll
         for (int i = 0; i < 16 / bit; i++) {
           int32_t offset_input = m * BLOCK_SIZE_K / 2 + tmp_k * (16 / bit) + i;
+#ifdef USE_ROCM
+          if constexpr (std::is_same<scalar_t, float>::value) {
+            float2 dequantized =
+                mul2_float(sub2_float(weight_half2[i], qzero_f2), scale_f2);
+            res2 =
+                fma2_float(dequantized, block_input_half2[offset_input], res2);
+          } else {
+            res2 =
+                __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
+                        block_input_half2[offset_input], res2);
+          }
+#else
           res2 = __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
                          block_input_half2[offset_input], res2);
+#endif
         }
 
         if (tmp_k == 0) {
@@ -216,12 +269,24 @@ __global__ void moe_wna16_gemm_kernel(
       if (mul_topk_weight) {
         res[m] *= topk_weights[token_index];
       }
+#ifdef USE_ROCM
+      if constexpr (std::is_same<scalar_t, half>::value) {
+        atomicAdd_half(&output[token_index * size_n + offset_n],
+                       Dtype::float2num(res[m]));
+      } else {
+        atomicAdd(&output[token_index * size_n + offset_n],
+                  Dtype::float2num(res[m]));
+      }
+#else
       atomicAdd(&output[token_index * size_n + offset_n],
                 Dtype::float2num(res[m]));
+#endif
     }
 
+#ifndef USE_ROCM
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   }
+#endif
 #endif
 }
 
@@ -252,6 +317,10 @@ void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
       kernel = moe_wna16_gemm_kernel<scalar_t, 4, 4>;
     } else if (BLOCK_SIZE_K / group_size == 8) {
       kernel = moe_wna16_gemm_kernel<scalar_t, 4, 8>;
+#ifdef USE_ROCM
+    } else if (BLOCK_SIZE_K / group_size == 16) {
+      kernel = moe_wna16_gemm_kernel<scalar_t, 4, 16>;
+#endif
     }
   } else {
     if (BLOCK_SIZE_K / group_size == 1) {
@@ -265,7 +334,7 @@ void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
     }
   }
 
-  const int shared_mem_size = BLOCK_SIZE_M * BLOCK_SIZE_K * 2;
+  const int shared_mem_size = BLOCK_SIZE_M * BLOCK_SIZE_K * sizeof(scalar_t);
   const cudaStream_t stream = get_current_cuda_stream();
   kernel<<<gridDim, blockDim, shared_mem_size, stream>>>(
       input, output, b_qweight, b_scales, b_qzeros, topk_weights,
@@ -299,7 +368,7 @@ torch::stable::Tensor moe_wna16_gemm(
   }
   const int num_token_blocks = (EM + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M;
 
-  const uint32_t* b_qzeros_ptr;
+  const uint32_t* b_qzeros_ptr = nullptr;
   if (b_qzeros.has_value())
     b_qzeros_ptr = (const uint32_t*)b_qzeros.value().const_data_ptr<uint8_t>();
   const float* topk_weights_ptr = nullptr;
@@ -308,15 +377,27 @@ torch::stable::Tensor moe_wna16_gemm(
         (const float*)topk_weights.value().const_data_ptr<float>();
 
   int groups_per_block_row = BLOCK_SIZE_K / group_size;
+#ifdef USE_ROCM
+  STD_TORCH_CHECK(bit == 4, "ROCm moe_wna16_gemm only supports 4-bit weights");
+#else
   STD_TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
+#endif
   STD_TORCH_CHECK(size_k % BLOCK_SIZE_K == 0,
                   "size_k must divisible by BLOCK_SIZE_K");
   STD_TORCH_CHECK(BLOCK_SIZE_K % group_size == 0,
                   "BLOCK_SIZE_K must divisible by group_size");
   STD_TORCH_CHECK(BLOCK_SIZE_M <= 64, "BLOCK_SIZE_M must less or equal to 64");
+#ifdef USE_ROCM
+  STD_TORCH_CHECK(
+      groups_per_block_row == 1 || groups_per_block_row == 2 ||
+          groups_per_block_row == 4 || groups_per_block_row == 8 ||
+          groups_per_block_row == 16,
+      "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8, 16]");
+#else
   STD_TORCH_CHECK(groups_per_block_row == 1 || groups_per_block_row == 2 ||
                       groups_per_block_row == 4 || groups_per_block_row == 8,
                   "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8]");
+#endif
 
   if (input.scalar_type() == torch::headeronly::ScalarType::Half) {
     run_moe_wna16_gemm<half>(
@@ -330,6 +411,19 @@ torch::stable::Tensor moe_wna16_gemm(
         num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
         BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
         topk_weights.has_value());
+#ifdef USE_ROCM
+  } else if (input.scalar_type() == torch::headeronly::ScalarType::Float) {
+    run_moe_wna16_gemm<float>(
+        input.const_data_ptr<float>(), output.mutable_data_ptr<float>(),
+        (const uint32_t*)b_qweight.const_data_ptr<uint8_t>(),
+        b_scales.const_data_ptr<float>(), b_qzeros_ptr, topk_weights_ptr,
+        sorted_token_ids.const_data_ptr<int32_t>(),
+        expert_ids.const_data_ptr<int32_t>(),
+        num_tokens_post_pad.const_data_ptr<int32_t>(), num_experts, group_size,
+        num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
+        BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
+        topk_weights.has_value());
+#else
   } else if (input.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
     run_moe_wna16_gemm<nv_bfloat16>(
         reinterpret_cast<const nv_bfloat16*>(input.const_data_ptr()),
@@ -343,8 +437,13 @@ torch::stable::Tensor moe_wna16_gemm(
         num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
         BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
         topk_weights.has_value());
+#endif
   } else {
+#ifdef USE_ROCM
+    STD_TORCH_CHECK(false, "ROCm moe_wna16_gemm only supports float16 and float32");
+#else
     STD_TORCH_CHECK(false, "moe_wna16_gemm only supports bfloat16 and float16");
+#endif
   }
   return output;
 }

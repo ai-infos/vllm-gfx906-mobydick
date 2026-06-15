@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -103,6 +104,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    is_gfx906: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -264,10 +266,15 @@ def fused_moe_kernel_gptq_awq(
 
         # We accumulate along the K dimension.
         if has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            b = (b.to(tl.float32) - b_zp) * b_scale
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+            b = (b.to(tl.float32) - b_zp_num) * b_scale
+        if is_gfx906 and compute_type == tl.float32:
+            accumulator = tl.dot(
+                a.to(tl.float16), b.to(tl.float16), acc=accumulator
+            )
+        else:
+            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -280,7 +287,8 @@ def fused_moe_kernel_gptq_awq(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
+    if compute_type != tl.float32:
+        accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -343,6 +351,7 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    is_gfx906: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -450,7 +459,8 @@ def fused_moe_kernel(
     if use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            if not is_gfx906:
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
@@ -461,12 +471,14 @@ def fused_moe_kernel(
                 b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
             )
             b_scale = tl.load(b_scale_ptrs)
-            # Load per-token scale for activations
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+            if not is_gfx906:
+                # Load per-token scale for activations
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
         # tensor-wise
         else:
-            a_scale = tl.load(a_scale_ptr)
+            if not is_gfx906:
+                a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
     if HAS_BIAS:
         # bias shape: [num_experts, N]
@@ -486,7 +498,16 @@ def fused_moe_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+        if is_gfx906 and use_fp8_w8a8:
+            b_u8 = b.to(tl.uint8, bitcast=True)
+            b_sign = (b_u8 & 0x80).to(tl.uint16) << 8
+            b_exp = ((b_u8 & 0x78) >> 3).to(tl.uint16)
+            b_exp = tl.where(b_exp == 0, 0, b_exp + 8)
+            b_mant = (b_u8 & 0x07).to(tl.uint16) << 7
+            b = (b_sign | (b_exp << 10) | b_mant).to(tl.float16, bitcast=True)
+            if compute_type == tl.float32:
+                a = a.to(tl.float16)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -494,12 +515,18 @@ def fused_moe_kernel(
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
                 offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
-                )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if is_gfx906:
+                    accumulator += tl.dot(a, b) * b_scale[None, :]
+                else:
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask,
+                        mask=token_mask,
+                        other=0.0,
+                    )
+                    accumulator += (
+                        tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                    )
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
@@ -520,7 +547,10 @@ def fused_moe_kernel(
     if use_int8_w8a16:
         accumulator = accumulator * b_scale
     elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
-        accumulator = accumulator * a_scale * b_scale
+        if is_gfx906:
+            accumulator = accumulator * b_scale
+        else:
+            accumulator = accumulator * a_scale * b_scale
 
     # Bias addition:
     # Bias must be applied after dequantization:
@@ -586,7 +616,7 @@ def invoke_fused_moe_wna16_cuda_kernel(
             num_valid_tokens=num_tokens,
             size_k=A.size(1),
             size_n=B.size(1),
-            num_experts=B.size(1),
+            num_experts=B.size(0),
             group_size=block_shape[1],
             real_top_k=top_k,
             block_size_m=config["BLOCK_SIZE_M"],
@@ -699,6 +729,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        is_gfx906=on_gfx906(),
         **config,
     )
 
@@ -809,6 +840,7 @@ def invoke_fused_moe_triton_kernel(
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
+        is_gfx906=on_gfx906(),
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         **config,
     )
@@ -1003,6 +1035,8 @@ def get_config_file_name(
     # Set device_name to H200 if a device from the H200 family is detected
     if "H200" in device_name.split("_"):
         device_name = "NVIDIA_H200"
+    if on_gfx906():
+        device_name = "AMD_GFX906"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
@@ -1193,7 +1227,7 @@ def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
     return (
-        current_platform.is_cuda()
+        (current_platform.is_cuda() or on_gfx906())
         and bit == 4
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6
@@ -1221,7 +1255,27 @@ def get_default_config(
     # num_stages can cause triton.runtime.errors.OutOfResources on ROCm.
     num_stages_rocm = 2
 
-    if dtype == "fp8_w8a8" and block_shape is not None:
+    if dtype == "fp8_w8a8" and block_shape is not None and on_gfx906():
+        if M <= 1:
+            block_m, group_m = 16, 16
+        elif M <= 8:
+            block_m, group_m = 16, 1
+        elif M <= 16:
+            block_m, group_m = 16, 8
+        elif M <= 64:
+            block_m, group_m = 32, 4
+        else:
+            block_m, group_m = 32, 8
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_K": block_shape[1],
+            "GROUP_SIZE_M": group_m,
+            "SPLIT_K": 1,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    elif dtype == "fp8_w8a8" and block_shape is not None:
         # Block-wise quant: tile sizes are constrained by block_shape.
         # Use a small M tile for decode-like batches where tokens are
         # spread thin across experts. Larger batches benefit from

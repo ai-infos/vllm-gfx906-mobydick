@@ -20,9 +20,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.transformers_utils.config import get_safetensors_params_metadata
+from vllm.platforms.rocm import on_gfx906
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -69,12 +71,13 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
+        if on_gfx906():
+            return [torch.half, torch.float32]
         return [torch.half]
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # The AWQ kernel only supports Turing or newer GPUs.
-        return 75
+        return 60 if on_gfx906() else 75
 
     @staticmethod
     def get_config_filenames() -> list[str]:
@@ -105,6 +108,10 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
+            if on_gfx906():
+                logger.warning_once(
+                    "Using the gfx906-optimized GPTQ GEMM path for AWQ."
+                )
             return AWQLinearMethod(self)
         elif isinstance(layer, RoutedExperts):
             # Lazy import to avoid circular import.
@@ -112,9 +119,12 @@ class AWQConfig(QuantizationConfig):
             from .moe_wna16 import MoeWNA16Config
             from .utils.marlin_utils import check_moe_marlin_supports_layer
 
-            if not check_moe_marlin_supports_layer(layer, self.group_size):
+            if on_gfx906() or not check_moe_marlin_supports_layer(
+                layer, self.group_size
+            ):
                 logger.warning_once(
-                    f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
+                    f"Layer '{prefix}' is not supported by AWQMoeMarlin or "
+                    "is running on gfx906. "
                     "Falling back to Moe WNA16 kernels."
                 )
                 config = {
@@ -259,28 +269,71 @@ class AWQLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
+        if on_gfx906():
+            bits = self.quant_config.weight_bits
+            empty = torch.empty(0, device=layer.qzeros.device)
+
+            # hints: shuffle twice is equal to unshuffle once
+            ops.gptq_shuffle(layer.qzeros, empty, bits)
+            ops.gptq_shuffle(layer.qzeros, empty, bits)
+
+            ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
+            layer.qweight.data = layer.qweight.reshape(
+                (layer.qweight.shape[0] // 8, layer.qweight.shape[1] * 8)
+            )
+            replace_parameter(layer, "qweight", layer.qweight.data)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qweight = layer.qweight
-        scales = layer.scales
-        qzeros = layer.qzeros
-        pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
-        reshaped_x = x.reshape(-1, x.shape[-1])
+        if on_gfx906():
+            out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
 
-        # num_tokens >= threshold
-        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
-        # Batch invariant mode requires torch.matmul path
-        # for Triton override
-        if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
-            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-            out = torch.matmul(reshaped_x, out)
+            # The optimized GPTQ GEMM is FP16-only; preserve FP32 at the API.
+            orig_dtype = x.dtype
+            scales = layer.scales
+            if x.dtype == torch.float32:
+                x = x.to(torch.float16)
+                if scales.dtype == torch.float32:
+                    scales = scales.to(torch.float16)
+
+            reshaped_x = x.reshape(-1, x.shape[-1])
+
+            output = ops.gptq_gemm(
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                scales,
+                torch.empty(0, device=layer.qweight.device),
+                True,
+                True,
+                self.quant_config.weight_bits,
+            )
+            if output.dtype != orig_dtype:
+                output = output.to(orig_dtype)
         else:
-            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+            qweight = layer.qweight
+            scales = layer.scales
+            qzeros = layer.qzeros
+            pack_factor = self.quant_config.pack_factor
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            reshaped_x = x.reshape(-1, x.shape[-1])
+
+            # num_tokens >= threshold
+            FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+            # Batch invariant mode requires torch.matmul path
+            # for Triton override
+            if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
+                out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
+                output = torch.matmul(reshaped_x, out)
+            else:
+                output = ops.awq_gemm(
+                    reshaped_x, qweight, scales, qzeros, pack_factor
+                )
+
         if bias is not None:
-            out.add_(bias)
-        return out.reshape(out_shape)
+            output.add_(bias)
+        return output.reshape(out_shape)

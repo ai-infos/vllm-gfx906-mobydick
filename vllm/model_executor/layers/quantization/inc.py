@@ -27,6 +27,7 @@ from vllm.model_executor.parameter import (
     RowvLLMParameter,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 
 if TYPE_CHECKING:
@@ -111,6 +112,8 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if on_gfx906():
+            return [torch.half, torch.float32]
         return [torch.half, torch.bfloat16]
 
     @classmethod
@@ -256,7 +259,7 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if backend == "auto" or "marlin" in backend:
+        if (backend == "auto" or "marlin" in backend) and not on_gfx906():
             AWQ_TYPE_MAP = {
                 4: scalar_types.uint4,
                 8: scalar_types.uint8,
@@ -341,7 +344,7 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if backend == "auto" or "marlin" in backend:
+        if backend == "auto" or "marlin" in backend or on_gfx906():
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,
                 (8, True): scalar_types.uint8b128,
@@ -353,6 +356,8 @@ class INCConfig(QuantizationConfig):
                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
                     layer, group_size
                 )
+                if on_gfx906():
+                    use_marlin = False
         else:
             use_marlin = False
         if use_marlin:
@@ -445,7 +450,7 @@ class INCConfig(QuantizationConfig):
             )
         return None
 
-    def apply_cpu_w4a16_quant_layer(self, layer, prefix: str):
+    def apply_cpu_w4a16_quant_layer(self, layer, prefix: str, backend: str = "auto"):
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -478,7 +483,7 @@ class INCConfig(QuantizationConfig):
                 ark_error or "unknown error",
             )
 
-            return self.apply_gptq_quant_layer(layer, prefix)
+            return self.apply_gptq_quant_layer(layer, prefix, backend)
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -493,11 +498,11 @@ class INCConfig(QuantizationConfig):
             return self.apply_xpu_w4a16_quant_layer(layer, prefix)
         is_gptq = "gptq" in self.packing_format or "gptq" in self.backend
         if current_platform.is_cpu() and is_gptq:
-            return self.apply_cpu_w4a16_quant_layer(layer, prefix)
+            return self.apply_cpu_w4a16_quant_layer(layer, prefix, self.backend)
         if is_gptq:
-            return self.apply_gptq_quant_layer(layer, prefix)
+            return self.apply_gptq_quant_layer(layer, prefix, self.backend)
         if "awq" in self.packing_format or "awq" in self.backend:
-            return self.apply_awq_quant_layer(layer, prefix)
+            return self.apply_awq_quant_layer(layer, prefix, self.backend)
 
         raise NotImplementedError(
             f"Unsupported quantization configuration for layer '{prefix}'. "

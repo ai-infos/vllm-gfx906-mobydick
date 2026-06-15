@@ -24,6 +24,8 @@ typedef __hip_bfloat16 __nv_bfloat16;
   #include <cuda.h>
 #endif
 
+#include <type_traits> // for std::remove_cv_t
+
 #if defined(__gfx942__)
 constexpr float kFp8ScaleDivisor = 224.f;
 #else
@@ -239,7 +241,13 @@ struct CopyWithScaleOp {
 
   __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      dst = static_cast<OutT>(src);
+      if constexpr (std::is_same<OutT, InT>::value) {
+        dst = static_cast<OutT>(src);
+      } else {
+        // Cross-type conversion (e.g., float -> half, bf16 -> half)
+        __half h = __float2half(static_cast<float>(src));
+        dst = *reinterpret_cast<OutT*>(&h);
+      }
     } else {
       dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
     }
@@ -426,7 +434,13 @@ __global__ void concat_and_cache_mla_kernel(
       const int64_t dst_idx =
           block_idx * block_stride + block_offset * entry_stride + i + offset;
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst[dst_idx] = src[src_idx];
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          dst[dst_idx] = src[src_idx];
+        } else {
+          // Cross-type conversion (e.g., float -> half, bf16 -> half)
+          __half h = __float2half(static_cast<float>(src[src_idx]));
+          dst[dst_idx] = *reinterpret_cast<cache_t*>(&h);
+        }
       } else {
         dst[dst_idx] =
             fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);
@@ -1032,8 +1046,20 @@ __global__ void gather_and_maybe_dequant_cache(
 #pragma unroll
     for (int idx = threadIdx.x; idx < vec_iter_cnt; idx += CTA_SIZE) {
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        reinterpret_cast<stype*>(dst_)[idx] =
-            static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          reinterpret_cast<stype*>(dst_)[idx] =
+              static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+        } else {
+          // Cross-type dequant (e.g., half cache -> float/bf16 dst)
+          ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
+          stype store_val;
+#pragma unroll
+          for (int j = 0; j < vec_size; ++j) {
+            __half h = *reinterpret_cast<const __half*>(&loaded_val.val[j]);
+            store_val.val[j] = static_cast<scalar_t>(__half2float(h));
+          }
+          reinterpret_cast<stype*>(dst_)[idx] = store_val;
+        }
       } else {
         ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
         stype store_val;
@@ -1052,7 +1078,12 @@ __global__ void gather_and_maybe_dequant_cache(
 #pragma unroll
     for (int idx = threadIdx.x; idx < tail_cnt; idx += CTA_SIZE) {
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst_[idx] = static_cast<scalar_t>(src_[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          dst_[idx] = static_cast<scalar_t>(src_[idx]);
+        } else {
+          __half h = *reinterpret_cast<const __half*>(&src_[idx]);
+          dst_[idx] = static_cast<scalar_t>(__half2float(h));
+        }
       } else {
         dst_[idx] =
             fp8::scaled_convert<scalar_t, cache_t, kv_dt>(src_[idx], *scale);
@@ -1291,6 +1322,169 @@ __global__ void cp_gather_cache(
     }
   }
 }
+
+// -------------------------------------------------------------------------
+// LOCAL VECTOR HELPERS
+// -------------------------------------------------------------------------
+
+template <typename T, int N>
+struct BuiltinVec;
+
+template <>
+struct BuiltinVec<float, 4> {
+  using Type = float4;
+};
+template <>
+struct BuiltinVec<uint16_t, 4> {
+  using Type = float2;
+};
+template <>
+struct BuiltinVec<half, 4> {
+  using Type = float2;
+};
+
+template <typename T, int N>
+__device__ __forceinline__ typename BuiltinVec<std::remove_cv_t<T>, N>::Type*
+vec_ptr(T* ptr) {
+  using NonConstT = std::remove_cv_t<T>;
+  return reinterpret_cast<typename BuiltinVec<NonConstT, N>::Type*>(
+      const_cast<NonConstT*>(ptr));
+}
+
+// -------------------------------------------------------------------------
+// Kernel 1: Indexer and Cache (Write K to Cache)
+// -------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void indexer_k_cache_fp16_kernel(
+    const scalar_t* __restrict__ k,
+    uint16_t* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    const int head_dim,
+    const int cache_block_size,
+    const int cache_stride) {
+  constexpr int VEC_SIZE = 4;
+  using CacheVecType = typename BuiltinVec<uint16_t, VEC_SIZE>::Type;
+
+  const int64_t token_idx = blockIdx.x;
+  const int64_t head_dim_idx =
+      (blockIdx.y * blockDim.y * blockDim.x + threadIdx.y * blockDim.x +
+       threadIdx.x) *
+      VEC_SIZE;
+
+  if (head_dim_idx >= head_dim) return;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / cache_block_size;
+  const int64_t block_offset = slot_idx % cache_block_size;
+
+  using InputVecType = typename BuiltinVec<scalar_t, VEC_SIZE>::Type;
+  InputVecType k_val_vec = *vec_ptr<const scalar_t, VEC_SIZE>(
+      &k[token_idx * head_dim + head_dim_idx]);
+  const scalar_t* k_val_ptr = reinterpret_cast<const scalar_t*>(&k_val_vec);
+
+  const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
+                             block_offset * head_dim + head_dim_idx;
+
+  if constexpr (std::is_same<scalar_t, half>::value) {
+    *vec_ptr<uint16_t, VEC_SIZE>(&kv_cache[dst_offset]) =
+        *reinterpret_cast<CacheVecType*>(&k_val_vec);
+  } else {
+    union {
+      CacheVecType vec;
+      uint16_t arr[VEC_SIZE];
+    } output_buffer;
+
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i++) {
+      half temp_half = __float2half(k_val_ptr[i]);
+      output_buffer.arr[i] = *reinterpret_cast<uint16_t*>(&temp_half);
+    }
+
+    *vec_ptr<uint16_t, VEC_SIZE>(&kv_cache[dst_offset]) = output_buffer.vec;
+  }
+}
+
+// -------------------------------------------------------------------------
+// Kernel 2: Gather (Read K from Cache)
+// -------------------------------------------------------------------------
+template <typename scalar_t, int BLOCK_Y_SIZE>
+__global__ void cp_gather_indexer_k_cache_fp16_kernel(
+    const uint16_t* __restrict__ kv_cache,
+    scalar_t* __restrict__ dst_k,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cu_seq_lens,
+    const int batch_size,
+    const int64_t token_stride,
+    const int64_t head_dim,
+    const int64_t block_stride,
+    const int64_t cache_block_size,
+    const int64_t block_table_stride,
+    const int num_tokens) {
+  constexpr int VEC_SIZE = 4;
+  using DstVecType = typename BuiltinVec<scalar_t, VEC_SIZE>::Type;
+  using CacheVecType = typename BuiltinVec<uint16_t, VEC_SIZE>::Type;
+
+  const int token_idx = blockIdx.x * blockDim.y + threadIdx.y;
+  const int head_idx = (blockIdx.y * blockDim.x + threadIdx.x) * VEC_SIZE;
+
+  __shared__ int batch_idx[BLOCK_Y_SIZE];
+  if (threadIdx.x == 0) {
+    batch_idx[threadIdx.y] = -1;
+  }
+  __syncthreads();
+
+  for (int iter = 0; iter < cuda_utils::ceil_div(batch_size, int(blockDim.x));
+       iter++) {
+    int tid = iter * blockDim.x + threadIdx.x;
+    if (tid < batch_size) {
+      const int seq_start = cu_seq_lens[tid];
+      const int seq_end = cu_seq_lens[tid + 1];
+      if (token_idx >= seq_start && token_idx < seq_end) {
+        batch_idx[threadIdx.y] = tid;
+      }
+    }
+  }
+  __syncthreads();
+
+  // num_tokens may be an allocation upper bound when Python avoids a D2H sync.
+  const int batch = batch_idx[threadIdx.y];
+  if (head_idx >= head_dim || token_idx >= num_tokens || batch < 0) return;
+
+  const int inbatch_seq_idx = token_idx - cu_seq_lens[batch];
+  const int block_idx_val =
+      block_table[batch * block_table_stride +
+                  inbatch_seq_idx / cache_block_size];
+
+  const int64_t src_offset =
+      block_idx_val * block_stride +
+      (inbatch_seq_idx % cache_block_size) * head_dim + head_idx;
+  const int64_t dst_offset = token_idx * token_stride + head_idx;
+
+  CacheVecType loaded_vec =
+      *vec_ptr<const uint16_t, VEC_SIZE>(&kv_cache[src_offset]);
+  const uint16_t* loaded_raw =
+      reinterpret_cast<const uint16_t*>(&loaded_vec);
+
+  if constexpr (std::is_same<scalar_t, half>::value) {
+    *vec_ptr<scalar_t, VEC_SIZE>(&dst_k[dst_offset]) =
+        *reinterpret_cast<DstVecType*>(&loaded_vec);
+  } else {
+    union {
+      DstVecType vec;
+      scalar_t arr[VEC_SIZE];
+    } out_buffer;
+
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; i++) {
+      half temp_half = *reinterpret_cast<const half*>(&loaded_raw[i]);
+      out_buffer.arr[i] = __half2float(temp_half);
+    }
+    *vec_ptr<scalar_t, VEC_SIZE>(&dst_k[dst_offset]) = out_buffer.vec;
+  }
+}
+
 }  // namespace vllm
 
 // Macro to dispatch the kernel based on the data type.
@@ -1591,4 +1785,125 @@ void concat_mla_q(
         q_out.stride(1), ql_nope.stride(0), ql_nope.stride(1), q_pe.stride(0),
         q_pe.stride(1));
   });
+}
+
+void indexer_k_cache_fp16(
+    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& slot_mapping) {
+  const int num_tokens = k.size(0);
+  const int head_dim = k.size(1);
+  const int cache_block_size = kv_cache.size(1);
+  const int cache_stride = kv_cache.size(2);
+
+  STD_TORCH_CHECK(k.device() == kv_cache.device(),
+                  "k and kv_cache must be on the same device");
+  STD_TORCH_CHECK(k.device() == slot_mapping.device(),
+                  "k and slot_mapping must be on the same device");
+  STD_TORCH_CHECK(kv_cache.element_size() == 2,
+                  "kv_cache must use a 16-bit element type");
+  STD_TORCH_CHECK(
+      slot_mapping.scalar_type() == torch::headeronly::ScalarType::Long,
+      "slot_mapping must be int64");
+  STD_TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4");
+
+  constexpr int VEC_SIZE = 4;
+  constexpr int BLOCK_Y = 4;
+  dim3 block(32, BLOCK_Y);
+  dim3 grid(num_tokens,
+            cuda_utils::ceil_div(head_dim, VEC_SIZE * 32 * BLOCK_Y));
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      k.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  if (k.scalar_type() == torch::headeronly::ScalarType::Float) {
+    vllm::indexer_k_cache_fp16_kernel<float><<<grid, block, 0, stream>>>(
+        k.const_data_ptr<float>(),
+        reinterpret_cast<uint16_t*>(kv_cache.mutable_data_ptr()),
+        slot_mapping.const_data_ptr<int64_t>(), head_dim, cache_block_size,
+        cache_stride);
+  } else if (k.scalar_type() == torch::headeronly::ScalarType::Half) {
+    vllm::indexer_k_cache_fp16_kernel<half><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const half*>(k.const_data_ptr()),
+        reinterpret_cast<uint16_t*>(kv_cache.mutable_data_ptr()),
+        slot_mapping.const_data_ptr<int64_t>(), head_dim, cache_block_size,
+        cache_stride);
+  } else {
+    STD_TORCH_CHECK(false, "k must be float32 or float16");
+  }
+}
+
+void cp_gather_indexer_k_cache_fp16(
+    const torch::stable::Tensor& kv_cache, torch::stable::Tensor& dst_k,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& cu_seq_lens) {
+  const int batch_size = block_table.size(0);
+  const int num_tokens = dst_k.size(0);
+  const int head_dim = dst_k.size(1);
+  const int64_t block_stride = kv_cache.stride(0);
+  const int64_t cache_block_size = kv_cache.size(1);
+  const int64_t block_table_stride = block_table.stride(0);
+
+  STD_TORCH_CHECK(kv_cache.device() == dst_k.device(),
+                  "kv_cache and dst_k must be on the same device");
+  STD_TORCH_CHECK(kv_cache.device() == block_table.device(),
+                  "kv_cache and block_table must be on the same device");
+  STD_TORCH_CHECK(kv_cache.device() == cu_seq_lens.device(),
+                  "kv_cache and cu_seq_lens must be on the same device");
+  STD_TORCH_CHECK(kv_cache.element_size() == 2,
+                  "kv_cache must use a 16-bit element type");
+  STD_TORCH_CHECK(
+      block_table.scalar_type() == torch::headeronly::ScalarType::Int,
+      "block_table must be int32");
+  STD_TORCH_CHECK(
+      cu_seq_lens.scalar_type() == torch::headeronly::ScalarType::Int,
+      "cu_seq_lens must be int32");
+  STD_TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4");
+
+  constexpr int VEC_SIZE = 4;
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      kv_cache.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+#define LAUNCH_GATHER(BLOCK_Y, TYPE)                                        \
+  vllm::cp_gather_indexer_k_cache_fp16_kernel<TYPE, BLOCK_Y>                \
+      <<<dim3(cuda_utils::ceil_div(num_tokens, BLOCK_Y),                    \
+               cuda_utils::ceil_div(head_dim, VEC_SIZE * 32)),             \
+         dim3(32, BLOCK_Y), 0, stream>>>(                                   \
+          reinterpret_cast<const uint16_t*>(kv_cache.const_data_ptr()),     \
+          reinterpret_cast<TYPE*>(dst_k.mutable_data_ptr()),                \
+          block_table.const_data_ptr<int32_t>(),                            \
+          cu_seq_lens.const_data_ptr<int32_t>(), batch_size, dst_k.stride(0), \
+          head_dim, block_stride, cache_block_size, block_table_stride,     \
+          num_tokens)
+
+  if (dst_k.scalar_type() == torch::headeronly::ScalarType::Float) {
+    if (num_tokens < 32) {
+      LAUNCH_GATHER(1, float);
+    } else if (num_tokens < 64) {
+      LAUNCH_GATHER(2, float);
+    } else if (num_tokens < 128) {
+      LAUNCH_GATHER(4, float);
+    } else if (num_tokens < 256) {
+      LAUNCH_GATHER(8, float);
+    } else {
+      LAUNCH_GATHER(16, float);
+    }
+  } else if (dst_k.scalar_type() == torch::headeronly::ScalarType::Half) {
+    if (num_tokens < 32) {
+      LAUNCH_GATHER(1, half);
+    } else if (num_tokens < 64) {
+      LAUNCH_GATHER(2, half);
+    } else if (num_tokens < 128) {
+      LAUNCH_GATHER(4, half);
+    } else if (num_tokens < 256) {
+      LAUNCH_GATHER(8, half);
+    } else {
+      LAUNCH_GATHER(16, half);
+    }
+  } else {
+    STD_TORCH_CHECK(false, "dst_k must be float32 or float16");
+  }
+
+#undef LAUNCH_GATHER
 }

@@ -1821,6 +1821,51 @@ void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height,
   shuffle_kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, height, width);
 }
 
+__global__ void shuffle_awq_qweight_kernel(uint32_t* q_weight, uint32_t* q_tmp,
+                                           int size_k, int size_n) {
+  int awq_k = blockIdx.x * 8;
+  int awq_stride = size_n / 8;
+  uint32_t* q_block_weight = q_weight + awq_k * awq_stride;
+  uint32_t* q_block_tmp = q_tmp + awq_k * awq_stride;
+
+  for (int gptq_n = threadIdx.x; gptq_n < size_n; gptq_n += blockDim.x) {
+    uint32_t w = q_block_weight[gptq_n];
+    shuffle_4bit_8(&w, 0);
+    shuffle_4bit_8(&w, 0);
+    q_block_tmp[gptq_n] = w;
+  }
+
+  __syncthreads();
+
+  for (int gptq_n = threadIdx.x; gptq_n < size_n; gptq_n += blockDim.x) {
+    uint32_t w = 0;
+    int awq_n = gptq_n / 8;
+    int awq_bf = (gptq_n % 8) * 4;
+    w |= ((q_block_tmp[0 * awq_stride + awq_n] >> awq_bf) & 0xF) << 0;
+    w |= ((q_block_tmp[1 * awq_stride + awq_n] >> awq_bf) & 0xF) << 4;
+    w |= ((q_block_tmp[2 * awq_stride + awq_n] >> awq_bf) & 0xF) << 8;
+    w |= ((q_block_tmp[3 * awq_stride + awq_n] >> awq_bf) & 0xF) << 12;
+    w |= ((q_block_tmp[4 * awq_stride + awq_n] >> awq_bf) & 0xF) << 16;
+    w |= ((q_block_tmp[5 * awq_stride + awq_n] >> awq_bf) & 0xF) << 20;
+    w |= ((q_block_tmp[6 * awq_stride + awq_n] >> awq_bf) & 0xF) << 24;
+    w |= ((q_block_tmp[7 * awq_stride + awq_n] >> awq_bf) & 0xF) << 28;
+    shuffle_4bit_8(&w, 0);
+    q_block_weight[gptq_n] = w;
+  }
+}
+
+void shuffle_awq_qweight(uint32_t* q_weight, uint32_t* q_tmp, int height,
+                         int width) {
+  dim3 blockDim, gridDim;
+  blockDim.x = THREADS_X;
+  blockDim.y = 1;
+  gridDim.x = height / 8;
+  gridDim.y = 1;
+  const cudaStream_t stream = get_current_cuda_stream();
+  shuffle_awq_qweight_kernel<<<gridDim, blockDim, 0, stream>>>(
+      q_weight, q_tmp, height, width);
+}
+
 }  // namespace gptq
 }  // namespace vllm
 
@@ -1842,7 +1887,8 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
       (const uint32_t*)b_q_weight.data_ptr(),
       (const uint32_t*)b_gptq_qzeros.data_ptr(),
       (const half*)b_gptq_scales.data_ptr(),
-      b_g_idx.device().type() == torch::stable::DeviceType::Meta
+      b_g_idx.device().type() == torch::stable::DeviceType::Meta ||
+              b_g_idx.numel() == 0
           ? NULL
           : (const int*)b_g_idx.data_ptr(),
       (half*)c.data_ptr(), (half*)temp_dq.data_ptr(),
@@ -1865,4 +1911,20 @@ void gptq_shuffle(torch::stable::Tensor q_weight, torch::stable::Tensor q_perm,
           ? NULL
           : (int*)q_perm.data_ptr(),
       q_weight.size(0) * 32 / bit, q_weight.size(1), bit);
+}
+
+void gptq_shuffle_awq_qweight(torch::stable::Tensor q_weight, int64_t bit) {
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      q_weight.get_device_index());
+  STD_TORCH_CHECK(q_weight.is_contiguous(), "q_weight must be contiguous");
+  STD_TORCH_CHECK(q_weight.size(0) % 8 == 0,
+                  "q_weight rows must be divisible by 8");
+  STD_TORCH_CHECK(bit == 4, "Only Int4 AWQ qweight is supported");
+
+  auto q_tmp = torch::stable::empty(q_weight.sizes(), q_weight.scalar_type(),
+                                    std::nullopt, q_weight.device());
+  vllm::gptq::shuffle_awq_qweight(
+      reinterpret_cast<uint32_t*>(q_weight.mutable_data_ptr()),
+      reinterpret_cast<uint32_t*>(q_tmp.mutable_data_ptr()), q_weight.size(0),
+      q_weight.size(1) * 8);
 }

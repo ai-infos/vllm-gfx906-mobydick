@@ -21,6 +21,19 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
+    VLLM_ROCM_MLA_SPARSE_FP16: bool = False
+    VLLM_ROCM_MLA_SPARSE_FP16_TRITON: bool = False
+    VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE: int = 4
+    VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE: int = 512 # Note: 512 is the sweet-spot for MI50 rocBLAS performance
+    VLLM_TORCH_SDPA_PREFILL: bool = False
+    VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS: int = 0
+    VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS: int = 0
+    VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE: int = 0
+    VLLM_TORCH_SDPA_BACKEND: str = "math" # auto, math, flash
+    VLLM_TORCH_SDPA_DECODE: bool = False
+    VLLM_TORCH_SDPA_DECODE_MAX_SEQS: int = 1
+    VLLM_TORCH_SDPA_MTP_DECODE: bool = False
+    VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS: int = 16 # 64 or 128 is better for gfx906 with Qwen3.6 27B MTP (but needs more vram)
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
@@ -145,6 +158,7 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1085,6 +1099,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
     ),
+    "VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE", "4")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL", "False").lower() in ("true", "1")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE", "0")
+    ),
+    "VLLM_TORCH_SDPA_BACKEND": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_BACKEND", "math").lower()
+    ),
+    "VLLM_TORCH_SDPA_DECODE": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_DECODE", "False").lower() in ("true", "1")
+    ),
+    "VLLM_TORCH_SDPA_DECODE_MAX_SEQS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_DECODE_MAX_SEQS", "1")
+    ),
+    "VLLM_TORCH_SDPA_MTP_DECODE": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_MTP_DECODE", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_FP16": lambda: (
+        os.getenv("VLLM_ROCM_MLA_SPARSE_FP16", "False").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_FP16_TRITON": lambda: (
+        os.getenv("VLLM_ROCM_MLA_SPARSE_FP16_TRITON", "False").lower() in ("true", "1")
+    ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (
@@ -1266,8 +1317,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # Number of parallel tiled softmax segments allocated for the Triton
+    # attention 3D decode path.
+    "VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": lambda: int(
+        os.getenv("VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS", "16")
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # If set, vLLM will disable the MLA sparse attention optimizations.
+    "VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL": lambda: bool(
+        int(os.getenv("VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL", "0"))
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,

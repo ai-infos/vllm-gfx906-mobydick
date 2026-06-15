@@ -53,8 +53,10 @@ class RocmAttentionMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
+    seq_lens_cpu_upper_bound: torch.Tensor | None
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -147,8 +149,10 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
@@ -442,7 +446,9 @@ class RocmAttentionImpl(AttentionImpl):
             value_cache=value_cache,
             block_table=block_table,
             query_start_loc=cu_seqlens_q,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
             seq_lens=seqused_k,
+            seq_lens_cpu=attn_metadata.seq_lens_cpu_upper_bound,
             max_seq_len=max_seqlen_k,
             max_query_len=max_seqlen_q,
             k_scale=layer._k_scale,
@@ -453,6 +459,7 @@ class RocmAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             sinks=self.sinks,
             causal=attn_metadata.causal,
+            attn_type=self.attn_type,
         )
 
         return output

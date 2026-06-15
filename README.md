@@ -1,3 +1,160 @@
+## Mini Install Guide for GFX906
+
+### 🐳 Using Pre-built Docker Image (Recommended)
+
+If you have Docker and the AMD ROCm drivers/kernel modules installed on your host system, you can totally bypass the complex manual source-build installation by using our pre-built Docker image.
+
+```bash
+# Pull the latest image (or specify a tag instead of latest, e.g. v0.19.1rc0.x)
+docker pull aiinfos/vllm-gfx906-mobydick:latest
+
+# Run the container interactively (Make sure to pass ROCm devices into the container and have your models in host /home/ as we map /home:/home; feel free to edit the command below to a safer one, without priviledged and others)
+sudo docker run -it --name vllm-gfx906-mobydick -v /home:/home --network host --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add $(getent group render | cut -d: -f3) \
+  --cap-add=SYS_ADMIN --volume /sys:/sys:ro --pid=host --privileged \
+  --ipc=host aiinfos/vllm-gfx906-mobydick:latest
+```
+
+Once inside the container, you are all set! You can immediately start serving models (see the Quickstart example below).
+
+---
+
+### 🛠️ Manual Build from Source
+
+If you prefer to build and install from source on your bare metal instead, follow the steps below:
+
+### ROCm 6.3.4 & amdgpu drivers
+
+```code
+# Get the script that adds the AMD repo for 24.04 (noble)
+wget https://repo.radeon.com/amdgpu-install/6.3.4/ubuntu/noble/amdgpu-install_6.3.60304-1_all.deb
+sudo apt install ./amdgpu-install_6.3.60304-1_all.deb
+
+# Install ROCm  6.3.4 including hip, rocblas, amdgpu-dkms etc (assuming the machine has already the advised compatible kernel 6.11)
+sudo amdgpu-install --usecase=rocm --rocmrelease=6.3.4    
+
+sudo usermod -aG render,video $USER
+
+# Verify ROCm installation
+rocm-smi --showproductname --showdriverversion
+rocminfo
+
+
+# Add iommu=pt if you later grow beyond two GPUs
+# ROCm’s NCCL-/RCCL-based frameworks can hang on multi-GPU rigs unless the IOMMU is put in pass-through mode
+# see https://rocm.docs.amd.com/projects/install-on-linux/en/docs-6.3.3/reference/install-faq.html#multi-gpu
+
+sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="iommu=pt /' /etc/default/grub
+sudo update-grub
+sudo reboot
+cat /proc/cmdline  # >>> to check: must return: "BOOT_IMAGE=... iommu=pt"
+
+```
+
+### vllm-gfx906-mobydick fork with its dependencies (python, torch, triton, flash-attn, etc)
+
+```code
+
+pyenv install 3.12.11
+pyenv virtualenv 3.12.11 venv312
+pyenv activate venv312
+
+# PYTORCH 2.11.0
+
+git clone --branch v2.11.0 --recursive https://github.com/pytorch/pytorch.git
+cd pytorch
+
+# Install Python Dependencies
+pip install -r requirements.txt
+pip install mkl-static mkl-include
+
+# Hipify the Source (Convert CUDA to ROCm code)
+python tools/amd_build/build_amd.py
+
+# Build the wheel and install
+export MAX_JOBS=96 # to be adjusted according to your setup to avoid OOM / freeze / crash
+export USE_ROCM=1
+export PYTORCH_ROCM_ARCH=gfx906
+export CMAKE_PREFIX_PATH="${VIRTUAL_ENV}:${CMAKE_PREFIX_PATH}"
+
+pip wheel --no-build-isolation -v -w dist -e . 2>&1 | tee build.log
+pip install ./dist/torch*.whl
+
+
+# TORCHVISION 0.26.0
+
+# Install dependencies
+sudo apt-get update && sudo apt-get install -y libpng-dev libjpeg-dev ffmpeg
+
+# Build and Install
+git clone --branch v0.26.0 https://github.com/pytorch/vision.git
+cd vision
+export FORCE_CUDA=1
+export USE_ROCM=1
+export PYTORCH_ROCM_ARCH=gfx906
+
+python setup.py install
+
+
+# TORCHAUDIO 2.11.0
+
+# Build and Install
+git clone --branch v2.11.0 https://github.com/pytorch/audio.git
+cd audio
+export PYTORCH_ROCM_ARCH=gfx906
+export USE_ROCM=1
+
+python setup.py install
+
+
+# TRITON-GFX906 V3.6.0
+
+git clone --branch v3.6.0+gfx906 https://github.com/ai-infos/triton-gfx906.git
+cd triton-gfx906 
+pip install -r python/requirements.txt
+TRITON_CODEGEN_BACKENDS="amd" pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
+pip install ./dist/triton-*.whl  
+
+
+# FLASH-ATTENTION-GFX906 (triton backend)
+
+git clone https://github.com/ai-infos/flash-attention-gfx906.git
+cd flash-attention-gfx906
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+
+# VLLM-GFX906-MOBYDICK main
+
+git clone https://github.com/ai-infos/vllm-gfx906-mobydick.git
+cd vllm-gfx906-mobydick
+pip install 'amdsmi>=6.3,<6.4'
+pip install -r requirements/rocm.txt
+pip wheel --no-build-isolation -v -w dist . 2>&1 | tee build.log
+pip install ./dist/vllm-*.whl
+
+# TRANSFORMERS (v5.7.0 or any other version <6 supporting your model)
+pip install transformers==5.7.0
+```
+
+### Quickstart example (with Qwen3.5-0.8B)
+
+```code
+FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE VLLM_LOGGING_LEVEL=DEBUG vllm serve Qwen/Qwen3.5-0.8B \
+  --dtype float16 \
+  --kv-cache-dtype float16 \
+  2>&1 | tee log.txt
+```
+
+NB: --dtype float16 is recommended to add for this gfx906 fork. If not set, vllm will take the dtype from config.json model which might be bfloat16, not natively supported on gfx906 (with potential fallback to float32, leading to slower inference)
+
+CREDITS
+-------
+
+- https://github.com/nlzy/vllm-gfx906
+- https://github.com/Said-Akbar/vllm-rocm
+- https://github.com/vllm-project/vllm
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>

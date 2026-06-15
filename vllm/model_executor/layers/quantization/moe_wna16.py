@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 
 
 class MoeWNA16Config(QuantizationConfig):
@@ -75,7 +76,10 @@ class MoeWNA16Config(QuantizationConfig):
                     f"Minimum capability: {awq_min_capability}. "
                     f"Current capability: {device_capability}."
                 )
-            self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
+            self.use_marlin = (
+                not on_gfx906()
+                and AWQMarlinConfig.is_awq_marlin_compatible(full_config)
+            )
         else:
             raise ValueError("moe_wna16 only support gptq and awq.")
 
@@ -90,6 +94,8 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if on_gfx906():
+            return [torch.half, torch.float32]
         return [torch.bfloat16, torch.half]
 
     @classmethod
@@ -196,6 +202,17 @@ class MoeWNA16Config(QuantizationConfig):
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, RoutedExperts):
+            if self.linear_quant_method == "gptq":
+                from vllm.model_executor.layers.quantization.auto_gptq import (
+                    AutoGPTQConfig,
+                )
+                from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+                    get_dynamic_override,
+                )
+
+                config = AutoGPTQConfig.from_config(self.full_config)
+                if get_dynamic_override(config, layer_name=prefix) is False:
+                    return UnquantizedFusedMoEMethod(layer.moe_config)
             return MoeWNA16Method(self, layer.moe_config)
         return None
 

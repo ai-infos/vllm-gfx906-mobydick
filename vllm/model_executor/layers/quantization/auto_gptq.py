@@ -60,6 +60,7 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from vllm.platforms.rocm import on_gfx906
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.collection_utils import is_list_of
@@ -180,6 +181,8 @@ class AutoGPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if on_gfx906():
+            return [torch.half, torch.float32]
         return [torch.half, torch.bfloat16]
 
     @classmethod
@@ -242,9 +245,12 @@ class AutoGPTQConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-            if not check_moe_marlin_supports_layer(layer, self.group_size):
+            if on_gfx906() or not check_moe_marlin_supports_layer(
+                layer, self.group_size
+            ):
                 logger.warning_once(
-                    f"Layer '{prefix}' is not supported by GPTQMoeMarlin. "
+                    f"Layer '{prefix}' is not supported by GPTQMoeMarlin or "
+                    "is running on gfx906. "
                     "Falling back to Moe WNA16 kernels."
                 )
                 return MoeWNA16Config.from_config(self.full_config).get_quant_method(

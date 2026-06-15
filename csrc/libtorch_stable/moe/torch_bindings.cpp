@@ -59,7 +59,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     Tensor !adapter_enabled,"
       "                     Tensor !lora_ids,"
       "                     Tensor? maybe_expert_map) -> () ");
-#ifndef USE_ROCM
   m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
       "Tensor b_scales, Tensor? b_qzeros, "
@@ -68,6 +67,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "int top_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, "
       "int bit) -> Tensor");
 
+#ifndef USE_ROCM
   m.def(
       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
       "Tensor! b_q_weight, Tensor? b_bias_or_none,"
@@ -137,8 +137,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("batched_moe_align_block_size",
          TORCH_BOX(&batched_moe_align_block_size));
   m.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
-#ifndef USE_ROCM
   m.impl("moe_wna16_gemm", TORCH_BOX(&moe_wna16_gemm));
+#ifndef USE_ROCM
   m.impl("shuffle_rows", TORCH_BOX(&shuffle_rows));
   m.impl("grouped_topk", TORCH_BOX(&grouped_topk));
 #endif

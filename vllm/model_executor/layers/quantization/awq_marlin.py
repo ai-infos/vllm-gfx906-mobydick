@@ -279,6 +279,12 @@ class AWQMarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906():
+            return AWQConfig.from_config(self.full_config).get_quant_method(
+                layer, prefix
+            )
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
@@ -334,7 +340,11 @@ class AWQMarlinConfig(QuantizationConfig):
         group_size = quant_config.get("group_size")
         zero_point = quant_config.get("zero_point")
 
-        if not (current_platform.is_cuda_alike() or current_platform.is_cpu()):
+        from vllm.platforms.rocm import on_gfx906
+
+        if on_gfx906() or not (
+            current_platform.is_cuda_alike() or current_platform.is_cpu()
+        ):
             return False
 
         if quant_method != "awq":

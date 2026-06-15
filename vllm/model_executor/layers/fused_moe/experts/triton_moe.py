@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
@@ -90,7 +91,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
         if device_supports_int8:
             supported.append((kInt8StaticChannelSym, kInt8DynamicTokenSym))
-        if current_platform.supports_fp8():
+        if current_platform.supports_fp8() or on_gfx906():
             supported += [
                 (kFp8Static128BlockSym, kFp8Dynamic128Sym),
                 (kFp8StaticChannelSym, kFp8DynamicTokenSym),
@@ -344,7 +345,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # Fuse SiLU+Mul + FP8 block quantize into a single kernel
         # when conditions permit (gated SiLU, fp8 block quant with
         # group_size=128, no LoRA requiring the BF16 intermediate).
-        if (
+        if on_gfx906() and self.quant_config.use_fp8_w8a8:
+            self.activation(
+                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+            )
+            qintermediate_cache2 = intermediate_cache2
+        elif (
             activation == MoEActivation.SILU
             and self.quant_config.use_fp8_w8a8
             and self.block_shape == [128, 128]
