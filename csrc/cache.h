@@ -12,7 +12,8 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
 
 void swap_blocks_batch(const torch::Tensor& src_ptrs,
                        const torch::Tensor& dst_ptrs,
-                       const torch::Tensor& sizes);
+                       const torch::Tensor& sizes,
+                       bool is_src_access_order_any);
 
 void reshape_and_cache(torch::Tensor& key, torch::Tensor& value,
                        torch::Tensor& key_cache, torch::Tensor& value_cache,
@@ -91,16 +92,3 @@ void cp_gather_indexer_k_quant_cache(
     torch::Tensor& dst_scale,  // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::Tensor& cu_seq_lens);  // [batch_size + 1]
-
-// Indexer K FP16 cache function
-void indexer_k_cache_fp16(
-    torch::Tensor& k,               // [num_tokens, head_dim]
-    torch::Tensor& kv_cache,        // [num_blocks, block_size, cache_stride]
-    torch::Tensor& slot_mapping);    // [num_tokens]
-
-// Extract function to gather K FP16 cache
-void cp_gather_indexer_k_cache_fp16(
-    const torch::Tensor& kv_cache,       // [num_blocks, block_size, cache_stride]
-    torch::Tensor& dst_k,                // [num_tokens, head_dim]
-    const torch::Tensor& block_table,    // [batch_size, num_blocks]
-    const torch::Tensor& cu_seq_lens);     // [batch_size + 1]

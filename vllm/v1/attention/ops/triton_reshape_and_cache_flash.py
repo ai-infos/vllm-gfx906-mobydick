@@ -13,6 +13,14 @@ from vllm.utils.torch_utils import is_quantized_kv_cache
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
 
+_NATIVE_KV_CACHE_DTYPES = {"auto", "float16", "bfloat16", "float32", "half", "float"}
+
+
+def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype in _NATIVE_KV_CACHE_DTYPES or is_quantized_kv_cache(
+        kv_cache_dtype
+    )
+
 
 @triton.jit
 def reshape_and_cache_kernel_flash(
@@ -324,7 +332,7 @@ def triton_reshape_and_cache_flash(
     # [num_blocks, block_size, num_heads, head_size]
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
-    kv_cache_dtype: str,  # "auto", "fp8", "float16"
+    kv_cache_dtype: str,  # "auto", "fp8"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
@@ -350,18 +358,14 @@ def triton_reshape_and_cache_flash(
     block_stride = key_cache.stride()[0]
     page_stride = key_cache.stride()[1]
 
-    assert (
-        kv_cache_dtype == "auto"
-        or is_quantized_kv_cache(kv_cache_dtype)
-        or kv_cache_dtype == "float16"
-    ), f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
-
-    if is_quantized_kv_cache(kv_cache_dtype):
-        kv_cache_torch_dtype = current_platform.fp8_dtype()
-    elif kv_cache_dtype == "float16":
-        kv_cache_torch_dtype = torch.float16
-    else:
-        kv_cache_torch_dtype = key_cache.dtype
+    assert _is_supported_kv_cache_dtype(kv_cache_dtype), (
+        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+    )
+    kv_cache_torch_dtype = (
+        current_platform.fp8_dtype()
+        if is_quantized_kv_cache(kv_cache_dtype)
+        else key_cache.dtype
+    )
 
     if key_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
         kv_cache_dtype
@@ -383,7 +387,7 @@ def triton_reshape_and_cache_flash(
         torch.float8_e4m3fnuz,
     ], (
         "unsupported dtype of KV cache tensor, got "
-        f"{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+        "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
         "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
     )
 
@@ -519,7 +523,7 @@ def triton_reshape_and_cache_flash_diffkv(
     # [num_blocks, block_size, num_heads, head_size + head_size_v]
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
-    kv_cache_dtype: str,  # "auto", "fp8", "float16"
+    kv_cache_dtype: str,  # "auto", "fp8"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
@@ -533,18 +537,14 @@ def triton_reshape_and_cache_flash_diffkv(
     block_stride = kv_cache.stride()[0]
     page_stride = kv_cache.stride()[1]
 
-    assert (
-        kv_cache_dtype == "auto"
-        or is_quantized_kv_cache(kv_cache_dtype)
-        or kv_cache_dtype == "float16"
-    ), f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
-
-    if is_quantized_kv_cache(kv_cache_dtype):
-        kv_cache_torch_dtype = current_platform.fp8_dtype()
-    elif kv_cache_dtype == "float16":
-        kv_cache_torch_dtype = torch.float16
-    else:
-        kv_cache_torch_dtype = kv_cache.dtype
+    assert _is_supported_kv_cache_dtype(kv_cache_dtype), (
+        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
+    )
+    kv_cache_torch_dtype = (
+        current_platform.fp8_dtype()
+        if is_quantized_kv_cache(kv_cache_dtype)
+        else kv_cache.dtype
+    )
 
     if kv_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(kv_cache_dtype):
         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
@@ -563,7 +563,7 @@ def triton_reshape_and_cache_flash_diffkv(
         torch.float8_e4m3fnuz,
     ], (
         "unsupported dtype of KV cache tensor, got "
-        f"{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
+        "{kv_cache_torch_dtype}. Supported kv cache dtypes: fp8e4m3fn, "
         "fp8e5m2, uint8, bfloat16, float16, float32, fp8e4m3fnuz."
     )
 

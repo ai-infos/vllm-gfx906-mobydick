@@ -26,7 +26,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.sequence import IntermediateTensors
 
 from .deepseek_v2 import (
@@ -36,9 +35,16 @@ from .deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
-from .utils import maybe_prefix
+from .utils import get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 class SharedHead(nn.Module):
@@ -116,7 +122,9 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         )
 
         hidden_states, residual = self.mtp_block(
-            positions=positions, hidden_states=hidden_states, residual=None
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
         )
         hidden_states = residual + hidden_states
         return hidden_states
@@ -147,6 +155,22 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def set_skip_topk(self, skip: bool):
+        """Toggle skip_topk on all MTP layers with sparse attention.
+
+        Called by the proposer to implement index_share_for_mtp_iteration:
+        step 0 sets skip=False (compute own indices), steps 1+ set skip=True
+        (reuse step 0's indices).
+        """
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is not None:
+                self_attn = getattr(mtp_block, "self_attn", None)
+                if self_attn is not None:
+                    mla_attn = getattr(self_attn, "mla_attn", None)
+                    if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
+                        mla_attn.skip_topk = skip
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -230,7 +254,11 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         hidden_states = self.model(
-            input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            spec_step_idx,
         )
         return hidden_states
 
@@ -252,7 +280,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
         ]
 
-        if not on_gfx906(): # fused indexer (using fp8/bf16) not supported on gfx906 which uses awq/gptq quant for deepseek
+        # gfx906 DeepSeek uses AWQ/GPTQ and cannot use the fused FP8/BF16 indexer.
+        if not on_gfx906():
             # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
             indexer_fused_mapping = [
                 ("wk_weights_proj", "wk", 0),
@@ -273,6 +302,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             ),
         )
 
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
@@ -288,7 +318,12 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
             if _try_load_fp8_indexer_wk(
-                name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
+                name,
+                loaded_weight,
+                _pending_wk_fp8,
+                params_dict,
+                loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 

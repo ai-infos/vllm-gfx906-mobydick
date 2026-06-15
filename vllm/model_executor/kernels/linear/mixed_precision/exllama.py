@@ -14,9 +14,20 @@ from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
 
 class ExllamaLinearKernel(MPLinearKernel):
-    SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128, scalar_types.uint4]
+    SUPPORTED_QUANT_TYPES = [
+        scalar_types.uint4b8,
+        scalar_types.uint8b128,
+        scalar_types.uint4,
+    ]
     # In theory supports `scalar_types.uint2b2, scalar_types.uint3b4` too but
     # currently untested so not added to the list
 
@@ -48,8 +59,10 @@ class ExllamaLinearKernel(MPLinearKernel):
                 "pack the zero points",
             )
 
-        if c.act_type not in (torch.float16, torch.float32):
-            return False, "Exllama only supports float16 or float32 activations"
+        if c.act_type != torch.float16 and not (
+            on_gfx906() and c.act_type == torch.float32
+        ):
+            return False, "Exllama only supports float16 activations"
 
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
             return (
@@ -58,6 +71,8 @@ class ExllamaLinearKernel(MPLinearKernel):
                 "Exllama, supported types are: "
                 f"{cls.SUPPORTED_QUANT_TYPES}",
             )
+        if c.weight_type == scalar_types.uint4 and not on_gfx906():
+            return False, "AWQ Exllama routing is only enabled on gfx906"
 
         if c.group_size <= 0:
             return (
@@ -84,6 +99,7 @@ class ExllamaLinearKernel(MPLinearKernel):
             def transform_w_zp(x):
                 permute_param_layout_(x, input_dim=0, output_dim=1)
                 return x.data.contiguous()
+
             self._transform_param(layer, self.w_zp_name, transform_w_zp)
         else:
             # For Exllama, we need to set a zero-point tensor if there is not one
@@ -91,11 +107,10 @@ class ExllamaLinearKernel(MPLinearKernel):
             assert c.weight_type.has_bias()
             groups = c.partition_weight_shape[0] // c.group_size
             out_features = c.partition_weight_shape[1]
-            # gfx906: We will pass use_v2_format=True to gptq_gemm,
-            # no need to subtract 1 here
+            zero_bias = c.weight_type.bias if on_gfx906() else c.weight_type.bias - 1
             zeros = torch.full(
                 (groups, out_features),
-                c.weight_type.bias,
+                zero_bias,
                 dtype=torch.int32,
                 device=device,
             )
@@ -133,8 +148,12 @@ class ExllamaLinearKernel(MPLinearKernel):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
             x.data = x.data.contiguous()
-            # Under the hood, the exllama kernel only supports float16
-            return x.to(dtype=torch.float16 if c.act_type == torch.float32 else c.act_type)
+            dtype = (
+                torch.float16
+                if on_gfx906() and c.act_type == torch.float32
+                else c.act_type
+            )
+            return x.to(dtype=dtype)
 
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
@@ -153,17 +172,26 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
 
-        # gfx906: see comment above
-        use_v2_format = True
+        use_v2_format = on_gfx906()
 
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
-        
-        # The underlying gptq_gemm kernel only supports fp16
-        x_2d_fp16 = x_2d.to(torch.float16) if x_2d.dtype == torch.float32 else x_2d
+
+        x_2d_fp16 = (
+            x_2d.to(torch.float16)
+            if on_gfx906() and x_2d.dtype == torch.float32
+            else x_2d
+        )
 
         output = ops.gptq_gemm(
-            x_2d_fp16, w_q, w_zp, w_s, w_g_idx, True, use_v2_format, c.weight_type.size_bits
+            x_2d_fp16,
+            w_q,
+            w_zp,
+            w_s,
+            w_g_idx,
+            True,
+            use_v2_format,
+            c.weight_type.size_bits,
         )
 
         if output.dtype != x.dtype:

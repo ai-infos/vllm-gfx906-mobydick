@@ -45,6 +45,11 @@ except ImportError as e:
 
 # import custom ops, trigger op registration
 try:
+    import vllm._C_stable_libtorch  # noqa: F401
+except ImportError as e:
+    logger.warning("Failed to import from vllm._C_stable_libtorch with %r", e)
+
+try:
     import vllm._rocm_C  # noqa: F401
 except ImportError as e:
     logger.warning("Failed to import from vllm._rocm_C with %r", e)
@@ -130,25 +135,6 @@ def _sync_hip_cuda_env_vars():
 _sync_hip_cuda_env_vars()
 
 
-def _set_rocm_nccl_workarounds():
-    """Disable NCCL watchdog/monitoring threads on ROCm to prevent
-    hipErrorCapturedEvent during CUDA graph capture with tensor parallelism.
-
-    The PyTorch NCCL watchdog thread queries HIP events via hipEventQuery,
-    which throws hipErrorCapturedEvent when events belong to a capturing
-    stream. TORCH_NCCL_BLOCKING_WAIT=1 is the only way to prevent the
-    watchdog from starting (TORCH_NCCL_ASYNC_ERROR_HANDLING=0 only changes
-    the error handling mode but does NOT stop the watchdog).
-    (Workadounds implemented during Qwen 3.5 27b AWQ MTP+TP2 testing)
-    """
-    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
-    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
-
-
-_set_rocm_nccl_workarounds()
-
 # AMDSMI utils
 # Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
 # all the related functions work on real physical device ids.
@@ -167,9 +153,6 @@ def with_amdsmi_context(fn):
     return wrapper
 
 
-# Known amdsmi target_graphics_version quirks.
-# Some ROCm versions (e.g. 6.3.4) return non-standard names like
-# "gfx9006" instead of "gfx906".  Map them to canonical names here.
 _AMDSMI_GFX_NORMALIZATION: dict[str, str] = {
     "gfx9006": "gfx906",
 }
@@ -221,6 +204,9 @@ def _get_gcn_arch() -> str:
 _GCN_ARCH = _get_gcn_arch()
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
+_ON_GFX11 = "gfx11" in _GCN_ARCH
+_ON_GFX1100 = "gfx1100" in _GCN_ARCH
+_ON_GFX1151 = "gfx1151" in _GCN_ARCH
 _ON_GFX12X = any(arch in _GCN_ARCH for arch in ["gfx12"])
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
 _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
@@ -305,6 +291,18 @@ def on_gfx1x() -> bool:
     return _ON_GFX1X
 
 
+def on_gfx11() -> bool:
+    return _ON_GFX11
+
+
+def on_gfx1100() -> bool:
+    return _ON_GFX1100
+
+
+def on_gfx1151() -> bool:
+    return _ON_GFX1151
+
+
 def on_gfx12x() -> bool:
     return _ON_GFX12X
 
@@ -331,6 +329,30 @@ def on_gfx942() -> bool:
 
 def on_gfx950() -> bool:
     return _ON_GFX950
+
+
+def _set_gfx906_nccl_workarounds() -> None:
+    """Avoid captured-event queries from NCCL watchdog threads on gfx906."""
+    if not on_gfx906():
+        return
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+
+
+_set_gfx906_nccl_workarounds()
+
+
+# Enable HIP online tuning early, before hipBLASLt initializes.
+# Turn on hipBLASLt online tuning if use AITER hipBLASLt GEMM.
+if (
+    envs.VLLM_ROCM_USE_AITER
+    and envs.VLLM_ROCM_USE_AITER_LINEAR
+    and envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+    and on_mi3xx()
+):
+    os.environ["HIP_ONLINE_TUNING"] = "1"
 
 
 @cache
@@ -375,6 +397,8 @@ def use_rocm_custom_paged_attention(
 
 @cache
 def flash_attn_triton_available() -> bool:
+    if not (on_gfx1x() or on_gfx906()):
+        return False
     try:
         from importlib.util import find_spec
 
@@ -385,7 +409,7 @@ def flash_attn_triton_available() -> bool:
         if os.environ.get("FLASH_ATTENTION_TRITON_AMD_ENABLE") != "TRUE":
             logger.info_once(
                 "Set FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE to enable "
-                "Flash Attention Triton backend on RDNA or GFX906."
+                "Flash Attention Triton backend on RDNA or gfx906."
             )
             return False
         return True
@@ -396,6 +420,7 @@ def flash_attn_triton_available() -> bool:
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
+    use_kv_connector: bool = False,
 ) -> list[AttentionBackendEnum]:
     from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 
@@ -409,7 +434,6 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.ROCM_AITER_TRITON_MLA,
             ]
-            # on gfx906, triton mla is the only one that has been well tested so it has the highest priority
             if on_gfx906():
                 backends.remove(AttentionBackendEnum.TRITON_MLA)
                 backends.insert(0, AttentionBackendEnum.TRITON_MLA)
@@ -419,9 +443,11 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
 
-    backends = [
-        AttentionBackendEnum.ROCM_ATTN,
-    ]
+    backends = []
+    # ROCM_ATTN uses (2, num_blocks, ...) KV cache layout which is
+    # incompatible with KV connectors that require blocks-first layout.
+    if not use_kv_connector:
+        backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
     if is_aiter_found_and_supported():
@@ -429,7 +455,6 @@ def _get_backend_priorities(
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
 
-    # on gfx906, triton attn is the fastest (e.g. 2x faster than rocm attn for Minimax M2.5 AWQ in TG) so it has the highest priority
     if on_gfx906():
         backends.remove(AttentionBackendEnum.TRITON_ATTN)
         backends.insert(0, AttentionBackendEnum.TRITON_ATTN)
@@ -456,11 +481,12 @@ class RocmPlatform(Platform):
         "awq",
         "awq_marlin",  # will be overwritten with awq
         "gptq",
-        "gptq_marlin",  # will be overwritten with gptq
+        "gptq_marlin",
+        "auto_gptq",
         "fp8",
+        "deepseek_v4_fp8",
         "compressed-tensors",
         "fbgemm_fp8",
-        "gguf",
         "quark",
         "mxfp4",
         "mxfp8",
@@ -505,6 +531,7 @@ class RocmPlatform(Platform):
         backend_priorities = _get_backend_priorities(
             attn_selector_config.use_mla,
             attn_selector_config.use_sparse,
+            attn_selector_config.use_kv_connector,
         )
         for priority, backend in enumerate(backend_priorities):
             try:
@@ -650,14 +677,15 @@ class RocmPlatform(Platform):
             logger.info_once("Using Flash Attention backend for ViT model.")
             return AttentionBackendEnum.FLASH_ATTN
 
-        # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
+        # RDNA3/RDNA4 and gfx906: use the Flash Attention Triton backend.
         if (
             (on_gfx1x() or on_gfx906())
             and flash_attn_triton_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
             logger.info_once(
-                "Using Flash Attention (Triton backend) for ViT model on RDNA or GFX906."
+                "Using Flash Attention (Triton backend) for ViT model on "
+                "RDNA or gfx906."
             )
             return AttentionBackendEnum.FLASH_ATTN
 
@@ -744,21 +772,11 @@ class RocmPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         from vllm._aiter_ops import rocm_aiter_ops
-        from vllm.config.compilation import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
-        is_eager_execution = compilation_config.cudagraph_mode == CUDAGraphMode.NONE
         use_aiter_fused_moe = rocm_aiter_ops.is_fused_moe_enabled()
-        use_aiter_rms_norm = rocm_aiter_ops.is_rmsnorm_enabled()
         use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
         use_aiter_fused_se = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        #  Aiter rms norm perform best when CUDA Graph capture is enabled.
-        if (
-            use_aiter_rms_norm
-            and not is_eager_execution
-            and "-rms_norm" not in compilation_config.custom_ops
-        ):
-            compilation_config.custom_ops.append("+rms_norm")
 
         if use_aiter_fp8_linear and "-quant_fp8" not in compilation_config.custom_ops:
             compilation_config.custom_ops.append("+quant_fp8")
@@ -859,7 +877,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_gfx9() or on_gfx12x() or on_gfx906() # experimental for gfx906 (test OK only done with Qwen3 Coder Next fp8)
+        return on_gfx9() or on_gfx12x() or on_gfx906()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
@@ -955,8 +973,8 @@ class RocmPlatform(Platform):
         dst_block_indices: torch.Tensor,
     ) -> None:
         """Copy blocks from src_cache to dst_cache on GPU."""
-        _src_cache = src_cache[:, src_block_indices]
-        dst_cache[:, dst_block_indices] = _src_cache.to(dst_cache.device)
+        _src_cache = src_cache[src_block_indices]
+        dst_cache[dst_block_indices] = _src_cache.to(dst_cache.device)
 
     @classmethod
     def swap_out_blocks_to_host(
@@ -967,8 +985,8 @@ class RocmPlatform(Platform):
         dst_block_indices: torch.Tensor,
     ) -> None:
         """Copy blocks from GPU to host (CPU)."""
-        _src_cache = src_cache[:, src_block_indices]
-        dst_cache[:, dst_block_indices] = _src_cache.cpu()
+        _src_cache = src_cache[src_block_indices]
+        dst_cache[dst_block_indices] = _src_cache.cpu()
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
@@ -990,7 +1008,7 @@ class RocmPlatform(Platform):
     def get_default_ir_op_priority(
         cls, vllm_config: "VllmConfig"
     ) -> "IrOpPriorityConfig":
-        from vllm.config.compilation import CompilationMode
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
         from vllm.config.kernel import IrOpPriorityConfig
 
         # Native used by default when compiling,
@@ -1000,12 +1018,10 @@ class RocmPlatform(Platform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        # This (mostly) preserves previous CustomOp behavior
-        # Necessary on ROCm because it's common that users
-        # enable rms_norm to use the aiter kernel.
+        #  Aiter rms norm perform best when CUDA Graph capture is enabled.
         # TODO(luka/TJ) remove env vars completely
         if (
-            cc.is_custom_op_enabled("rms_norm")
+            cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
         ):
@@ -1013,7 +1029,9 @@ class RocmPlatform(Platform):
         else:
             rms_norm = default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        return IrOpPriorityConfig.with_default(
+            default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm
+        )
 
     @classmethod
     @with_amdsmi_context

@@ -3,10 +3,11 @@
 """Torch SDPA attention kernels."""
 
 import contextlib
-from typing import Iterator, Optional
+from collections.abc import Iterator
 
 import torch
 import torch.nn.functional as F
+
 import vllm.envs as envs
 
 from vllm.logger import init_logger
@@ -50,7 +51,7 @@ def _causal_lower_right_mask(
     kv_len: int,
     device: torch.device,
     query_start_pos: int = 0,
-    full_query_len: Optional[int] = None,
+    full_query_len: int | None = None,
 ) -> torch.Tensor:
     if full_query_len is None:
         full_query_len = query_len
@@ -104,20 +105,20 @@ def can_use_torch_sdpa_prefill(
     num_actual_tokens: int,
     max_query_len: int,
     query_lens_cpu: torch.Tensor,
-    seq_lens_cpu: Optional[torch.Tensor],
+    seq_lens_cpu: torch.Tensor | None,
     attn_type: AttentionType,
     kv_quant_mode: KVQuantMode,
     q_dtype: torch.dtype,
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     use_alibi_sqrt: bool,
-    sinks: Optional[torch.Tensor],
+    sinks: torch.Tensor | None,
     logits_soft_cap: float,
     sliding_window: tuple[int, int],
     chunk_lookback: int,
-    output_scale: Optional[torch.Tensor],
-    mm_prefix_range_tensor: Optional[torch.Tensor],
+    output_scale: torch.Tensor | None,
+    mm_prefix_range_tensor: torch.Tensor | None,
 ) -> bool:
     if not envs.VLLM_TORCH_SDPA_PREFILL:
         return False
@@ -154,10 +155,15 @@ def can_use_torch_sdpa_prefill(
         logger.debug("Torch SDPA prefill skip: Sinks not supported")
         return False
     if logits_soft_cap != 0:
-        logger.debug("Torch SDPA prefill skip: logits_soft_cap %s != 0", logits_soft_cap)
+        logger.debug(
+            "Torch SDPA prefill skip: logits_soft_cap %s != 0", logits_soft_cap
+        )
         return False
     if sliding_window != (-1, -1):
-        logger.debug("Torch SDPA prefill skip: sliding_window %s != (-1, -1)", sliding_window)
+        logger.debug(
+            "Torch SDPA prefill skip: sliding_window %s != (-1, -1)",
+            sliding_window,
+        )
         return False
     if chunk_lookback != -1:
         logger.debug("Torch SDPA prefill skip: chunk_lookback %s != -1", chunk_lookback)
@@ -181,8 +187,10 @@ def can_use_torch_sdpa_prefill(
             envs.VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS,
         )
         return False
-    if (envs.VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS > 0
-            and total_prefill_tokens > envs.VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS):
+    if (
+        envs.VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS > 0
+        and total_prefill_tokens > envs.VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS
+    ):
         logger.debug(
             "Torch SDPA prefill skip: total_tokens %d > MAX_TOKENS %d",
             total_prefill_tokens,
@@ -207,17 +215,17 @@ def can_use_torch_sdpa_mtp_decode(
     max_query_len: int,
     max_decode_query_len: int,
     kv_quant_mode: KVQuantMode,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     use_alibi_sqrt: bool,
-    sinks: Optional[torch.Tensor],
+    sinks: torch.Tensor | None,
     logits_soft_cap: float,
     sliding_window: tuple[int, int],
     chunk_lookback: int,
-    seq_lens_cpu: Optional[torch.Tensor],
+    seq_lens_cpu: torch.Tensor | None,
     query_start_loc_cpu: torch.Tensor,
-    is_prefilling: Optional[torch.Tensor],
-    output_scale: Optional[torch.Tensor],
-    mm_prefix_range_tensor: Optional[torch.Tensor],
+    is_prefilling: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    mm_prefix_range_tensor: torch.Tensor | None,
 ) -> bool:
     if not envs.VLLM_TORCH_SDPA_MTP_DECODE:
         return False
@@ -351,7 +359,8 @@ def torch_sdpa_prefill_attention(
                     -1, num_kv_heads, head_size)[:kv_len]
             else:
                 # Triton/CUDA layout:
-                # key_cache/value_cache: (num_blocks, block_size, num_kv_heads, head_size)
+                # key_cache/value_cache:
+                # (num_blocks, block_size, num_kv_heads, head_size)
                 k = key_cache.index_select(0, block_ids).reshape(
                     -1, num_kv_heads, head_size)[:kv_len]
                 v = value_cache.index_select(0, block_ids).reshape(
@@ -448,16 +457,16 @@ def can_use_torch_sdpa_decode(
     attn_type: AttentionType,
     max_query_len: int,
     _kv_quant_mode: KVQuantMode,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     use_alibi_sqrt: bool,
-    sinks: Optional[torch.Tensor],
+    sinks: torch.Tensor | None,
     logits_soft_cap: float,
     sliding_window: tuple[int, int],
     chunk_lookback: int,
-    seq_lens_cpu: Optional[torch.Tensor],
+    seq_lens_cpu: torch.Tensor | None,
     query_start_loc_cpu: torch.Tensor,
-    output_scale: Optional[torch.Tensor],
-    mm_prefix_range_tensor: Optional[torch.Tensor],
+    output_scale: torch.Tensor | None,
+    mm_prefix_range_tensor: torch.Tensor | None,
 ) -> bool:
     if not envs.VLLM_TORCH_SDPA_DECODE:
         return False
@@ -579,7 +588,8 @@ def torch_sdpa_decode_attention(
                 )
             else:
                 # Triton/CUDA layout:
-                # key_cache/value_cache: (num_blocks, block_size, num_kv_heads, head_size)
+                # key_cache/value_cache:
+                # (num_blocks, block_size, num_kv_heads, head_size)
                 k = (
                     key_cache.index_select(0, block_ids)
                     .reshape(-1, num_kv_heads, head_size)[:kv_len]

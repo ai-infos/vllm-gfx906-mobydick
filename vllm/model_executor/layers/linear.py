@@ -5,7 +5,7 @@ import itertools
 from abc import abstractmethod
 
 import torch
-from torch.nn.parameter import Parameter, UninitializedParameter
+from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm.distributed import (
@@ -48,18 +48,15 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearTransformMethod",
     "AWQMarlinLinearMethod",
     "AWQLinearMethod",
-    "GPTQMarlinLinearMethod",
+    "AutoGPTQLinearMethod",
     "Fp8LinearMethod",
-    "MarlinLinearMethod",
-    "GPTQMarlin24LinearMethod",
-    "TPUInt8LinearMethod",
-    "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp8PcPtLinearMethod",
     "ModelOptFp8PbWoLinearMethod",
     "QuarkLinearMethod",
     "ModelOptNvFp4LinearMethod",
+    "ModelOptNvFp4W4A16LinearMethod",
     "HummingLinearMethod",
 ]
 
@@ -268,10 +265,13 @@ class LinearBase(PluggableLayer):
         self.quant_config = quant_config
         self.prefix = prefix
         self.allow_fp8_block_shape_mismatch = False
+        self.quant_method: QuantizeMethodBase
         if quant_config is None:
-            self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
+            self.quant_method = UnquantizedLinearMethod()
+        elif quant_method := quant_config.get_quant_method(self, prefix=prefix):
+            self.quant_method = quant_method
         else:
-            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+            raise ValueError("All linear layers should support quant method.")
         self.return_bias = return_bias
         self.disable_tp = disable_tp
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -335,8 +335,6 @@ class ReplicatedLinear(LinearBase):
             disable_tp=disable_tp,
         )
 
-        # All the linear layer supports quant method.
-        assert self.quant_method is not None
         self.quant_method.create_weights(
             self,
             self.input_size,
@@ -362,19 +360,6 @@ class ReplicatedLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        # If the weight on disk does not have a shape, give it one
-        # (such scales for AutoFp8).
-        # Special case for GGUF
-
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, UninitializedParameter):
-            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
-
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
@@ -389,7 +374,6 @@ class ReplicatedLinear(LinearBase):
         x: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
 
         output = self.quant_method.apply(self, x, bias)
 
@@ -474,7 +458,6 @@ class ColumnParallelLinear(LinearBase):
         self._maybe_allow_fp8_block_shape_mismatch()
         self.gather_output = gather_output
 
-        assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -540,20 +523,6 @@ class ColumnParallelLinear(LinearBase):
         # no need to narrow
         is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
 
-        # Special case for GGUF
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, UninitializedParameter):
-            final_shape = list(loaded_weight.shape)
-            if output_dim is not None:
-                assert final_shape[output_dim] % self.tp_size == 0
-                final_shape[output_dim] = final_shape[output_dim] // self.tp_size
-            param.materialize(final_shape, dtype=loaded_weight.dtype)
-
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
@@ -583,7 +552,6 @@ class ColumnParallelLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
@@ -698,37 +666,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
         self.validate_shard_id(loaded_shard_id)
-        # Special case for GGUF
-        # initialize GGUF param after we know the quantize type
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if isinstance(loaded_shard_id, tuple) and (
-            is_gguf_weight or is_gguf_weight_type
-        ):
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported for GGUF."
-            )
-        if is_gguf_weight_type:
-            if loaded_shard_id is not None:
-                param.data[loaded_shard_id].copy_(loaded_weight)
-                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
-            else:
-                param.shard_weight_type = {
-                    i: loaded_weight.item() for i, _ in enumerate(self.output_sizes)
-                }
-            return
-
-        if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-
-            if loaded_shard_id is not None:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-                param.shard_id.append(loaded_shard_id)
-                param.shard_id_map[loaded_shard_id] = len(param.data_container)
-                param.data_container.append(loaded_weight)
-                return
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
@@ -1191,30 +1128,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_shard_id: str | None = None,
     ):
         self.validate_shard_id(loaded_shard_id)
-        # Special case for GGUF
-        # initialize GGUF param after we know the quantize type
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            idx_map = {"q": 0, "k": 1, "v": 2}
-            if loaded_shard_id is not None:
-                param.data[idx_map[loaded_shard_id]].copy_(loaded_weight)
-                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
-            else:
-                param.shard_weight_type = {k: loaded_weight.item() for k in idx_map}
-            return
-
-        if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-
-            if loaded_shard_id is not None:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-                param.shard_id.append(loaded_shard_id)
-                param.shard_id_map[loaded_shard_id] = len(param.data_container)
-                param.data_container.append(loaded_weight)
-                return
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
@@ -1463,7 +1376,6 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
-        assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -1504,19 +1416,6 @@ class RowParallelLinear(LinearBase):
         # no need to narrow
         is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
 
-        # Special case for GGUF
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, UninitializedParameter):
-            weight_shape = list(loaded_weight.shape)
-            if input_dim:
-                weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
-            param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
-
         param_data = param.data
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
@@ -1553,7 +1452,6 @@ class RowParallelLinear(LinearBase):
             input_parallel = split_input[self.tp_rank].contiguous()
 
         # Matrix multiply.
-        assert self.quant_method is not None
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias

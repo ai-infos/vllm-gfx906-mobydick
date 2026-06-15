@@ -32,8 +32,8 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
-import vllm.envs as envs
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
@@ -83,9 +83,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    extract_layer_index,
+    sequence_parallel_chunk,
+)
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
@@ -103,6 +106,7 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
+    get_pp_missing_layer_names,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -110,6 +114,13 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 class DeepseekAttention(nn.Module):
@@ -298,6 +309,13 @@ class DeepseekV2MoE(nn.Module):
         self.is_fusion_moe_shared_experts_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )
+        if (
+            self.is_rocm_aiter_moe_enabled
+            and self.gate.e_score_correction_bias is not None
+        ):
+            # Accumulates in fp32; avoids bf16->fp32 cast.
+            self.gate.set_out_dtype(self.gate.weight.dtype)
+
         if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
             self.shared_experts = None
         else:
@@ -337,15 +355,9 @@ class DeepseekV2MoE(nn.Module):
             n_shared_experts=config.n_shared_experts
             if self.is_fusion_moe_shared_experts_enabled
             else None,
+            router_logits_dtype=self.gate.out_dtype,
         )
 
-        # Pre-cast the bias to match the gate output dtype so the
-        # conversion is not repeated on every forward pass.  All
-        # downstream references (FusedMoE, router) share the same
-        # nn.Parameter object, so mutating .data propagates everywhere.
-        # Weight loading uses copy_(), which handles the dtype conversion.
-        # Only needed on ROCm where the aiter biased_grouped_topk kernel
-        # requires the bias dtype to match the gating output dtype.
         if (
             self.is_rocm_aiter_moe_enabled
             and self.gate.e_score_correction_bias is not None
@@ -607,6 +619,7 @@ class Indexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
+        is_inplace_rope: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -626,18 +639,7 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        if not on_gfx906(): # fused wk (using fp8/bf16) not supported on gfx906 which uses awq/gptq quant for deepseek
-            # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-            # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
-            self.wk_weights_proj = MergedColumnParallelLinear(
-                hidden_size,
-                [self.head_dim, self.n_head],
-                bias=False,
-                quant_config=None,
-                disable_tp=True,
-                prefix=f"{prefix}.wk_weights_proj",
-            )
-        else:
+        if on_gfx906():
             self.wk = ReplicatedLinear(
                 hidden_size,
                 self.head_dim,
@@ -652,6 +654,17 @@ class Indexer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.weights_proj",
             )
+        else:
+            # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
+            # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
+            self.wk_weights_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [self.head_dim, self.n_head],
+                bias=False,
+                quant_config=None,
+                disable_tp=True,
+                prefix=f"{prefix}.wk_weights_proj",
+            )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -662,9 +675,18 @@ class Indexer(nn.Module):
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
         #       per self.quant_block_size element
+        self.use_fp16_sparse = on_gfx906() and envs.VLLM_ROCM_MLA_SPARSE_FP16
+        if self.use_fp16_sparse:
+            assert cache_config is not None and cache_config.block_size == 64, (
+                "The gfx906 FP16 sparse MLA path requires block_size=64."
+            )
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim if envs.VLLM_ROCM_MLA_SPARSE_FP16 else self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.float16 if envs.VLLM_ROCM_MLA_SPARSE_FP16 else torch.uint8,
+            head_dim=(
+                self.head_dim
+                if self.use_fp16_sparse
+                else self.head_dim + self.head_dim // self.quant_block_size * 4
+            ),
+            dtype=torch.float16 if self.use_fp16_sparse else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -684,63 +706,82 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
         )
 
+        self.is_inplace_rope = is_inplace_rope
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
-        if not on_gfx906():
-            # Fused wk + weights_proj: one GEMM, then split
+
+        if on_gfx906():
+            k, _ = self.wk(hidden_states)
+            weights, _ = self.weights_proj(hidden_states)
+        else:
             kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
+
+        if current_platform.is_rocm() and self.is_inplace_rope:
+            # This path should works on all platform, will remove extra
+            # branches in the future
+            # This fast path relies on rotary_emb mutating q and k inplace.
+            # On ROCm, this is only valid for kernels used as custom ops.
+            # In pytorch-native rope for inductor fusion, rotated q/k tensors
+            # are not mutated inplace but returned as new tensors.
+            k = self.k_norm(k)
+
+            rotary_emb(
+                positions, q[..., : self.rope_dim], k[..., : self.rope_dim].unsqueeze(1)
+            )
         else:
-            k, _ = self.wk(hidden_states)
-            weights, _ = self.weights_proj(hidden_states)
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            k = self.k_norm(k)
+            k_pe, k_nope = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
 
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            # Note: RoPE (NeoX) can introduce extra leading dimensions during
+            # compilation so we need to reshape back to token-flattened shapes
+            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # Note: RoPE (NeoX) can introduce extra leading dimensions during compilation
-        # so we need to reshape back to token-flattened shapes
-        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
-
-        # `rotary_emb` is shape-preserving; `q_pe` is already
-        # [num_tokens, n_head, rope_dim].
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            # `rotary_emb` is shape-preserving; `q_pe` is already
+            # [num_tokens, n_head, rope_dim].
+            q = torch.cat([q_pe, q_nope], dim=-1)
+            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
-        if not envs.VLLM_ROCM_MLA_SPARSE_FP16:
+        if self.use_fp16_sparse:
+            q_quant = q.to(torch.float16)
+            weights = weights * self.softmax_scale * self.n_head**-0.5
+        else:
             q = q.view(-1, self.head_dim)
-            q, q_scale = per_token_group_quant_fp8(
+            q_quant, q_scale = per_token_group_quant_fp8(
                 q,
                 self.quant_block_size,
                 column_major_scales=False,
                 use_ue8m0=self.scale_fmt is not None,
             )
-            q = q.view(-1, self.n_head, self.head_dim)
+            q_quant = q_quant.view(-1, self.n_head, self.head_dim)
             q_scale = q_scale.view(-1, self.n_head, 1)
-        else:
-            q_scale = 1
+            weights = (
+                weights.unsqueeze(-1)
+                * q_scale
+                * self.softmax_scale
+                * self.n_head**-0.5
+            ).squeeze(-1)
 
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
-        )
-        weights = weights.squeeze(-1)
-
-        return self.indexer_op(hidden_states, q, k, weights)
+        return self.indexer_op(hidden_states, q_quant, k, weights)
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+def _try_load_fp8_indexer_wk(
+    name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
+):
     """
     We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
     in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
@@ -756,6 +797,12 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
         return False  # WK is not in FP8 format, ignore.
     # Buffer this tensor (weight or scale) until both have arrived.
     layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -773,47 +820,6 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     )
 
     # Load the dequantized weight into shard 0 of the fused buffer.
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
-    param = params_dict[fused_name]
-    param.weight_loader(param, weight_bf16, 0)
-    loaded_params.add(fused_name)
-    return True
-
-
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
-    """
-    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
-    in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
-    Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK
-    weights and scale, and when both are available, dequantizes to BF16 and stores into
-    the fused wk_weights_proj.weight parameter.
-    """
-    if "indexer.wk." not in name or "wk_weights" in name:
-        return False  # Weight is not an isolated WK weight for the indexer, ignore.
-    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
-    if not is_weight and not is_scale:
-        return False  # WK is not in FP8 format, ignore.
-    # Buffer this tensor (weight or scale) until both have arrived.
-    layer_prefix = name.rsplit(".wk.", 1)[0]  # e.g. "model.layers.0.self_attn.indexer"
-    entry = buf.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
-    if "weight" not in entry or "scale" not in entry:
-        return True  # still waiting for the other param
-
-    # We have both weight and scale: dequantize FP8 to BF16.
-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
-    del buf[layer_prefix]
-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
-    weight_bf16 = scaled_dequantize(
-        weight_fp8,
-        scale_inv,
-        group_shape=GroupShape(block_size, block_size),
-        out_dtype=torch.bfloat16,
-    )
-
-    # Load the dequantized weight into shard 0 of the fused buffer.
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1026,9 +1032,9 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        # MLA Sparse (with Indexer) introduced by DS v3.2 can be enabled or not (EXPERIMENTAL)
-        self.is_v32 = False if envs.VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL else hasattr(config, "index_topk")
+        self.is_v32 = hasattr(config, "index_topk")
 
+        _skip_topk = False
         if self.is_v32:
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
@@ -1045,7 +1051,24 @@ class DeepseekV2MLAAttention(nn.Module):
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
+                is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
+
+            # IndexCache config
+            # Refer: https://arxiv.org/abs/2603.12201 for more details.
+            _index_topk_freq = getattr(config, "index_topk_freq", 1)
+            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
+            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+            layer_id = extract_layer_index(prefix)
+
+            if _index_topk_pattern is None:
+                _skip_topk = (
+                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
+                    != 0
+                )
+            elif 0 <= layer_id < len(_index_topk_pattern):
+                _skip_topk = _index_topk_pattern[layer_id] == "S"
+
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1083,6 +1106,7 @@ class DeepseekV2MLAAttention(nn.Module):
             cache_config,
             quant_config,
             prefix,
+            skip_topk=_skip_topk,
         )
 
     def forward(
@@ -1265,8 +1289,8 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config,
-                prefix,
+                vllm_config=vllm_config,
+                prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
@@ -1281,6 +1305,16 @@ class DeepseekV2Model(nn.Module):
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
+
+        # Needed by load_weights
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+        self.use_mha = config.model_type == "deepseek" or all(
+            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
+        )
+        self.num_redundant_experts = (
+            vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1343,178 +1377,6 @@ class DeepseekV2Model(nn.Module):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-
-class DeepseekV2MixtureOfExperts(MixtureOfExperts):
-    moe_mlp_layers: list[DeepseekV2MoE]
-    """
-    List of MoE MLP layers in the model.
-    """
-
-    def extract_moe_parameters(self, example_moe: DeepseekV2MoE | None):
-        if example_moe is None:
-            self.num_moe_layers = 0
-            self.num_expert_groups = 0
-            self.num_logical_experts = 0
-            self.num_physical_experts = 0
-            self.num_local_physical_experts = 0
-            self.num_routed_experts = 0
-            self.num_shared_experts = 0
-            self.num_redundant_experts = 0
-            logger.warning("DeepSeekV2: No DeepseekV2MoE layer found in model.layers.")
-        else:
-            self.num_logical_experts = example_moe.n_logical_experts
-            self.num_physical_experts = example_moe.n_physical_experts
-            self.num_local_physical_experts = example_moe.n_local_physical_experts
-            self.num_routed_experts = example_moe.n_routed_experts
-            self.num_shared_experts = example_moe.n_shared_experts
-            self.num_redundant_experts = example_moe.n_redundant_experts
-
-    def update_physical_experts_metadata(
-        self,
-        num_physical_experts: int,
-        num_local_physical_experts: int,
-    ) -> None:
-        assert self.num_local_physical_experts == num_local_physical_experts
-        self.num_physical_experts = num_physical_experts
-        self.num_local_physical_experts = num_local_physical_experts
-        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for moe in self.moe_mlp_layers:
-            moe.n_local_physical_experts = num_local_physical_experts
-            moe.n_physical_experts = num_physical_experts
-            moe.n_redundant_experts = self.num_redundant_experts
-            moe.experts.update_expert_map()
-
-
-class DeepseekV2ForCausalLM(
-    nn.Module,
-    SupportsPP,
-    DeepseekV2MixtureOfExperts,
-    SupportsLoRA,
-    SupportsEagle,
-    SupportsEagle3,
-):
-    packed_modules_mapping = {
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-    model_cls = DeepseekV2Model
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.config = config
-        self.quant_config = quant_config
-        self.is_fp4_ckpt = (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "modelopt_fp4"
-        )
-
-        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
-        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
-        self.use_mha = config.model_type == "deepseek" or all(
-            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
-        )
-
-        if self.use_mha:
-            self.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
-
-        # `packed_modules_mapping` needs to be modified before
-        # initializing DeepseekV2Model, as it is passed inplace to
-        # quantization config init and may be used to select the
-        # quant_method for relevant layers during initialization.
-        self.fuse_qkv_a_proj = (
-            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
-        )
-        if self.fuse_qkv_a_proj:
-            self.packed_modules_mapping["fused_qkv_a_proj"] = [
-                "q_a_proj",
-                "kv_a_proj_with_mqa",
-            ]
-
-        self.model = self.model_cls(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
-        # Set MoE hyperparameters
-        self.num_moe_layers = (
-            self.config.num_hidden_layers - self.config.first_k_dense_replace
-        )
-        self.set_moe_parameters()
-
-    def set_moe_parameters(self):
-        self.expert_weights = []
-
-        self.num_expert_groups = getattr(self.config, "n_group", 1)
-
-        self.moe_layers = []
-        self.moe_mlp_layers = []
-        example_moe = None
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
-
-            assert isinstance(layer, DeepseekV2DecoderLayer)
-            if isinstance(layer.mlp, DeepseekV2MoE):
-                # Pick last one layer since the first ones may be dense layers.
-                example_moe = layer.mlp
-                self.moe_mlp_layers.append(layer.mlp)
-                self.moe_layers.append(layer.mlp.experts)
-
-        self.extract_moe_parameters(example_moe)
-
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
-        )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
@@ -1563,6 +1425,7 @@ class DeepseekV2ForCausalLM(
             num_redundant_experts=self.num_redundant_experts,
         )
 
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
@@ -1577,8 +1440,13 @@ class DeepseekV2ForCausalLM(
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
 
-            if _try_load_fp8_indexer_wk(
-                name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
+            if not on_gfx906() and _try_load_fp8_indexer_wk(
+                name,
+                loaded_weight,
+                _pending_wk_fp8,
+                params_dict,
+                loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -1725,15 +1593,6 @@ class DeepseekV2ForCausalLM(
                         if is_pp_missing_parameter(name, self):
                             continue
 
-                        # ========================================================
-                        # Ignore Indexer Weights of MLA Sparse if VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL 
-                        # (it might disable MTP as well which depends on indexer)
-                        # ========================================================
-                        if envs.VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL and name not in params_dict:
-                            if "indexer" in name:
-                                continue
-                        # ========================================================
-
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
@@ -1743,6 +1602,178 @@ class DeepseekV2ForCausalLM(
                 loaded_params.add(name)
 
         return loaded_params
+
+
+class DeepseekV2MixtureOfExperts(MixtureOfExperts):
+    moe_mlp_layers: list[DeepseekV2MoE]
+    """
+    List of MoE MLP layers in the model.
+    """
+
+    def extract_moe_parameters(self, example_moe: DeepseekV2MoE | None):
+        if example_moe is None:
+            self.num_moe_layers = 0
+            self.num_expert_groups = 0
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_shared_experts = 0
+            self.num_redundant_experts = 0
+            logger.warning("DeepSeekV2: No DeepseekV2MoE layer found in model.layers.")
+        else:
+            self.num_logical_experts = example_moe.n_logical_experts
+            self.num_physical_experts = example_moe.n_physical_experts
+            self.num_local_physical_experts = example_moe.n_local_physical_experts
+            self.num_routed_experts = example_moe.n_routed_experts
+            self.num_shared_experts = example_moe.n_shared_experts
+            self.num_redundant_experts = example_moe.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
+
+
+class DeepseekV2ForCausalLM(
+    nn.Module,
+    SupportsPP,
+    DeepseekV2MixtureOfExperts,
+    SupportsLoRA,
+    SupportsEagle,
+    SupportsEagle3,
+):
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    model_cls = DeepseekV2Model
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.quant_config = quant_config
+
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+        self.use_mha = config.model_type == "deepseek" or all(
+            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
+        )
+
+        if self.use_mha:
+            self.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+
+        # `packed_modules_mapping` needs to be modified before
+        # initializing DeepseekV2Model, as it is passed inplace to
+        # quantization config init and may be used to select the
+        # quant_method for relevant layers during initialization.
+        self.fuse_qkv_a_proj = (
+            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+        )
+        if self.fuse_qkv_a_proj:
+            self.packed_modules_mapping["fused_qkv_a_proj"] = [
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+            ]
+
+        self.model = self.model_cls(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+        # Set MoE hyperparameters
+        self.num_moe_layers = (
+            self.config.num_hidden_layers - self.config.first_k_dense_replace
+        )
+        self.set_moe_parameters()
+
+    def set_moe_parameters(self):
+        self.expert_weights = []
+
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+
+        self.moe_layers = []
+        self.moe_mlp_layers = []
+        example_moe = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+
+            assert isinstance(layer, DeepseekV2DecoderLayer)
+            if isinstance(layer.mlp, DeepseekV2MoE):
+                # Pick last one layer since the first ones may be dense layers.
+                example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
+                self.moe_layers.append(layer.mlp.experts)
+
+        self.extract_moe_parameters(example_moe)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts,
+            num_redundant_experts=0,
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
 
 
 class DeepseekForCausalLM(DeepseekV2ForCausalLM):
@@ -1768,6 +1799,8 @@ def get_spec_layer_idx_from_weight_name(
     ):
         layer_idx = config.num_hidden_layers
         for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
+            if weight_name.startswith(
+                f"model.layers.{layer_idx + i}."
+            ) or weight_name.startswith(f"layers.{layer_idx + i}."):
                 return layer_idx + i
     return None

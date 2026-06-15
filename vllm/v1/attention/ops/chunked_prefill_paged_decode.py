@@ -13,17 +13,41 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.ops.torch_attention import (
+    can_use_torch_sdpa_prefill,
+    torch_sdpa_prefill_attention,
+)
+from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
 from .prefix_prefill import context_attention_fwd
-from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import get_kv_quant_mode
-from vllm.v1.attention.ops.torch_attention import (
-    can_use_torch_sdpa_prefill, torch_sdpa_prefill_attention)
-from vllm.platforms.rocm import on_gfx906
 
 logger = init_logger(__name__)
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
 float8_info = torch.finfo(current_platform.fp8_dtype())
+
+
+def has_native_kv_cache_layout(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> bool:
+    """Return whether KV cache blocks can use the native ROCm pairing.
+
+    The native reshape_and_cache writer assumes packed blocks. If cache update
+    needs reshape_and_cache_flash for a stride-padded hybrid layout, decode
+    should use the matching Triton path too.
+    """
+    return (
+        key_cache.stride(0) == key_cache.shape[1:].numel()
+        and value_cache.stride(0) == value_cache.shape[1:].numel()
+    )
 
 
 @triton.jit
@@ -416,14 +440,12 @@ def chunked_prefill_paged_decode(
         alibi_slopes,
         sinks,
     )
-    # Triton is only forced when encountering a non-standard block
-    # like Qwen3 with a size of 544.
-    # 1. Check if block_size is a power of 2 (16, 32, 64...)
-    # 2. If it's a power of 2, we trust the vLLM's native use_custom decision.
-    # 3. If it's not a power of 2 (such as Qwen3's 544),
-    # then our Triton path is forced.
+    has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
+    # Force Triton for non-standard blocks like Qwen3's 544 and for
+    # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
+    # during cache update, so keep decode on the matching stride-aware path.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
-    if not is_pow2:
+    if not is_pow2 or not has_native_layout:
         use_custom = False
 
     triton_launch_kwargs = {}
@@ -485,7 +507,12 @@ def chunked_prefill_paged_decode(
         real_block_size = value_cache.shape[3]
         # The standard model directly uses the original block_size.
         # Non-standard 544 uses 32 to accommodate integer division logic.
-        TRITON_BLOCK_SIZE = block_size if is_pow2 else 32
+        # Cap at 128 to avoid exceeding GPU shared memory limits
+        # (e.g. hybrid Mamba models inflate block_size to 2048).
+        # The kernel handles TRITON_BLOCK_SIZE != PHYSICAL_BLOCK_SIZE
+        # via the l_block_idx/internal_offsets addressing logic.
+        MAX_TRITON_BLOCK_SIZE = 128
+        TRITON_BLOCK_SIZE = min(block_size, MAX_TRITON_BLOCK_SIZE) if is_pow2 else 32
         if is_block_table_ptr:
             # Using the physical base address of tensors
             kv_element_size = key_cache.element_size()

@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -23,14 +23,21 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_safetensors_params_metadata
-from vllm.platforms.rocm import on_gfx906
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 class AWQConfig(QuantizationConfig):
@@ -71,11 +78,13 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
-        return [torch.half, torch.float32]
+        if on_gfx906():
+            return [torch.half, torch.float32]
+        return [torch.half]
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 60
+        return 60 if on_gfx906() else 75
 
     @staticmethod
     def get_config_filenames() -> list[str]:
@@ -106,19 +115,23 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
-            logger.warning_once(
-                "[vllm-gfx906] You are using AWQ with exllama kernel, "
-                "this is differ from the offical vLLM.")
+            if on_gfx906():
+                logger.warning_once(
+                    "Using the gfx906-optimized GPTQ GEMM path for AWQ."
+                )
             return AWQLinearMethod(self)
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, RoutedExperts):
             # Lazy import to avoid circular import.
             from .awq_marlin import AWQMarlinConfig
             from .moe_wna16 import MoeWNA16Config
             from .utils.marlin_utils import check_moe_marlin_supports_layer
 
-            if on_gfx906() or not check_moe_marlin_supports_layer(layer, self.group_size):
+            if on_gfx906() or not check_moe_marlin_supports_layer(
+                layer, self.group_size
+            ):
                 logger.warning_once(
-                    f"Layer '{prefix}' is not supported by AWQMoeMarlin or GFX906 used. "
+                    f"Layer '{prefix}' is not supported by AWQMoeMarlin or "
+                    "is running on gfx906. "
                     "Falling back to Moe WNA16 kernels."
                 )
                 config = {
@@ -272,21 +285,21 @@ class AWQLinearMethod(LinearMethodBase):
             ops.gptq_shuffle(layer.qzeros, empty, bits)
 
             ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
-            layer.qweight.data = layer.qweight.reshape((layer.qweight.shape[0] // 8,
-                                                        layer.qweight.shape[1] * 8))
+            layer.qweight.data = layer.qweight.reshape(
+                (layer.qweight.shape[0] // 8, layer.qweight.shape[1] * 8)
+            )
             replace_parameter(layer, "qweight", layer.qweight.data)
 
-    def apply(self,
-              layer: torch.nn.Module,
-              x: torch.Tensor,
-              bias: torch.Tensor | None = None) -> torch.Tensor:
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if on_gfx906():
-            out_shape = x.shape[:-1] + (layer.qweight.shape[-1], )
+            out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
 
-            # If --dtype float32 force operations to run in FP16 as w4a32 mode not implemented for gptq_gemm kernel
-            # TODO: implement w4a32 mode for gptq_gemm kernel to be consistent (only if necessary, for example: in case of w4a16 precision issues leading to garbage outputs with future models)
-            # NB: it has not been implemented yet as Deepseek v3.2 int4 autoround gptq works with dtype fp32 and with moe_wna16 kernel with true w4a32 mode implemented there
-            # So gptq_gemm has been left in w4a16 mode only for now with the below cast workaround when dtype is fp32 -> that's enough for now.
+            # The optimized GPTQ GEMM is FP16-only; preserve FP32 at the API.
             orig_dtype = x.dtype
             scales = layer.scales
             if x.dtype == torch.float32:
@@ -297,9 +310,14 @@ class AWQLinearMethod(LinearMethodBase):
             reshaped_x = x.reshape(-1, x.shape[-1])
 
             output = ops.gptq_gemm(
-                reshaped_x, layer.qweight, layer.qzeros, scales,
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                scales,
                 torch.empty(0, device=layer.qweight.device),
-                True, True, self.quant_config.weight_bits
+                True,
+                True,
+                self.quant_config.weight_bits,
             )
             if output.dtype != orig_dtype:
                 output = output.to(orig_dtype)
@@ -308,7 +326,7 @@ class AWQLinearMethod(LinearMethodBase):
             scales = layer.scales
             qzeros = layer.qzeros
             pack_factor = self.quant_config.pack_factor
-            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor, )
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
             reshaped_x = x.reshape(-1, x.shape[-1])
 
             # num_tokens >= threshold
@@ -319,7 +337,9 @@ class AWQLinearMethod(LinearMethodBase):
                 out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
                 output = torch.matmul(reshaped_x, out)
             else:
-                output = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+                output = ops.awq_gemm(
+                    reshaped_x, qweight, scales, qzeros, pack_factor
+                )
 
         if bias is not None:
             output.add_(bias)

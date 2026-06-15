@@ -27,7 +27,6 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
@@ -37,6 +36,13 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
@@ -172,7 +178,7 @@ def _silu_mul_quant_fp8_packed_kernel(
 
     pid_pack = tl.program_id(0)
     pid_m = tl.program_id(1)
-    m_offset = pid_m * BLOCK_M
+    m_offset = pid_m.to(tl.int64) * BLOCK_M
 
     if m_offset >= M:
         return
@@ -256,7 +262,7 @@ def silu_mul_quant_fp8_packed_triton(
     if output_q is None:
         output_q = torch.empty((M, N_2), dtype=fp8_dtype, device=input.device)
 
-    output_scale_packed = torch.zeros(
+    output_scale_packed = torch.empty(
         (num_packed_groups, tma_aligned_M),
         dtype=torch.int32,
         device=input.device,
@@ -303,9 +309,11 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     y_s_col_stride: tl.int64,
     # Information for float8
     eps,
+    clamp_limit,
     fp8_min: tl.constexpr,
     fp8_max: tl.constexpr,
     use_ue8m0: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
     # Meta-parameters
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -322,8 +330,8 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     pid_n = tl.program_id(1)
     N_2 = N // 2
 
-    m_offset = pid_m * BLOCK_M
-    n_offset = pid_n * BLOCK_N
+    m_offset = pid_m.to(tl.int64) * BLOCK_M
+    n_offset = pid_n.to(tl.int64) * BLOCK_N
     if m_offset >= M:
         return
 
@@ -337,7 +345,16 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     act_in = tl.load(act_in_ptrs)
     mul_in = tl.load(act_in_ptrs + N_2)
 
-    # silu & mul
+    # silu & mul — match C++ silu_and_mul: clamp in fp32 then store back to the
+    # input dtype, run silu in fp32 then narrow, and do the mul at input
+    # precision so HAS_CLAMP True/False share the same multiplication path.
+    if HAS_CLAMP:
+        act_in = tl.minimum(act_in.to(tl.float32), clamp_limit).to(
+            y_ptr.dtype.element_ty
+        )
+        mul_in = tl.clamp(mul_in.to(tl.float32), -clamp_limit, clamp_limit).to(
+            y_ptr.dtype.element_ty
+        )
     act_in = act_in.to(tl.float32)
     one_f32 = tl.cast(1, tl.float32)
     silu_out = (act_in / (one_f32 + tl.exp(-act_in))).to(y_ptr.dtype.element_ty)
@@ -368,6 +385,7 @@ def silu_mul_per_token_group_quant_fp8_colmajor(
     output: torch.Tensor | None = None,  # [M, N // 2]
     use_ue8m0: bool | None = None,
     eps: float = 1e-10,
+    clamp_limit: float | None = None,
 ):
     """
     silu+mul + block-fp8 quant with group size 128.
@@ -410,6 +428,7 @@ def silu_mul_per_token_group_quant_fp8_colmajor(
     assert N_2 % BLOCK_N == 0
     grid = (M // BLOCK_M, N_2 // BLOCK_N)
 
+    has_clamp = clamp_limit is not None
     _silu_mul_per_token_group_quant_fp8_colmajor[grid](
         input,
         output,
@@ -418,9 +437,11 @@ def silu_mul_per_token_group_quant_fp8_colmajor(
         N,
         output_scales.stride(-1),
         eps,
+        clamp_limit if has_clamp else 0.0,
         fp8_min,
         fp8_max,
         use_ue8m0,
+        has_clamp,
         GROUP_SIZE,
         BLOCK_M,
         BLOCK_N,
@@ -559,9 +580,11 @@ def per_token_group_quant_fp8(
         shape = x.shape[:-1] + (x.shape[-1] // group_size,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
-    # prefer CUDA kernel if available
+    # prefer CUDA/XPU kernel if available
     # TODO(bnell): this causes some fp8 moe test to fail.
-    if current_platform.is_cuda() and x.is_contiguous():
+    if (
+        current_platform.is_cuda_alike() or current_platform.is_xpu()
+    ) and x.is_contiguous():
         torch.ops._C.per_token_group_fp8_quant(
             x,
             x_q,
@@ -650,8 +673,7 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
     )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
 
-    finfo = torch.finfo(dtype)
-    fp8_min, fp8_max = finfo.min, finfo.max
+    fp8_min, fp8_max = get_fp8_min_max()
 
     # compute DeepGEMM-style packed scale tensor shape.
     hidden_dim = x.shape[-1]
@@ -667,10 +689,10 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
         dtype=torch.int32,
     )
 
-    # CUDA kernel path only (DeepGEMM + E8M0 is CUDA-specific).
-    assert current_platform.is_cuda(), (
-        "per_token_group_quant_fp8_packed_for_deepgemm is only valid on CUDA "
-        "platforms using DeepGEMM."
+    # Native kernel (libtorch stable); used with DeepGEMM on CUDA and
+    # available on ROCm for the same packed UE8M0 scale layout.
+    assert current_platform.is_cuda_alike(), (
+        "per_token_group_quant_fp8_packed_for_deepgemm requires a CUDA or ROCm GPU."
     )
 
     x_contiguous = x.contiguous()
@@ -725,7 +747,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    on_gfx906: tl.constexpr,
+    is_gfx906: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -748,35 +770,33 @@ def _w8a8_triton_block_scaled_mm(
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    if not on_gfx906: # A is fp16 input for gfx906 so no need to load As
+    if not is_gfx906:
         As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        if on_gfx906:
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
-        
-            # Bitwise E4M3 -> FP16 dequant for B (b is already uint8)
-            b_sign = (b & 0x80).to(tl.uint16) << 8
-            b_exp = ((b & 0x78) >> 3).to(tl.uint16)
-            b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
-            b_mant = (b & 0x07).to(tl.uint16) << 7
-            b_bits = b_sign | (b_exp << 10) | b_mant
-            b = b_bits.to(tl.float16, bitcast=True)
-        else:
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+        if is_gfx906:
+            b_u8 = b.to(tl.uint8, bitcast=True)
+            b_sign = (b_u8 & 0x80).to(tl.uint16) << 8
+            b_exp = ((b_u8 & 0x78) >> 3).to(tl.uint16)
+            b_exp = tl.where(b_exp == 0, 0, b_exp + 8)
+            b_mant = (b_u8 & 0x07).to(tl.uint16) << 7
+            b = (b_sign | (b_exp << 10) | b_mant).to(tl.float16, bitcast=True)
+            a = a.to(tl.float16)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
-        if not on_gfx906: # A is fp16 input for gfx906 so no need to load As
-            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * b_s[None, :] if on_gfx906 else tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if is_gfx906:
+            accumulator += tl.dot(a, b) * b_s[None, :]
+        else:
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -836,7 +856,7 @@ def get_w8a8_block_fp8_configs(
 def w8a8_triton_block_scaled_mm(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor,
+    As: torch.Tensor | None,
     Bs: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype = torch.float16,
@@ -859,9 +879,20 @@ def w8a8_triton_block_scaled_mm(
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
-    if not on_gfx906(): # As is none for gfx906 (we kept initial A in fp16)
-        assert A.shape[-1] == B.shape[-1]
-        assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+    # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
+    # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
+    # so decode them to fp32 before launching the kernel.
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        if As is not None and As.dtype == torch.float8_e8m0fnu:
+            As = _upcast_e8m0_to_fp32(As).contiguous()
+        if Bs.dtype == torch.float8_e8m0fnu:
+            Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+
+    assert A.shape[-1] == B.shape[-1]
+    assert A.is_contiguous()
+    if not on_gfx906():
+        assert As is not None
+        assert A.shape[:-1] == As.shape[:-1]
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     M = A.numel() // A.shape[-1]
 
@@ -873,14 +904,9 @@ def w8a8_triton_block_scaled_mm(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    # ── GFX906: bitwise Triton dequant + triton matmul with A as fp16 ──────────────
-    if on_gfx906():
-        logger.info_once(
-            "GFX906: bitwise FP8 dequant + triton matmul with A as fp16 "
-            "in w8a8_triton_block_scaled_mm (FP8 linear layer)",
-        )
-        if not A.dtype == torch.float16: # A can be fp32 or fp16
-            A = A.to(torch.float16)
+    if on_gfx906() and A.dtype == torch.float32:
+        A = A.to(torch.float16)
+
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:
         # Get the optimal config if there is one
@@ -890,29 +916,24 @@ def w8a8_triton_block_scaled_mm(
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
         # BLOCK_SIZE_K must be divisible by block_size[1]
         if on_gfx906():
-            # Optimize for gfx906 (MI50)
-            # BLOCK_SIZE_M should be smaller for small batch sizes to improve
-            # occupancy. Logic based on benchmarking results.
             if M <= 1:
-                bm, gm, nw, ns = 16, 16, 4, 1
+                block_m, group_m = 16, 16
             elif M <= 8:
-                bm, gm, nw, ns = 16, 1, 4, 1
+                block_m, group_m = 16, 1
             elif M <= 16:
-                bm, gm, nw, ns = 16, 8, 4, 1
+                block_m, group_m = 16, 8
             elif M <= 64:
-                bm, gm, nw, ns = 32, 4, 4, 1
+                block_m, group_m = 32, 4
             else:
-                bm, gm, nw, ns = 32, 8, 4, 1
-
+                block_m, group_m = 32, 8
             config = {
-                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_M": block_m,
                 "BLOCK_SIZE_N": block_size[0],
                 "BLOCK_SIZE_K": block_size[1],
-                "GROUP_SIZE_M": gm,
-                "num_warps": nw,
-                "num_stages": ns,
+                "GROUP_SIZE_M": group_m,
+                "num_warps": 4,
+                "num_stages": 1,
             }
-
         else:
             config = {
                 "BLOCK_SIZE_M": 64,
@@ -930,9 +951,9 @@ def w8a8_triton_block_scaled_mm(
 
     _w8a8_triton_block_scaled_mm[grid](
         A,
-        B.view(torch.uint8) if B.element_size() == 1 else B,
+        B,
         C,
-        As,
+        As if As is not None else A,
         Bs,
         M,
         N,
@@ -945,12 +966,12 @@ def w8a8_triton_block_scaled_mm(
         B.stride(0),
         C.stride(-2),
         C.stride(-1),
-        As.stride(-2) if not on_gfx906() else None,
-        As.stride(-1) if not on_gfx906() else None,
+        As.stride(-2) if As is not None else 0,
+        As.stride(-1) if As is not None else 0,
         Bs.stride(1),
         Bs.stride(0),
         **config,
-        on_gfx906=on_gfx906(),
+        is_gfx906=on_gfx906(),
     )
 
     return C
@@ -1287,7 +1308,7 @@ def process_fp8_weight_tensor_strategy(
         requantize_with_max_scale,
     )
 
-    if current_platform.is_fp8_fnuz():
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
         weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
@@ -1313,7 +1334,7 @@ def process_fp8_weight_channel_strategy(
         normalize_e4m3fn_to_e4m3fnuz,
     )
 
-    if current_platform.is_fp8_fnuz():
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
         weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
@@ -1330,7 +1351,7 @@ def process_fp8_weight_block_strategy(
         normalize_e4m3fn_to_e4m3fnuz,
     )
 
-    if current_platform.is_fp8_fnuz():
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale
         )

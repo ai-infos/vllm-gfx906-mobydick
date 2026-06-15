@@ -341,6 +341,7 @@ def rocm_unquantized_gemm_impl(
             envs.VLLM_ROCM_USE_SKINNY_GEMM
             and on_gfx950()
             and x.dtype in [torch.float16, torch.bfloat16]
+            and x.dim() == 2
             and (
                 10 <= n <= 128
                 and k % 8 == 0
@@ -351,8 +352,7 @@ def rocm_unquantized_gemm_impl(
             )
         )
         if use_skinny_reduce_counting:
-            out = ops.wvSplitKrc(weight, x.reshape(-1, x.size(-1)), cu_count, bias)
-            return out.reshape(*x.shape[:-1], weight.shape[0])
+            return ops.wvSplitKrc(x, weight, cu_count, bias)
 
         if use_aiter_triton_gemm(n, m, k, x.dtype):
             from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
@@ -361,7 +361,7 @@ def rocm_unquantized_gemm_impl(
 
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
-        and (on_gfx906() or on_gfx9() or on_gfx1x())
+        and (on_gfx9() or on_gfx1x() or on_gfx906())
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0
     )
@@ -444,6 +444,19 @@ def dispatch_cpu_unquantized_gemm(
         layer.cpu_linear = torch.nn.functional.linear
         return
 
+    if layer.weight.ndim != 2:
+        # this is not a linear layer
+        # For now it should be a causal_conv1d op
+        if torch.cpu._is_amx_tile_supported():
+            # prepack conv weight
+            layer.weight.data = ops.causal_conv1d_weight_pack(
+                layer.weight.view(
+                    layer.weight.size(0),
+                    layer.weight.size(2),
+                )
+            )
+        return
+
     N, K = layer.weight.size()
     dtype = layer.weight.dtype
 
@@ -513,13 +526,6 @@ def cpu_unquantized_gemm(
     bias: torch.Tensor | None = None,
 ):
     return layer.cpu_linear(x, weight, bias)
-
-
-def cublas_gemm_bf16_bf16_fp32(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-):
-    return ops.router_gemm_bf16_fp32(x, weight)
 
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:

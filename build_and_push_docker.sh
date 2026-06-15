@@ -4,11 +4,11 @@ set -e
 # Settings
 # NB: run this script from this branch with:
 # chmod +x ./build_and_push_docker.sh && docker login -u aiinfos && ./build_and_push_docker.sh 
-# it will default to current branch name: v0.20.1rc0.x or from another branch: e.g. "./build_and_push_docker.sh v0.17.1rc0.x"
+# it will default to current branch name: v0.23.1rc0.x or from another branch: e.g. "./build_and_push_docker.sh v0.17.1rc0.x"
 # NB2: you can force ROCM/PyTorch versions with: 
-# sudo ./build_and_push_docker.sh v0.20.1rc0.x 7.2.1 2.11.0
+# sudo ./build_and_push_docker.sh v0.23.1rc0.x 7.2.1 2.11.0
 IMAGE_NAME="aiinfos/vllm-gfx906-mobydick"
-IMAGE_TAG="${1:-v0.20.1rc0.x}"
+IMAGE_TAG="${1:-v0.23.1rc0.x}"
 ROCM_VERSION="${2:-6.3.3}"
 PYTORCH_VERSION="${3:-2.11.0}"
 TRANSFORMERS_VERSION="5.7.0"
@@ -84,6 +84,7 @@ FROM build_base AS build_vllm
 WORKDIR /app
 RUN git clone https://github.com/ai-infos/vllm-gfx906-mobydick.git vllm-gfx906-mobydick && \\
     cd vllm-gfx906-mobydick && \\
+    pip install setuptools_rust && \\
     pip install -r requirements/rocm.txt && \\
     pip wheel --no-build-isolation -v -w /dist .
 

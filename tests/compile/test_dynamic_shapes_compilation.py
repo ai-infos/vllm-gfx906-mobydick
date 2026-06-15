@@ -55,12 +55,19 @@ def test_dynamic_shapes_compilation(
     evaluate_guards,
 ):
     """Test that all dynamic shapes types compile successfully"""
-    if use_bytecode_hook and shapes_type == DynamicShapesType.UNBACKED:
-        pytest.skip("UNBACKED dynamic shapes require VLLM_USE_BYTECODE_HOOK=0")
+    if shapes_type == DynamicShapesType.UNBACKED and not is_torch_equal_or_newer(
+        "2.11.0"
+    ):
+        # NOTE[ROCm]: shape_id (used by Qwen2/Llama to relate input dims) only
+        # landed in torch 2.11, but the ROCm CI still runs torch 2.10.x. On
+        # older torch there's no way to express it, so unbacked shapes go
+        # data-dependent and compilation blows up -- nothing to test.
+        pytest.skip("unbacked dynamic shapes with shape_id require torch>=2.11")
 
     if evaluate_guards and shapes_type == DynamicShapesType.UNBACKED:
         pytest.skip("unbacked dynamic shapes do not add guards")
 
+    # TODO is this still a requirement?
     if evaluate_guards and use_aot_compile:
         pytest.skip("evaluate_guards requires use_aot_compile=0")
 

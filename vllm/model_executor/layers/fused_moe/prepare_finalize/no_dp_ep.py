@@ -9,7 +9,14 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.platforms.rocm import on_gfx906
+from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 def _quantize_input(
@@ -24,9 +31,9 @@ def _quantize_input(
 
     # On gfx906, skip FP8 activation quantization - the
     # bitwise dequant path expects FP16 inputs.
-    if on_gfx906() and quant_config.quant_dtype == torch.float8_e4m3fn:
+    if on_gfx906() and quant_config.use_fp8_w8a8:
         return a1, None
-    
+
     input_sf = (
         quant_config.a1_gscale if quant_config.use_nvfp4_w4a4 else quant_config.a1_scale
     )
@@ -36,7 +43,8 @@ def _quantize_input(
         quant_dtype=quant_config.quant_dtype,
         per_act_token_quant=quant_config.per_act_token_quant,
         block_shape=quant_config.block_shape,
-        is_fp4_scale_swizzled=quant_config.is_nvfp4_scale_swizzled,
+        is_scale_swizzled=quant_config.is_scale_swizzled,
+        mx_alignment=quant_config.mx_alignment,
     )
 
     return a1q, a1q_scale
@@ -76,7 +84,6 @@ class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
             assert topk == 1, (
                 "apply_router_weight_on_input is only implemented for topk=1"
             )
-            # Note: do not use inplace for shared experts overlap
             a1 = a1 * topk_weights.to(a1.dtype)
 
         a1q, a1q_scale = _quantize_input(a1, quant_config, defer_input_quant)

@@ -35,10 +35,15 @@ import torch
 from packaging import version
 
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
 
 is_hip_ = current_platform.is_rocm()
+if is_hip_:
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 logger = logging.getLogger(__name__)
 
@@ -220,12 +225,7 @@ def _decode_att_m_fwd(
 
     num_warps = 4
     if kv_group_num != 1:
-        if on_gfx906():
-             num_warps = 4 
-        elif is_hip_:
-             num_warps = 1
-        else:
-             num_warps = 2
+        num_warps = 4 if on_gfx906() else (1 if is_hip_ else 2)
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
@@ -258,7 +258,7 @@ def _decode_att_m_fwd(
         PAGE_SIZE=page_size,
         logit_cap=logit_cap,
         num_warps=num_warps,
-        num_stages=2 if not on_gfx906() else 1,
+        num_stages=1 if on_gfx906() else 2,
         Lk=Lk,
         Lv=Lv,
     )
@@ -465,24 +465,28 @@ def _decode_grouped_att_m_fwd(
 ):
     # with is_mla there is only a single c_kv in smem.
     # could increase BLOCK or num_stages.
-    BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    # [TODO] work around shmem limit on MI3xx
-    if (is_hip_ and Lk >= 576) or on_gfx906():
-        BLOCK = 16
-
-    if Lk == 576:
-        BLOCK_DMODEL = 512
-        BLOCK_DPE = 64
-    elif Lk == 288:
-        BLOCK_DMODEL = 256
-        BLOCK_DPE = 32
+    # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
+    if is_mla:
+        if not is_hip_ and Lk == 576:
+            BLOCK_DMODEL = 512
+            BLOCK_DPE = 64
+        elif not is_hip_ and Lk == 288:
+            BLOCK_DMODEL = 256
+            BLOCK_DPE = 32
+        else:
+            BLOCK_DMODEL = triton.next_power_of_2(Lv)
+            BLOCK_DPE = triton.next_power_of_2(Lk - Lv) if Lk > Lv else 0
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lk)
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
+
+    BLOCK = 32
+    if is_hip_:
+        BLOCK = 16
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[-2]
@@ -501,7 +505,16 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         if not on_gfx906():
-            extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+            extra_kargs = {
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            }
+        num_stages = 1
+    elif not is_hip_ and BLOCK_DMODEL >= 1024:
+        # Avoid shared memory overflow on NVIDIA when BLOCK_DMODEL is large
+        # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
+        # exceeds 101376 bytes limit
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
@@ -626,7 +639,7 @@ def _decode_softmax_reducev_fwd(
     NUM_KV_SPLITS = num_kv_splits
 
     extra_kargs = {}
-    if is_hip_ and not on_gfx906():
+    if is_hip_:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
@@ -647,7 +660,7 @@ def _decode_softmax_reducev_fwd(
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         num_warps=4,
-        num_stages=2 if not on_gfx906() else 1,
+        num_stages=1 if on_gfx906() else 2,
         **extra_kargs,
     )
 
