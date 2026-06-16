@@ -9,7 +9,16 @@ from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-IndexerKVDType = Literal["bf16", "float16", "fp16", "fp8", "mxfp4", "nvfp4"]
+IndexerKVDType = Literal[
+    "bf16",
+    "float16",
+    "fp16",
+    "float32",
+    "fp32",
+    "fp8",
+    "mxfp4",
+    "nvfp4",
+]
 
 
 @config
@@ -124,6 +133,8 @@ class AttentionConfig:
             value = value.lower()
             if value == "fp16":
                 return "float16"
+            if value == "fp32":
+                return "float32"
             if value == "bfloat16":
                 return "bf16"
         return value

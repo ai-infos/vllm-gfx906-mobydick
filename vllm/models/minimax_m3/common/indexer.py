@@ -50,9 +50,14 @@ from vllm.v1.kv_cache_interface import (
 class MiniMaxM3IndexerBackend(AttentionBackend):
     """Indexer side-cache backend (key-only)."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
-    # fp16/bf16 today; quantized formats are reserved for future cache impls.
+    # fp16/bf16/fp32 today; quantized formats are reserved for future cache impls.
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "float32",
         "float16",
         "bfloat16",
         "fp8",
@@ -110,6 +115,8 @@ def _normalize_indexer_kv_dtype(
 ) -> IndexerKVDType:
     if indexer_kv_dtype == "fp16":
         return "float16"
+    if indexer_kv_dtype == "fp32":
+        return "float32"
     return indexer_kv_dtype
 
 
@@ -121,9 +128,12 @@ def _indexer_kv_dtype_to_torch_dtype(
         return torch.bfloat16
     if indexer_kv_dtype == "float16":
         return torch.float16
+    if indexer_kv_dtype == "float32":
+        return torch.float32
     raise NotImplementedError(
         f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
-        "for the MiniMax M3 indexer cache (only 'bf16' and 'float16')."
+        "for the MiniMax M3 indexer cache "
+        "(only 'bf16', 'float16', 'float32')."
     )
 
 
@@ -467,7 +477,7 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
-    if indexer_kv_dtype not in ("bf16", "float16"):
+    if indexer_kv_dtype not in ("bf16", "float16", "float32"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."

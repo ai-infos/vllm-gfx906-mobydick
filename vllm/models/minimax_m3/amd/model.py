@@ -411,16 +411,31 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        model_stream_dtype = hidden_states.dtype
         qkv, _ = self.qkv_proj(hidden_states)
+        if qkv.dtype == torch.float32:
+            qkv = qkv.to(torch.float16)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        if cos_sin_cache.dtype != qkv.dtype:
+            cos_sin_cache = cos_sin_cache.to(qkv.dtype)
+            self.rotary_emb.cos_sin_cache = cos_sin_cache
+        q_norm_weight = self.q_norm.weight
+        if q_norm_weight.dtype != qkv.dtype:
+            q_norm_weight = q_norm_weight.to(qkv.dtype)
+        k_norm_weight = self.k_norm.weight
+        if k_norm_weight.dtype != qkv.dtype:
+            k_norm_weight = k_norm_weight.to(qkv.dtype)
         # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place (dense
         # mode: no index branch, no KV-cache insert). Matches nvidia/model.py and
         # replaces the unfused split -> q_norm/k_norm -> rotary_emb chain; verified
         # bit-equivalent on ROCm (q/k rel ~2e-3 bf16 noise, v untouched).
+        # Note also that the op is half/bf16-only, so fp32 model-stream activations 
+        # are narrowed above.
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.rotary_emb.cos_sin_cache,
+            q_norm_weight,
+            k_norm_weight,
+            cos_sin_cache,
             positions,
             self.num_heads,
             self.num_kv_heads,
@@ -429,7 +444,11 @@ class MiniMaxM3Attention(nn.Module):
         )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
+        if attn_output.dtype != model_stream_dtype:
+            attn_output = attn_output.to(model_stream_dtype)
         output, _ = self.o_proj(attn_output)
+        if output.dtype != model_stream_dtype:
+            output = output.to(model_stream_dtype)
         return output
 
 
@@ -631,7 +650,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         # Single fused projection emitting [q | k | v | index_q | index_k].
+        model_stream_dtype = hidden_states.dtype
         qkv, _ = self.qkv_proj(hidden_states)
+        if qkv.dtype == torch.float32:
+            qkv = qkv.to(torch.float16)
 
         # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
         # main (q/k) and index (index_q/index_k) branches, all read straight out
@@ -644,6 +666,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # index slot mappings are read from the forward context's slot_mapping
         # dict, matching the breakable-cudagraph path -- see nvidia/model.py.)
         cos_sin_cache = self.rotary_emb.cos_sin_cache
+        if cos_sin_cache.dtype != qkv.dtype:
+            cos_sin_cache = cos_sin_cache.to(qkv.dtype)
+            self.rotary_emb.cos_sin_cache = cos_sin_cache
+        q_norm_weight = self.q_norm.weight
+        if q_norm_weight.dtype != qkv.dtype:
+            q_norm_weight = q_norm_weight.to(qkv.dtype)
+        k_norm_weight = self.k_norm.weight
+        if k_norm_weight.dtype != qkv.dtype:
+            k_norm_weight = k_norm_weight.to(qkv.dtype)
+        index_q_norm_weight = self.index_q_norm.weight
+        if index_q_norm_weight.dtype != qkv.dtype:
+            index_q_norm_weight = index_q_norm_weight.to(qkv.dtype)
+        index_k_norm_weight = self.index_k_norm.weight
+        if index_k_norm_weight.dtype != qkv.dtype:
+            index_k_norm_weight = index_k_norm_weight.to(qkv.dtype)
         rotary_dim = self.rotary_emb.rotary_dim
         eps = self.q_norm.variance_epsilon
         num_tokens = qkv.shape[0]
@@ -654,7 +691,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+            return hidden_states.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
@@ -668,16 +705,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         insert_via_fused = not self._fp8_kv
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
+            q_norm_weight,
+            k_norm_weight,
             cos_sin_cache,
             positions,
             self.num_heads,
             self.num_kv_heads,
             rotary_dim,
             eps,
-            self.index_q_norm.weight,
-            self.index_k_norm.weight,
+            index_q_norm_weight,
+            index_k_norm_weight,
             self.num_idx_heads,
             main_slot_mapping,
             index_slot_mapping,
@@ -704,7 +741,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         output = torch.empty_like(q)
         attn_output = self._run_attention(q, index_q, output)
+        if attn_output.dtype != model_stream_dtype:
+            attn_output = attn_output.to(model_stream_dtype)
         output, _ = self.o_proj(attn_output)
+        if output.dtype != model_stream_dtype:
+            output = output.to(model_stream_dtype)
         return output
 
     @eager_break_during_capture

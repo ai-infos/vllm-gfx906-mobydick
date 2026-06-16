@@ -167,6 +167,8 @@ def _gqa_sparse_fwd_kernel(
         lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+        if q.dtype == tl.float32:
+            q = q.to(tl.float16)
         for _ in range(real_topk):
             blk = tl.load(t_ptr_j).to(tl.int32)
             t_ptr_j = t_ptr_j + stride_tk
@@ -186,6 +188,8 @@ def _gqa_sparse_fwd_kernel(
             )
             if USE_FP8:
                 k = k.to(q.dtype)
+            elif k.dtype == tl.float32:
+                k = k.to(tl.float16)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
@@ -208,6 +212,8 @@ def _gqa_sparse_fwd_kernel(
             )
             if USE_FP8:
                 v = v.to(q.dtype)
+            elif v.dtype == tl.float32:
+                v = v.to(tl.float16)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -328,6 +334,8 @@ def _gqa_sparse_decode_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
@@ -349,6 +357,8 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             k = k.to(q.dtype)
+        elif k.dtype == tl.float32:
+            k = k.to(tl.float16)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
@@ -368,6 +378,8 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             v = v.to(q.dtype)
+        elif v.dtype == tl.float32:
+            v = v.to(tl.float16)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)

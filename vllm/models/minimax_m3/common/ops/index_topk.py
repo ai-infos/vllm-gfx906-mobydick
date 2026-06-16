@@ -241,6 +241,8 @@ def _index_block_score_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -264,6 +266,8 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
+        if k.dtype == tl.float32:
+            k = k.to(tl.float16)
         qk = tl.dot(q, k) * sm_scale_log2e
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
@@ -464,6 +468,8 @@ def _decode_index_score_kernel(
         + tl.arange(0, num_idx_heads) * stride_q_h
         + off_d[:, None] * stride_q_d,
     )  # [D,H]
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -477,6 +483,8 @@ def _decode_index_score_kernel(
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
         )  # [N,D]
+        if k.dtype == tl.float32:
+            k = k.to(tl.float16)
         kq = tl.dot(k, q) * sm_scale_log2e  # [N,H]
         kq = tl.where(pos_mask[:, None], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [H]
