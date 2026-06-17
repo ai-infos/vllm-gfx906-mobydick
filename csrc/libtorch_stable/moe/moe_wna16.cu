@@ -1,33 +1,64 @@
-#include <algorithm>
-
+/*
+/!\ Optimized for GFX906 devices, not tested on other platforms
+    Edit this file with cautions to avoid introducing perf regressions on GFX906.
+*/
+#include <torch/all.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <torch/csrc/stable/accelerator.h>
-#include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
 
 #include <cuda_fp16.h>
-#ifndef USE_ROCM
-#include <cuda_bf16.h>
-#endif
-#include "libtorch_stable/torch_utils.h"
 #include "moe_wna16_utils.h"
 
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
-#ifdef USE_ROCM
+// ========================================================================
+//  Add missing ScalarType specialization for float (FP32)
+//  This provides the necessary type mappings (scalar_t2 -> float2) 
+//  and conversion helpers that the kernel expects.
+// ========================================================================
+template<>
+struct ScalarType<float> {
+    using scalar_t2 = float2;
+
+    __device__ __forceinline__ static float2 num2num2(float v) {
+        return make_float2(v, v);
+    }
+
+    __device__ __forceinline__ static float int2num(int v) {
+        return static_cast<float>(v);
+    }
+
+    __device__ __forceinline__ static float num2float(float v) {
+        return v;
+    }
+
+    __device__ __forceinline__ static float float2num(float v) {
+        return v;
+    }
+};
+
+// ========================================================================
+//  FP32 Helper Math Functions
+//  Standard arithmetic operators (+, *, -) are not always defined 
+//  for vector types (float2) in all CUDA/HIP environments.
+// ========================================================================
+
 __device__ __forceinline__ float2 fma2_float(float2 a, float2 b, float2 c) {
-  return make_float2(a.x * b.x + c.x, a.y * b.y + c.y);
+    return make_float2(a.x * b.x + c.x, a.y * b.y + c.y);
 }
 
 __device__ __forceinline__ float2 mul2_float(float2 a, float2 b) {
-  return make_float2(a.x * b.x, a.y * b.y);
+    return make_float2(a.x * b.x, a.y * b.y);
 }
 
 __device__ __forceinline__ float2 sub2_float(float2 a, float2 b) {
-  return make_float2(a.x - b.x, a.y - b.y);
+    return make_float2(a.x - b.x, a.y - b.y);
 }
-#endif
+
+// ========================================================================
+//  Kernel Implementation
+// ========================================================================
 
 template <typename scalar_t, int bit, int GROUPS>
 __global__ void moe_wna16_gemm_kernel(
@@ -44,251 +75,227 @@ __global__ void moe_wna16_gemm_kernel(
     uint32_t size_n, uint32_t size_k, uint16_t BLOCK_SIZE_M,
     uint16_t BLOCK_SIZE_N, uint16_t BLOCK_SIZE_K, bool has_zp,
     bool mul_topk_weight) {
-#ifndef USE_ROCM
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
-  if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
-    return;
-  } else {
-#endif
-#endif
 
-    using Dtype = ScalarType<scalar_t>;
-    using scalar_t2 = typename ScalarType<scalar_t>::scalar_t2;
+  using Dtype = ScalarType<scalar_t>;
+  using scalar_t2 = typename ScalarType<scalar_t>::scalar_t2;
 
-    if (blockIdx.x * BLOCK_SIZE_M >= num_tokens_post_pad[0]) return;
+  if (blockIdx.x * BLOCK_SIZE_M >= num_tokens_post_pad[0]) return;
 
-    const int32_t offset_n = blockIdx.y * BLOCK_SIZE_N + threadIdx.x;
-    const int32_t offset_k = blockIdx.z * BLOCK_SIZE_K;
+  const int32_t offset_n = blockIdx.y * BLOCK_SIZE_N + threadIdx.x;
+  const int32_t offset_k = blockIdx.z * BLOCK_SIZE_K;
 
-    const int32_t expert_id = expert_ids[blockIdx.x];
+  const int32_t expert_id = expert_ids[blockIdx.x];
 
-    int32_t num_valid_tokens = 0;
-    extern __shared__ __align__(16) uint8_t block_input_tmp[];
-    scalar_t* block_input = reinterpret_cast<scalar_t*>(block_input_tmp);
-    scalar_t2* block_input_half2 = reinterpret_cast<scalar_t2*>(block_input);
+  int32_t num_valid_tokens = 0;
+  
+  // Use char for extern shared to avoid alignment issues during cast
+  extern __shared__ char block_input_tmp_char[];
+  scalar_t* block_input = reinterpret_cast<scalar_t*>(block_input_tmp_char);
+  scalar_t2* block_input_half2 = reinterpret_cast<scalar_t2*>(block_input);
 
-    // load BLOCK_SIZE_M * BLOCK_SIZE_K into shared memory
-    for (int m = 0; m < BLOCK_SIZE_M; m++) {
-      const int32_t offset_m = blockIdx.x * BLOCK_SIZE_M + m;
-      const int32_t token_index = sorted_token_ids[offset_m];
-      if (token_index / top_k >= size_m) break;
+  // load BLOCK_SIZE_M * BLOCK_SIZE_K into shared memory
+  for (int m = 0; m < BLOCK_SIZE_M; m++) {
+    const int32_t offset_m = blockIdx.x * BLOCK_SIZE_M + m;
+    const int32_t token_index = sorted_token_ids[offset_m];
+    if (token_index / top_k >= size_m) break;
 
-      num_valid_tokens = m + 1;
+    num_valid_tokens = m + 1;
 
-      if (expert_id != -1) {
-        int k_per_thread = DIVIDE(BLOCK_SIZE_K, BLOCK_SIZE_N);
-        for (int i = 0; i < k_per_thread; i++) {
-          int k = BLOCK_SIZE_N * i + threadIdx.x;
-          if (k >= BLOCK_SIZE_K) break;
-          if (offset_k + k >= size_k) break;
+    if (expert_id != -1) {
+      int k_per_thread = DIVIDE(BLOCK_SIZE_K, BLOCK_SIZE_N);
+      for (int i = 0; i < k_per_thread; i++) {
+        int k = BLOCK_SIZE_N * i + threadIdx.x;
+        if (k >= BLOCK_SIZE_K) break;
+        if (offset_k + k >= size_k) break;
 
-          // load input to shared memory
-          // use a special layout to fit the layout of dequanted-weight
-          int origin_k;
-          if constexpr (bit == 4) {
-            // [0, 4, 1, 5, 2, 6, 3, 7]
-            int8_t order = (threadIdx.x % 2) * 4 + ((threadIdx.x % 8) / 2);
-            origin_k = BLOCK_SIZE_N * i + threadIdx.x / 8 * 8 + order;
-          } else {
-            // [0, 2, 1, 3]
-            int8_t order = (threadIdx.x % 2) * 2 + ((threadIdx.x % 4) / 2);
-            origin_k = BLOCK_SIZE_N * i + threadIdx.x / 4 * 4 + order;
-          }
-
-          origin_k += token_index / top_k * size_k + blockIdx.z * BLOCK_SIZE_K;
-          block_input[m * BLOCK_SIZE_K + k] = input[origin_k];
-        }
-      }
-    }
-
-    if (expert_id == -1) return;
-    __syncthreads();
-    if (threadIdx.x >= BLOCK_SIZE_N || offset_n >= size_n) return;
-
-    float res[64];  // assume BLOCK_SIZE_M <= 64
-    scalar_t2 res2;
-    const scalar_t2 zero2 = Dtype::num2num2(Dtype::float2num(0.0f));
-    scalar_t2 scale_f2;
-    scalar_t2 qzero_f2;
-
-    // note that (size_n * size_k * expert_id) may greater than 2 ** 31
-    constexpr int8_t pack_factor = 32 / bit;
-    const uint64_t expert_offset = ((uint64_t)size_n) * size_k * expert_id;
-    const uint32_t* expert_qweight = qweight + expert_offset / pack_factor;
-    const scalar_t* expert_scales = scales + expert_offset / group_size;
-    const uint32_t* expert_qzeros =
-        qzeros + expert_offset / group_size / pack_factor;
-
-    // load 4*int32 one time: 4 int32 = 128 bit = 1 float4
-    // weight would be loaded in loop
-    uint32_t expert_qweight_tmp[4];
-    float4* expert_qweight_tmp_float4 =
-        reinterpret_cast<float4*>(expert_qweight_tmp);
-
-    // load all required scales one time
-    scalar_t expert_scales_groups[GROUPS];
-    int scales_offset_tmp =
-        (offset_n * size_k + offset_k) / group_size / GROUPS;
-    if constexpr (std::is_same<scalar_t, float>::value) {
-#pragma unroll
-      for (int i = 0; i < GROUPS; i++) {
-        expert_scales_groups[i] =
-            expert_scales[offset_n * size_k / group_size +
-                          offset_k / group_size + i];
-      }
-    } else if constexpr (GROUPS == 1) {
-      *expert_scales_groups = expert_scales[scales_offset_tmp];
-    } else if constexpr (GROUPS == 2) {
-      float* expert_scales_groups_tmp =
-          reinterpret_cast<float*>(expert_scales_groups);
-      *expert_scales_groups_tmp =
-          reinterpret_cast<const float*>(expert_scales)[scales_offset_tmp];
-    } else if constexpr (GROUPS == 4) {
-      float2* expert_scales_groups_tmp =
-          reinterpret_cast<float2*>(expert_scales_groups);
-      *expert_scales_groups_tmp =
-          reinterpret_cast<const float2*>(expert_scales)[scales_offset_tmp];
-    } else if constexpr (GROUPS == 8) {
-      float4* expert_scales_groups_tmp =
-          reinterpret_cast<float4*>(expert_scales_groups);
-      *expert_scales_groups_tmp =
-          reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
-    } else {
-#pragma unroll
-      for (int i = 0; i < GROUPS; i++) {
-        expert_scales_groups[i] =
-            expert_scales[offset_n * size_k / group_size +
-                          offset_k / group_size + i];
-      }
-    }
-
-    // load all required qzeros one time
-    uint8_t expert_qzeros_groups[GROUPS];
-    if (!has_zp) {
-      if constexpr (bit == 4) {
-        qzero_f2 = Dtype::num2num2(Dtype::int2num(8));
-      } else {
-        qzero_f2 = Dtype::num2num2(Dtype::int2num(128));
-      }
-    } else {
-      int qzeros_offset_tmp =
-          (offset_n / (8 / bit)) * (size_k / group_size / GROUPS) +
-          offset_k / group_size / GROUPS;
-      if constexpr (GROUPS == 1) {
-        uint8_t* expert_qzeros_groups_tmp =
-            reinterpret_cast<uint8_t*>(expert_qzeros_groups);
-        *expert_qzeros_groups_tmp =
-            reinterpret_cast<const uint8_t*>(expert_qzeros)[qzeros_offset_tmp];
-      } else if constexpr (GROUPS == 2) {
-        uint16_t* expert_qzeros_groups_tmp =
-            reinterpret_cast<uint16_t*>(expert_qzeros_groups);
-        *expert_qzeros_groups_tmp =
-            reinterpret_cast<const uint16_t*>(expert_qzeros)[qzeros_offset_tmp];
-      } else if constexpr (GROUPS == 4) {
-        uint32_t* expert_qzeros_groups_tmp =
-            reinterpret_cast<uint32_t*>(expert_qzeros_groups);
-        *expert_qzeros_groups_tmp =
-            reinterpret_cast<const uint32_t*>(expert_qzeros)[qzeros_offset_tmp];
-      } else if constexpr (GROUPS == 8) {
-        uint64_t* expert_qzeros_groups_tmp =
-            reinterpret_cast<uint64_t*>(expert_qzeros_groups);
-        *expert_qzeros_groups_tmp =
-            reinterpret_cast<const uint64_t*>(expert_qzeros)[qzeros_offset_tmp];
-      } else {
-        uint64_t* expert_qzeros_groups_tmp =
-            reinterpret_cast<uint64_t*>(expert_qzeros_groups);
-        const uint64_t* expert_qzeros_src =
-            reinterpret_cast<const uint64_t*>(expert_qzeros) +
-            qzeros_offset_tmp * 2;
-        expert_qzeros_groups_tmp[0] = expert_qzeros_src[0];
-        expert_qzeros_groups_tmp[1] = expert_qzeros_src[1];
-      }
-    }
-
-    for (int tmp_k = 0; tmp_k < BLOCK_SIZE_K / pack_factor; tmp_k++) {
-      int k = offset_k + tmp_k * pack_factor;
-      if (k >= size_k) break;
-      const int32_t weight_offset = offset_n * size_k + k;
-
-      if (tmp_k % 4 == 0) {
-        *expert_qweight_tmp_float4 = reinterpret_cast<const float4*>(
-            expert_qweight)[weight_offset / pack_factor / 4];
-      }
-
-      if (tmp_k % (group_size / pack_factor) == 0) {
-        scalar_t scale_f =
-            expert_scales_groups[tmp_k / (group_size / pack_factor)];
-        scale_f2 = Dtype::num2num2(scale_f);
-
-        if (has_zp) {
-          uint8_t qzero =
-              expert_qzeros_groups[tmp_k / (group_size / pack_factor)];
-          if constexpr (bit == 4) {
-            qzero = (qzero >> ((threadIdx.x % 2) * 4)) & 0xF;
-          }
-          qzero_f2 = Dtype::num2num2(Dtype::int2num(qzero));
-        }
-      }
-
-      scalar_t2 weight_half2[16 / bit];
-      dequant<scalar_t2, bit>(expert_qweight_tmp[tmp_k % 4], weight_half2);
-
-      for (int m = 0; m < num_valid_tokens; m++) {
-        res2 = zero2;
-
-#pragma unroll
-        for (int i = 0; i < 16 / bit; i++) {
-          int32_t offset_input = m * BLOCK_SIZE_K / 2 + tmp_k * (16 / bit) + i;
-#ifdef USE_ROCM
-          if constexpr (std::is_same<scalar_t, float>::value) {
-            float2 dequantized =
-                mul2_float(sub2_float(weight_half2[i], qzero_f2), scale_f2);
-            res2 =
-                fma2_float(dequantized, block_input_half2[offset_input], res2);
-          } else {
-            res2 =
-                __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
-                        block_input_half2[offset_input], res2);
-          }
-#else
-          res2 = __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
-                         block_input_half2[offset_input], res2);
-#endif
-        }
-
-        if (tmp_k == 0) {
-          res[m] = Dtype::num2float(res2.x) + Dtype::num2float(res2.y);
+        // load input to shared memory
+        // use a special layout to fit the layout of dequanted-weight
+        int origin_k;
+        if constexpr (bit == 4) {
+          // [0, 4, 1, 5, 2, 6, 3, 7]
+          int8_t order = (threadIdx.x % 2) * 4 + ((threadIdx.x % 8) / 2);
+          origin_k = BLOCK_SIZE_N * i + threadIdx.x / 8 * 8 + order;
         } else {
-          res[m] += Dtype::num2float(res2.x) + Dtype::num2float(res2.y);
+          // [0, 2, 1, 3]
+          int8_t order = (threadIdx.x % 2) * 2 + ((threadIdx.x % 4) / 2);
+          origin_k = BLOCK_SIZE_N * i + threadIdx.x / 4 * 4 + order;
+        }
+
+        origin_k += token_index / top_k * size_k + blockIdx.z * BLOCK_SIZE_K;
+        block_input[m * BLOCK_SIZE_K + k] = input[origin_k];
+      }
+    }
+  }
+
+  if (expert_id == -1) return;
+  __syncthreads();
+  if (threadIdx.x >= BLOCK_SIZE_N || offset_n >= size_n) return;
+
+  float res[64];  // assume BLOCK_SIZE_M <= 64
+  scalar_t2 res2;
+  scalar_t2 scale_f2;
+  scalar_t2 qzero_f2;
+
+  // note that (size_n * size_k * expert_id) may greater than 2 ** 31
+  constexpr int8_t pack_factor = 32 / bit;
+  const uint64_t expert_offset = ((uint64_t)size_n) * size_k * expert_id;
+  const uint32_t* expert_qweight = qweight + expert_offset / pack_factor;
+  const scalar_t* expert_scales = scales + expert_offset / group_size;
+  const uint32_t* expert_qzeros =
+      qzeros + expert_offset / group_size / pack_factor;
+
+  // load 4*int32 one time: 4 int32 = 128 bit = 1 float4
+  // weight would be loaded in loop
+  uint32_t expert_qweight_tmp[4];
+  float4* expert_qweight_tmp_float4 =
+      reinterpret_cast<float4*>(expert_qweight_tmp);
+
+  // load all required scales one time
+  scalar_t expert_scales_groups[GROUPS];
+  int scales_offset_tmp =
+      (offset_n * size_k + offset_k) / group_size / GROUPS;
+  if constexpr (GROUPS == 1) {
+    *expert_scales_groups = expert_scales[scales_offset_tmp];
+  } else if constexpr (GROUPS == 2) {
+      if constexpr (sizeof(scalar_t) == 2) {
+        float* dst = reinterpret_cast<float*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float*>(expert_scales)[scales_offset_tmp];
+      } else {
+        float2* dst = reinterpret_cast<float2*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float2*>(expert_scales)[scales_offset_tmp];
+      }
+  } else if constexpr (GROUPS == 4) {
+      if constexpr (sizeof(scalar_t) == 2) {
+        float2* dst = reinterpret_cast<float2*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float2*>(expert_scales)[scales_offset_tmp];
+      } else {
+        float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
+      }
+  } else if constexpr (GROUPS == 8) {
+      if constexpr (sizeof(scalar_t) == 2) {
+        float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+        *dst = reinterpret_cast<const float4*>(expert_scales)[scales_offset_tmp];
+      } else {
+        // float32 path: load 2 float4s manually
+        const float4* src = reinterpret_cast<const float4*>(expert_scales);
+        float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+        dst[0] = src[scales_offset_tmp * 2];
+        dst[1] = src[scales_offset_tmp * 2 + 1];
+      }
+  } else if constexpr (GROUPS == 16) {
+    float4* dst = reinterpret_cast<float4*>(expert_scales_groups);
+    const float4* src = reinterpret_cast<const float4*>(expert_scales);
+    
+    if constexpr (sizeof(scalar_t) == 2) {
+        dst[0] = src[scales_offset_tmp * 2];
+        dst[1] = src[scales_offset_tmp * 2 + 1];
+    } else {
+        // float32 path: 16 floats = 4 float4s
+        dst[0] = src[scales_offset_tmp * 4];
+        dst[1] = src[scales_offset_tmp * 4 + 1];
+        dst[2] = src[scales_offset_tmp * 4 + 2];
+        dst[3] = src[scales_offset_tmp * 4 + 3];
+    }
+  }
+
+  // load all required qzeros one time
+  uint8_t expert_qzeros_groups[GROUPS];
+  if (!has_zp) {
+    if constexpr (bit == 4) {
+      qzero_f2 = Dtype::num2num2(Dtype::int2num(8));
+    } else {
+      qzero_f2 = Dtype::num2num2(Dtype::int2num(128));
+    }
+  } else {
+    int qzeros_offset_tmp =
+        (offset_n / (8 / bit)) * (size_k / group_size / GROUPS) +
+        offset_k / group_size / GROUPS;
+    if constexpr (GROUPS == 1) {
+      uint8_t* dst = reinterpret_cast<uint8_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint8_t*>(expert_qzeros)[qzeros_offset_tmp];
+    } else if constexpr (GROUPS == 2) {
+      uint16_t* dst = reinterpret_cast<uint16_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint16_t*>(expert_qzeros)[qzeros_offset_tmp];
+    } else if constexpr (GROUPS == 4) {
+      uint32_t* dst = reinterpret_cast<uint32_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint32_t*>(expert_qzeros)[qzeros_offset_tmp];
+    } else if constexpr (GROUPS == 8) {
+      uint64_t* dst = reinterpret_cast<uint64_t*>(expert_qzeros_groups);
+      *dst = reinterpret_cast<const uint64_t*>(expert_qzeros)[qzeros_offset_tmp];
+    } else if constexpr (GROUPS == 16) {
+      uint4* dst = reinterpret_cast<uint4*>(expert_qzeros_groups);
+      const uint4* src = reinterpret_cast<const uint4*>(expert_qzeros);
+      *dst = src[qzeros_offset_tmp];
+    }
+  }
+
+  for (int tmp_k = 0; tmp_k < BLOCK_SIZE_K / pack_factor; tmp_k++) {
+    int k = offset_k + tmp_k * pack_factor;
+    if (k >= size_k) break;
+    const int32_t weight_offset = offset_n * size_k + k;
+
+    if (tmp_k % 4 == 0) {
+      *expert_qweight_tmp_float4 = reinterpret_cast<const float4*>(
+          expert_qweight)[weight_offset / pack_factor / 4];
+    }
+
+    if (tmp_k % (group_size / pack_factor) == 0) {
+      scalar_t scale_f =
+          expert_scales_groups[tmp_k / (group_size / pack_factor)];
+      scale_f2 = Dtype::num2num2(scale_f);
+
+      if (has_zp) {
+        uint8_t qzero =
+            expert_qzeros_groups[tmp_k / (group_size / pack_factor)];
+        if constexpr (bit == 4) {
+          qzero = (qzero >> ((threadIdx.x % 2) * 4)) & 0xF;
+        }
+        qzero_f2 = Dtype::num2num2(Dtype::int2num(qzero));
+      }
+    }
+
+    scalar_t2 weight_half2[16 / bit];
+    dequant<scalar_t2, bit>(expert_qweight_tmp[tmp_k % 4], weight_half2);
+
+    for (int m = 0; m < num_valid_tokens; m++) {
+      res2 = scalar_t2{};
+
+#pragma unroll
+      for (int i = 0; i < 16 / bit; i++) {
+        int32_t offset_input = m * BLOCK_SIZE_K / 2 + tmp_k * (16 / bit) + i;
+        
+        if constexpr (std::is_same_v<scalar_t, half>) {
+            res2 = __hfma2(__hmul2(__hsub2(weight_half2[i], qzero_f2), scale_f2),
+                           block_input_half2[offset_input], res2);
+        } else {
+            // Float path using helpers
+            float2 dequantized = mul2_float(sub2_float(weight_half2[i], qzero_f2), scale_f2);
+            res2 = fma2_float(dequantized, block_input_half2[offset_input], res2);
         }
       }
-    }
 
-    for (int m = 0; m < num_valid_tokens; ++m) {
-      const int32_t token_index =
-          sorted_token_ids[blockIdx.x * BLOCK_SIZE_M + m];
-      if (mul_topk_weight) {
-        res[m] *= topk_weights[token_index];
-      }
-#ifdef USE_ROCM
-      if constexpr (std::is_same<scalar_t, half>::value) {
-        atomicAdd_half(&output[token_index * size_n + offset_n],
-                       Dtype::float2num(res[m]));
+      if (tmp_k == 0) {
+        res[m] = Dtype::num2float(res2.x) + Dtype::num2float(res2.y);
       } else {
-        atomicAdd(&output[token_index * size_n + offset_n],
-                  Dtype::float2num(res[m]));
+        res[m] += Dtype::num2float(res2.x) + Dtype::num2float(res2.y);
       }
-#else
-      atomicAdd(&output[token_index * size_n + offset_n],
-                Dtype::float2num(res[m]));
-#endif
     }
-
-#ifndef USE_ROCM
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   }
-#endif
-#endif
+
+  for (int m = 0; m < num_valid_tokens; ++m) {
+    const int32_t token_index =
+        sorted_token_ids[blockIdx.x * BLOCK_SIZE_M + m];
+    if (mul_topk_weight) {
+      res[m] *= topk_weights[token_index];
+    }
+    
+    if constexpr (std::is_same_v<scalar_t, half>) {
+        atomicAdd_half(&output[token_index * size_n + offset_n], Dtype::float2num(res[m]));
+    } else {
+        atomicAdd(&output[token_index * size_n + offset_n], Dtype::float2num(res[m]));
+    }
+  }
 }
 
 template <typename scalar_t>
@@ -318,25 +325,27 @@ void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
       kernel = moe_wna16_gemm_kernel<scalar_t, 4, 4>;
     } else if (BLOCK_SIZE_K / group_size == 8) {
       kernel = moe_wna16_gemm_kernel<scalar_t, 4, 8>;
-#ifdef USE_ROCM
     } else if (BLOCK_SIZE_K / group_size == 16) {
       kernel = moe_wna16_gemm_kernel<scalar_t, 4, 16>;
-#endif
     }
   } else {
-    if (BLOCK_SIZE_K / group_size == 1) {
-      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 1>;
-    } else if (BLOCK_SIZE_K / group_size == 2) {
-      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 2>;
-    } else if (BLOCK_SIZE_K / group_size == 4) {
-      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 4>;
-    } else if (BLOCK_SIZE_K / group_size == 8) {
-      kernel = moe_wna16_gemm_kernel<scalar_t, 8, 8>;
-    }
+    // TODO support 8
+    // if (BLOCK_SIZE_K / group_size == 1) {
+    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 1>;
+    // } else if (BLOCK_SIZE_K / group_size == 2) {
+    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 2>;
+    // } else if (BLOCK_SIZE_K / group_size == 4) {
+    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 4>;
+    // } else if (BLOCK_SIZE_K / group_size == 8) {
+    //   kernel = moe_wna16_gemm_kernel<scalar_t, 8, 8>;
+    // }
+    TORCH_CHECK(false, "Unsupported bit width");
   }
 
+  // Use generic size
   const int shared_mem_size = BLOCK_SIZE_M * BLOCK_SIZE_K * sizeof(scalar_t);
-  const cudaStream_t stream = get_current_cuda_stream();
+  
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   kernel<<<gridDim, blockDim, shared_mem_size, stream>>>(
       input, output, b_qweight, b_scales, b_qzeros, topk_weights,
       sorted_token_ids, expert_ids, num_tokens_post_pad, num_experts,
@@ -344,18 +353,17 @@ void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
       BLOCK_SIZE_K, has_zp, mul_topk_weight);
 }
 
-torch::stable::Tensor moe_wna16_gemm(
-    torch::stable::Tensor input, torch::stable::Tensor output,
-    torch::stable::Tensor b_qweight, torch::stable::Tensor b_scales,
-    std::optional<torch::stable::Tensor> b_qzeros,
-    std::optional<torch::stable::Tensor> topk_weights,
-    torch::stable::Tensor sorted_token_ids, torch::stable::Tensor expert_ids,
-    torch::stable::Tensor num_tokens_post_pad, int64_t top_k,
-    int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N, int64_t BLOCK_SIZE_K,
-    int64_t bit) {
-  const torch::stable::accelerator::DeviceGuard device_guard(
-      input.get_device_index());
-  torch::stable::zero_(output);
+torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
+                             torch::Tensor b_qweight, torch::Tensor b_scales,
+                             std::optional<torch::Tensor> b_qzeros,
+                             std::optional<torch::Tensor> topk_weights,
+                             torch::Tensor sorted_token_ids,
+                             torch::Tensor expert_ids,
+                             torch::Tensor num_tokens_post_pad, int64_t top_k,
+                             int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N,
+                             int64_t BLOCK_SIZE_K, int64_t bit) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  output.zero_();
 
   const int num_experts = b_qweight.size(0);
   const int size_m = input.size(0);
@@ -365,86 +373,55 @@ torch::stable::Tensor moe_wna16_gemm(
 
   int64_t EM = sorted_token_ids.size(0);
   if (size_m <= BLOCK_SIZE_M) {
-    EM = std::min(EM, size_m * BLOCK_SIZE_M * top_k);
+    EM = min(EM, size_m * BLOCK_SIZE_M * top_k);
   }
   const int num_token_blocks = (EM + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M;
 
-  const uint32_t* b_qzeros_ptr = nullptr;
+  const uint32_t* b_qzeros_ptr;
   if (b_qzeros.has_value())
-    b_qzeros_ptr = (const uint32_t*)b_qzeros.value().const_data_ptr<uint8_t>();
+    b_qzeros_ptr = (const uint32_t*)b_qzeros.value().data_ptr<uint8_t>();
   const float* topk_weights_ptr = nullptr;
   if (topk_weights.has_value())
-    topk_weights_ptr =
-        (const float*)topk_weights.value().const_data_ptr<float>();
+    topk_weights_ptr = (const float*)topk_weights.value().data_ptr<float>();
 
   int groups_per_block_row = BLOCK_SIZE_K / group_size;
-#ifdef USE_ROCM
-  STD_TORCH_CHECK(bit == 4, "ROCm moe_wna16_gemm only supports 4-bit weights");
-#else
-  STD_TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
-#endif
-  STD_TORCH_CHECK(size_k % BLOCK_SIZE_K == 0,
-                  "size_k must divisible by BLOCK_SIZE_K");
-  STD_TORCH_CHECK(BLOCK_SIZE_K % group_size == 0,
-                  "BLOCK_SIZE_K must divisible by group_size");
-  STD_TORCH_CHECK(BLOCK_SIZE_M <= 64, "BLOCK_SIZE_M must less or equal to 64");
-#ifdef USE_ROCM
-  STD_TORCH_CHECK(
-      groups_per_block_row == 1 || groups_per_block_row == 2 ||
-          groups_per_block_row == 4 || groups_per_block_row == 8 ||
-          groups_per_block_row == 16,
-      "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8, 16]");
-#else
-  STD_TORCH_CHECK(groups_per_block_row == 1 || groups_per_block_row == 2 ||
-                      groups_per_block_row == 4 || groups_per_block_row == 8,
-                  "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8]");
-#endif
+  // TODO: support 8
+  // TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
+  TORCH_CHECK(bit == 4, "bit must be 4");
+  TORCH_CHECK(size_k % BLOCK_SIZE_K == 0,
+              "size_k must divisible by BLOCK_SIZE_K");
+  TORCH_CHECK(BLOCK_SIZE_K % group_size == 0,
+              "BLOCK_SIZE_K must divisible by group_size");
+  TORCH_CHECK(BLOCK_SIZE_M <= 64, "BLOCK_SIZE_M must less or equal to 64");
+  TORCH_CHECK(groups_per_block_row == 1 || groups_per_block_row == 2 ||
+                  groups_per_block_row == 4 || groups_per_block_row == 8 ||
+                  groups_per_block_row == 16,
+              "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8, 16]");
 
-  if (input.scalar_type() == torch::headeronly::ScalarType::Half) {
+  if (input.scalar_type() == at::ScalarType::Half) {
     run_moe_wna16_gemm<half>(
-        reinterpret_cast<const half*>(input.const_data_ptr()),
-        reinterpret_cast<half*>(output.mutable_data_ptr()),
-        (const uint32_t*)b_qweight.const_data_ptr<uint8_t>(),
-        reinterpret_cast<const half*>(b_scales.const_data_ptr()), b_qzeros_ptr,
-        topk_weights_ptr, sorted_token_ids.const_data_ptr<int32_t>(),
-        expert_ids.const_data_ptr<int32_t>(),
-        num_tokens_post_pad.const_data_ptr<int32_t>(), num_experts, group_size,
-        num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
-        BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
-        topk_weights.has_value());
-#ifdef USE_ROCM
-  } else if (input.scalar_type() == torch::headeronly::ScalarType::Float) {
+        (const half*)input.data_ptr<at::Half>(),
+        (half*)output.data_ptr<at::Half>(),
+        (const uint32_t*)b_qweight.data_ptr<uint8_t>(),
+        (const half*)b_scales.data_ptr<at::Half>(), b_qzeros_ptr,
+        topk_weights_ptr, sorted_token_ids.data_ptr<int32_t>(),
+        expert_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
+        num_experts, group_size, num_token_blocks, top_k, size_m, size_n,
+        size_k, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, bit,
+        b_qzeros.has_value(), topk_weights.has_value());
+  } else if (input.scalar_type() == at::ScalarType::Float) {
     run_moe_wna16_gemm<float>(
-        input.const_data_ptr<float>(), output.mutable_data_ptr<float>(),
-        (const uint32_t*)b_qweight.const_data_ptr<uint8_t>(),
-        b_scales.const_data_ptr<float>(), b_qzeros_ptr, topk_weights_ptr,
-        sorted_token_ids.const_data_ptr<int32_t>(),
-        expert_ids.const_data_ptr<int32_t>(),
-        num_tokens_post_pad.const_data_ptr<int32_t>(), num_experts, group_size,
-        num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
-        BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
-        topk_weights.has_value());
-#else
-  } else if (input.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
-    run_moe_wna16_gemm<nv_bfloat16>(
-        reinterpret_cast<const nv_bfloat16*>(input.const_data_ptr()),
-        reinterpret_cast<nv_bfloat16*>(output.mutable_data_ptr()),
-        (const uint32_t*)b_qweight.const_data_ptr<uint8_t>(),
-        reinterpret_cast<const nv_bfloat16*>(b_scales.const_data_ptr()),
-        b_qzeros_ptr, topk_weights_ptr,
-        sorted_token_ids.const_data_ptr<int32_t>(),
-        expert_ids.const_data_ptr<int32_t>(),
-        num_tokens_post_pad.const_data_ptr<int32_t>(), num_experts, group_size,
-        num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
-        BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
-        topk_weights.has_value());
-#endif
+      (const float*)input.data_ptr<float>(),
+      (float*)output.data_ptr<float>(),
+      (const uint32_t*)b_qweight.data_ptr<uint8_t>(),
+      (const float*)b_scales.data_ptr<float>(), b_qzeros_ptr,
+      topk_weights_ptr, sorted_token_ids.data_ptr<int32_t>(),
+      expert_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
+      num_experts, group_size, num_token_blocks, top_k, size_m, size_n,
+      size_k, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, bit,
+      b_qzeros.has_value(), topk_weights.has_value());
   } else {
-#ifdef USE_ROCM
-    STD_TORCH_CHECK(false, "ROCm moe_wna16_gemm only supports float16 and float32");
-#else
-    STD_TORCH_CHECK(false, "moe_wna16_gemm only supports bfloat16 and float16");
-#endif
+    TORCH_CHECK(false, "moe_wna16_gemm only supports float16 and float32");
   }
   return output;
 }
