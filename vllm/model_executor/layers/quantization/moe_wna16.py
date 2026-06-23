@@ -376,6 +376,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w1_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def apply(

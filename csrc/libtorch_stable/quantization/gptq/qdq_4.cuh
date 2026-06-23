@@ -92,7 +92,7 @@ __forceinline__ __device__ void dequant_4bit_8_gptq(const uint32_t q_0,
                                                     half2 (&y1y16)[2],
                                                     int stride, bool scaled) {
   const uint32_t c0 = 0x64006400;
-  const half2 inv16 = __half2half2(__float2half_rn(1.0f / 16.0f));
+  const half2 inv16{ 0x1.p-4f, 0x1.p-4f }; // 1/16
 
   uint32_t qa = q_0;
   half2_uint32 q0(

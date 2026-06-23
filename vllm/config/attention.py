@@ -9,7 +9,16 @@ from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-IndexerKVDType = Literal["bf16", "fp8", "mxfp4", "nvfp4"]
+IndexerKVDType = Literal[
+    "bf16",
+    "float16",
+    "fp16",
+    "float32",
+    "fp32",
+    "fp8",
+    "mxfp4",
+    "nvfp4",
+]
 
 
 @config
@@ -114,4 +123,18 @@ class AttentionConfig:
         """Enable parsing of the `mla_prefill_backend` enum type from string."""
         if isinstance(value, str):
             return MLAPrefillBackendEnum[value.upper()]
+        return value
+
+    @field_validator("indexer_kv_dtype", mode="before")
+    @classmethod
+    def validate_indexer_kv_dtype_before(cls, value: Any) -> Any:
+        """Normalize sparse indexer cache dtype aliases."""
+        if isinstance(value, str):
+            value = value.lower()
+            if value == "fp16":
+                return "float16"
+            if value == "fp32":
+                return "float32"
+            if value == "bfloat16":
+                return "bf16"
         return value

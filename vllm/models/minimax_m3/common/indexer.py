@@ -50,9 +50,15 @@ from vllm.v1.kv_cache_interface import (
 class MiniMaxM3IndexerBackend(AttentionBackend):
     """Indexer side-cache backend (key-only)."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
-    # bf16 today; mirrors the main backend to keep spec validation permissive.
+    # fp16/bf16/fp32 today; quantized formats are reserved for future cache impls.
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "float32",
+        "float16",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
@@ -104,6 +110,33 @@ class MiniMaxM3IndexerBackend(AttentionBackend):
         return (0, 1, 2)
 
 
+def _normalize_indexer_kv_dtype(
+    indexer_kv_dtype: IndexerKVDType,
+) -> IndexerKVDType:
+    if indexer_kv_dtype == "fp16":
+        return "float16"
+    if indexer_kv_dtype == "fp32":
+        return "float32"
+    return indexer_kv_dtype
+
+
+def _indexer_kv_dtype_to_torch_dtype(
+    indexer_kv_dtype: IndexerKVDType,
+) -> torch.dtype:
+    indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
+    if indexer_kv_dtype == "bf16":
+        return torch.bfloat16
+    if indexer_kv_dtype == "float16":
+        return torch.float16
+    if indexer_kv_dtype == "float32":
+        return torch.float32
+    raise NotImplementedError(
+        f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
+        "for the MiniMax M3 indexer cache "
+        "(only 'bf16', 'float16', 'float32')."
+    )
+
+
 class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
     """Side KV cache for the indexer's per-token index keys (key-only).
 
@@ -120,16 +153,11 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
     ) -> None:
         super().__init__()
-        if indexer_kv_dtype != "bf16":
-            raise NotImplementedError(
-                f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
-                "for the MiniMax M3 indexer cache (only 'bf16')."
-            )
+        indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.indexer_kv_dtype = indexer_kv_dtype
-        # Storage dtype for the side cache (bf16 today; quantized layouts later).
-        self.dtype = torch.bfloat16
+        self.dtype = _indexer_kv_dtype_to_torch_dtype(indexer_kv_dtype)
         self.prefix = prefix
         self.cache_config = cache_config
         # Impl-chosen backend -> each impl gets its own builder (get_attn_backend).
@@ -351,6 +379,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
         self.score_type = score_type
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
+        indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
         self.indexer_kv_dtype = indexer_kv_dtype
         # Owns the side cache (registers itself in the static forward context).
         self.index_cache = MiniMaxM3IndexerCache(
@@ -442,12 +471,13 @@ def select_indexer_impl_cls(
     The SM100 MSA indexer score path is disabled for now; use the local Triton
     indexer. If re-enabled, add a NVIDIA-specific ``MiniMaxM3IndexerImpl`` here.
     """
+    indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
     if indexer_kv_dtype in ("mxfp4", "nvfp4"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
-    if indexer_kv_dtype != "bf16":
+    if indexer_kv_dtype not in ("bf16", "float16", "float32"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."
@@ -479,6 +509,7 @@ class MiniMaxM3Indexer(nn.Module):
         indexer_kv_dtype: IndexerKVDType = "bf16",
     ) -> None:
         super().__init__()
+        indexer_kv_dtype = _normalize_indexer_kv_dtype(indexer_kv_dtype)
         impl_cls = select_indexer_impl_cls(
             indexer_kv_dtype=indexer_kv_dtype,
         )

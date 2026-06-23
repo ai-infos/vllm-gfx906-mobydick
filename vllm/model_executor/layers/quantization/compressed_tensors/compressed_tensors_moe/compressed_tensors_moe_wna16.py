@@ -16,8 +16,9 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
-    int4_w4a16_moe_quant_config,
-    int8_w8a16_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+    make_wna16_moe_quant_config,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -38,6 +39,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         super().__init__(moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+        self.symmetric = weight_quant.symmetric
         # Extract properties from weight_quant
         self.num_bits = weight_quant.num_bits
         self.packed_factor = 32 // weight_quant.num_bits
@@ -47,9 +49,46 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.group_size = weight_quant.group_size
         # grouped actorder isn't supported by this kernel
         assert weight_quant.actorder != "group"
-        assert weight_quant.symmetric, (
-            "Only symmetric quantization is supported for MoE"
-        )
+
+    def get_weight_shape(
+        self,
+        weight_name: str,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        num_groups_w2: int | None = None,
+        num_groups_w13: int | None = None,
+    ) -> tuple[int, int, int]:
+        """
+        Get the shape of the weight based on the weight name, number of experts
+        hidden size, intermediate size per partition, number of groups for w2,
+        and number of groups for w13. Pass in num_groups_w2 and num_groups_w13
+        for weight scales/zero_points.
+        """
+        if weight_name == "w13_zp":
+            assert num_groups_w13 is not None, (
+                "num_groups_w13 must be provided for weight zero_points"
+            )
+        if weight_name == "w2_zp":
+            assert num_groups_w2 is not None, (
+                "num_groups_w2 must be provided for weight zero_points"
+            )
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        shape_map = {
+            "w13_zp": (
+                num_experts,
+                num_groups_w13,
+                w13_num_shards
+                * intermediate_size_per_partition
+                // self.packed_factor,
+            ),
+            "w2_zp": (
+                num_experts,
+                num_groups_w2,
+                hidden_size // self.packed_factor,
+            ),
+        }
+        return shape_map[weight_name]
 
     def create_weights(
         self,
@@ -119,6 +158,39 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w2_weight_scale", w2_scale)
         set_weight_attrs(w2_scale, extra_weight_attrs)
         set_weight_attrs(w2_scale, {"load_full_w2": False})
+
+        if not self.symmetric:
+            w13_zp = torch.nn.Parameter(
+                torch.zeros(
+                    *self.get_weight_shape(
+                        "w13_zp",
+                        num_experts,
+                        hidden_size,
+                        intermediate_size_per_partition,
+                        num_groups_w13=num_groups_w13,
+                    ),
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_zp)
+            set_weight_attrs(w13_zp, extra_weight_attrs)
+
+            w2_zp = torch.nn.Parameter(
+                torch.zeros(
+                    *self.get_weight_shape(
+                        "w2_zp",
+                        num_experts,
+                        hidden_size,
+                        intermediate_size_per_partition,
+                        num_groups_w2=num_groups_w2,
+                    ),
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_zp)
+            set_weight_attrs(w2_zp, extra_weight_attrs)
 
         w2_weight_shape = torch.nn.Parameter(
             torch.empty(num_experts, 2), requires_grad=False
@@ -195,23 +267,57 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.w2_weight_scale = torch.nn.Parameter(
             layer.w2_weight_scale.transpose(1, 2).contiguous(), requires_grad=False
         )
+        if not self.symmetric:
+            layer.w13_weight_zero_point = torch.nn.Parameter(
+                layer.w13_weight_zero_point.view(torch.uint8)
+                .transpose(1, 2)
+                .contiguous(),
+                requires_grad=False,
+            )
+            layer.w2_weight_zero_point = torch.nn.Parameter(
+                layer.w2_weight_zero_point.view(torch.uint8)
+                .transpose(1, 2)
+                .contiguous(),
+                requires_grad=False,
+            )
+            bit8_pack_factor = 8 // self.num_bits
+            expected_w13_zp_shape = (
+                layer.w13_weight_packed.shape[0],
+                layer.w13_weight_packed.shape[1] // bit8_pack_factor,
+                layer.w13_weight_scale.shape[2],
+            )
+            expected_w2_zp_shape = (
+                layer.w2_weight_packed.shape[0],
+                layer.w2_weight_packed.shape[1] // bit8_pack_factor,
+                layer.w2_weight_scale.shape[2],
+            )
+            assert layer.w13_weight_zero_point.shape == expected_w13_zp_shape, (
+                "Unexpected w13 zero-point shape after WNA16 MoE packing: "
+                f"{layer.w13_weight_zero_point.shape}, "
+                f"expected {expected_w13_zp_shape}"
+            )
+            assert layer.w2_weight_zero_point.shape == expected_w2_zp_shape, (
+                "Unexpected w2 zero-point shape after WNA16 MoE packing: "
+                f"{layer.w2_weight_zero_point.shape}, "
+                f"expected {expected_w2_zp_shape}"
+            )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        assert self.num_bits == 4 or self.num_bits == 8
-        config_builder = (
-            int4_w4a16_moe_quant_config
-            if self.num_bits == 4
-            else int8_w8a16_moe_quant_config
-        )
-
-        return config_builder(
+        # SwiGLU/swigluoai gate params live on the layer; plumb them into the
+        # quant config so the fused activation (e.g. swigluoai_uninterleave on
+        # MiniMax-M3) receives gemm1_clamp_limit/alpha/beta.
+        return make_wna16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_zp=None,
-            w2_zp=None,
-            block_shape=[0, self.group_size],
+            group_size=self.group_size,
+            num_bits=self.num_bits,
+            w1_zp=getattr(layer, "w13_weight_zero_point", None),
+            w2_zp=getattr(layer, "w2_weight_zero_point", None),
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def select_gemm_impl(

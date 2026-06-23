@@ -488,8 +488,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
-        # cache (--attention-config '{"indexer_kv_dtype": ...}').
+        # Indexer side-cache dtype (--attention-config '{"indexer_kv_dtype": ...}').
         self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
 
         self.attn_backend = MiniMaxM3SparseBackend
@@ -935,6 +934,22 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".mlp.fc1.": ".fc1.",
+            ".mlp.fc2.": ".fc2.",
+        },
+        orig_to_new_suffix={
+            ".mlp.fc1": ".fc1",
+            ".mlp.fc2": ".fc2",
+        },
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -994,6 +1009,10 @@ class MiniMaxM3SparseForConditionalGeneration(
     # data``; ``run_dp_sharded_mrope_vision_model`` shards the work across
     # ranks (see ``_process_image_input`` / ``_process_video_input``).
     supports_encoder_tp_data = True
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1003,6 +1022,10 @@ class MiniMaxM3SparseForConditionalGeneration(
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
+        },
+        orig_to_new_suffix={
+            ".mlp.fc1": ".fc1",
+            ".mlp.fc2": ".fc2",
         },
     )
 

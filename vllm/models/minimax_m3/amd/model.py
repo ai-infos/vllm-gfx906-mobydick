@@ -30,7 +30,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -44,7 +47,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
-    MinimaxM3QKVParallelLinearWithIndexer,
+    ReplicatedLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -411,16 +414,31 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        model_stream_dtype = hidden_states.dtype
         qkv, _ = self.qkv_proj(hidden_states)
+        if qkv.dtype == torch.float32:
+            qkv = qkv.to(torch.float16)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        if cos_sin_cache.dtype != qkv.dtype:
+            cos_sin_cache = cos_sin_cache.to(qkv.dtype)
+            self.rotary_emb.cos_sin_cache = cos_sin_cache
+        q_norm_weight = self.q_norm.weight
+        if q_norm_weight.dtype != qkv.dtype:
+            q_norm_weight = q_norm_weight.to(qkv.dtype)
+        k_norm_weight = self.k_norm.weight
+        if k_norm_weight.dtype != qkv.dtype:
+            k_norm_weight = k_norm_weight.to(qkv.dtype)
         # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place (dense
         # mode: no index branch, no KV-cache insert). Matches nvidia/model.py and
         # replaces the unfused split -> q_norm/k_norm -> rotary_emb chain; verified
         # bit-equivalent on ROCm (q/k rel ~2e-3 bf16 noise, v untouched).
+        # Note also that the op is half/bf16-only, so fp32 model-stream activations 
+        # are narrowed above.
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.rotary_emb.cos_sin_cache,
+            q_norm_weight,
+            k_norm_weight,
+            cos_sin_cache,
             positions,
             self.num_heads,
             self.num_kv_heads,
@@ -429,7 +447,11 @@ class MiniMaxM3Attention(nn.Module):
         )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
+        if attn_output.dtype != model_stream_dtype:
+            attn_output = attn_output.to(model_stream_dtype)
         output, _ = self.o_proj(attn_output)
+        if output.dtype != model_stream_dtype:
+            output = output.to(model_stream_dtype)
         return output
 
 
@@ -470,6 +492,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         else:
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        # How many ranks share each KV head (>1 when tp_size > num_kv_heads).
+        self.num_kv_head_replicas = max(1, tp_size // self.total_num_kv_heads)
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -484,17 +509,37 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
 
-        # Single fused projection: q, k, v, index_q, index_k in one GEMM.
-        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
+        # Main q/k/v projection (quantized when quant_config is set). The sparse
+        # lightning indexer (index_q/index_k) is *not* fused in here: many
+        # checkpoints leave the indexer in bf16 while quantizing q/k/v, which a
+        # single packed GEMM can't represent. We keep them as separate
+        # unquantized projections and re-concatenate into the [q|k|v|index_q|
+        # index_k] layout the fused kernel expects (see forward()).
+        self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            self.total_idx_heads,
-            self.idx_head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+        )
+        # Unquantized indexer projections, replicated on every rank (full
+        # weight); the per-rank index_q slice is taken in forward(). index_k is
+        # a single head replicated to all ranks.
+        self.index_q_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.total_idx_heads * self.idx_head_dim,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.index_q_proj",
+        )
+        self.index_k_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.idx_head_dim,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.index_k_proj",
         )
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
@@ -533,15 +578,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
         # fp8 main-K/V cache: the fused qknorm+rope+kv-insert op is bf16-cache-only
         # (asserts kv_cache dtype == qkv), so on the fp8 path we run it in
         # norm+rope-only mode and write the cache via the fp8-capable
-        # reshape_and_cache_flash in _insert_kv. (index cache stays bf16.)
+        # reshape_and_cache_flash in _insert_kv.
         self._fp8_kv = "fp8" in self.kv_cache_dtype
 
         self.attn_backend = MiniMaxM3SparseBackend
         # Indexer and main attention are separate impls. On ROCm the SM100 gate
-        # is always False, so both pick Triton and the index cache stays bf16.
+        # is always False, so both pick Triton.
         # impl is AttentionImplBase (broader than AttentionLayerBase's annotation).
         self.impl: MiniMaxM3SparseImpl = select_main_impl_cls(  # type: ignore[assignment]
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
@@ -569,6 +615,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             score_type=sparse_cfg.get("sparse_score_type", "max"),
             cache_config=cache_config,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
@@ -606,7 +653,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         runs in norm+rope-only mode and the (already normed/roped) k/v/index_k are
         written here via ``reshape_and_cache_flash`` (which honors kv_cache_dtype,
         unit scale -- matching the fp8 read path added in #33). Mirrors the
-        pre-#20 unfused insert. The index cache stays bf16 (no quant).
+        pre-#20 unfused insert.
         """
         key_cache, value_cache = self.kv_cache.unbind(1)
         scale = torch.ones((), device=key.device)
@@ -628,8 +675,20 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Single fused projection emitting [q | k | v | index_q | index_k].
+        # q/k/v (possibly quantized) and the bf16 indexer projections are run
+        # separately, then concatenated into the single [q | k | v | index_q |
+        # index_k] buffer the fused kernel below consumes. index_q_proj is
+        # replicated, so slice this rank's KV-aligned head(s); index_k is a
+        # single replicated head used as-is.
+        model_stream_dtype = hidden_states.dtype
         qkv, _ = self.qkv_proj(hidden_states)
+        index_q_full, _ = self.index_q_proj(hidden_states)
+        index_k, _ = self.index_k_proj(hidden_states)
+        iq_start = (self.tp_rank // self.num_kv_head_replicas) * self.index_q_size
+        index_q = index_q_full.narrow(-1, iq_start, self.index_q_size)
+        qkv = torch.cat([qkv, index_q, index_k], dim=-1)
+        if qkv.dtype == torch.float32:
+            qkv = qkv.to(torch.float16)
 
         # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
         # main (q/k) and index (index_q/index_k) branches, all read straight out
@@ -642,6 +701,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # index slot mappings are read from the forward context's slot_mapping
         # dict, matching the breakable-cudagraph path -- see nvidia/model.py.)
         cos_sin_cache = self.rotary_emb.cos_sin_cache
+        if cos_sin_cache.dtype != qkv.dtype:
+            cos_sin_cache = cos_sin_cache.to(qkv.dtype)
+            self.rotary_emb.cos_sin_cache = cos_sin_cache
+        q_norm_weight = self.q_norm.weight
+        if q_norm_weight.dtype != qkv.dtype:
+            q_norm_weight = q_norm_weight.to(qkv.dtype)
+        k_norm_weight = self.k_norm.weight
+        if k_norm_weight.dtype != qkv.dtype:
+            k_norm_weight = k_norm_weight.to(qkv.dtype)
+        index_q_norm_weight = self.index_q_norm.weight
+        if index_q_norm_weight.dtype != qkv.dtype:
+            index_q_norm_weight = index_q_norm_weight.to(qkv.dtype)
+        index_k_norm_weight = self.index_k_norm.weight
+        if index_k_norm_weight.dtype != qkv.dtype:
+            index_k_norm_weight = index_k_norm_weight.to(qkv.dtype)
         rotary_dim = self.rotary_emb.rotary_dim
         eps = self.q_norm.variance_epsilon
         num_tokens = qkv.shape[0]
@@ -652,7 +726,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+            return hidden_states.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
@@ -666,16 +740,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         insert_via_fused = not self._fp8_kv
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
+            q_norm_weight,
+            k_norm_weight,
             cos_sin_cache,
             positions,
             self.num_heads,
             self.num_kv_heads,
             rotary_dim,
             eps,
-            self.index_q_norm.weight,
-            self.index_k_norm.weight,
+            index_q_norm_weight,
+            index_k_norm_weight,
             self.num_idx_heads,
             main_slot_mapping,
             index_slot_mapping,
@@ -702,7 +776,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         output = torch.empty_like(q)
         attn_output = self._run_attention(q, index_q, output)
+        if attn_output.dtype != model_stream_dtype:
+            attn_output = attn_output.to(model_stream_dtype)
         output, _ = self.o_proj(attn_output)
+        if output.dtype != model_stream_dtype:
+            output = output.to(model_stream_dtype)
         return output
 
     @eager_break_during_capture
@@ -881,10 +959,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # q/k/v_proj -> fused qkv_proj; gate_proj/up_proj -> fused gate_up_proj
-        # (dense MLP and shared expert). On sparse layers the indexer
-        # index_q/index_k_proj fold into the same fused qkv_proj
-        # (MinimaxM3QKVParallelLinearWithIndexer); these entries simply never match on
-        # dense layers, whose checkpoints have no index_*_proj weights. Leading
+        # (dense MLP and shared expert). The sparse-attention indexer
+        # (index_q/index_k_proj) is NOT fused: it loads directly into the
+        # standalone bf16-fp16 ReplicatedLinear params, so it is absent here. Leading
         # dots keep `q_proj`/`k_proj` from matching `index_q_proj`/`index_k_proj`
         # (preceded by `_`, not `.`).
         stacked_params_mapping: list[tuple[str, str, int | str]] = [
@@ -892,8 +969,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            (".qkv_proj", ".index_q_proj", "index_q"),
-            (".qkv_proj", ".index_k_proj", "index_k"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
@@ -980,6 +1055,22 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".mlp.fc1.": ".fc1.",
+            ".mlp.fc2.": ".fc2.",
+        },
+        orig_to_new_suffix={
+            ".mlp.fc1": ".fc1",
+            ".mlp.fc2": ".fc2",
+        },
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -1042,6 +1133,10 @@ class MiniMaxM3SparseForConditionalGeneration(
     # data``; ``run_dp_sharded_mrope_vision_model`` shards the work across
     # ranks (see ``_process_image_input`` / ``_process_video_input``).
     supports_encoder_tp_data = True
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1051,6 +1146,10 @@ class MiniMaxM3SparseForConditionalGeneration(
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
+        },
+        orig_to_new_suffix={
+            ".mlp.fc1": ".fc1",
+            ".mlp.fc2": ".fc2",
         },
     )
 

@@ -25,11 +25,11 @@ from vllm.triton_utils import tl, triton
 SPARSE_BLOCK_SIZE = 128
 
 
-_SPARSE_ATTN_NUM_STAGES_KWARG: dict | None = None
+_SPARSE_ATTN_LAUNCH_KWARGS: dict | None = None
 
 
-def _sparse_attn_num_stages_kwarg() -> dict:
-    """Triton ``num_stages`` override for the sparse-attn GEMM kernels.
+def _sparse_attn_launch_kwargs() -> dict:
+    """Triton launch overrides for the sparse-attn GEMM kernels.
 
     Forced only where required: CDNA3 (gfx942) caps LDS at
     64 KB, and the default 2-stage pipeline double-buffers the 128x128 K/V tiles
@@ -37,17 +37,35 @@ def _sparse_attn_num_stages_kwarg() -> dict:
     stage (~32 KB, which fits). Everywhere else (NVIDIA, CDNA4 gfx950) return an
     empty kwarg and let Triton keep its own default -- don't second-guess it.
     Cached: the arch is fixed per process.
-    """
-    global _SPARSE_ATTN_NUM_STAGES_KWARG
-    if _SPARSE_ATTN_NUM_STAGES_KWARG is None:
-        kwarg: dict = {}
-        if current_platform.is_rocm():
-            from vllm.platforms.rocm import on_gfx942
 
-            if on_gfx942():
-                kwarg = {"num_stages": 1}
-        _SPARSE_ATTN_NUM_STAGES_KWARG = kwarg
-    return _SPARSE_ATTN_NUM_STAGES_KWARG
+    gfx906 / MI50 has also a 64 KiB LDS limit. The default multi-stage pipeline can
+    exceed that for 128-token K/V sparse tiles, so force one stage.
+
+    gfx906 tuning:
+      - num_stages=1: required to stay below LDS limit
+      - num_warps=4: good default for these attention tiles on GCN/CDNA-era AMD
+      - waves_per_eu=1: usually helps avoid over-occupancy / VGPR pressure
+    """
+    global _SPARSE_ATTN_LAUNCH_KWARGS
+    if _SPARSE_ATTN_LAUNCH_KWARGS is None:
+        kwargs: dict = {}
+
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx942, on_gfx906 
+
+            if on_gfx906():
+                kwargs = {
+                    "num_warps": 4,
+                    "num_stages": 1,
+                    "waves_per_eu": 1,
+                }
+            elif on_gfx942():
+                # MI300 tuning
+                kwargs = {"num_stages": 1}
+
+        _SPARSE_ATTN_LAUNCH_KWARGS = kwargs
+
+    return _SPARSE_ATTN_LAUNCH_KWARGS
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +167,8 @@ def _gqa_sparse_fwd_kernel(
         lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+        if q.dtype == tl.float32:
+            q = q.to(tl.float16)
         for _ in range(real_topk):
             blk = tl.load(t_ptr_j).to(tl.int32)
             t_ptr_j = t_ptr_j + stride_tk
@@ -168,6 +188,8 @@ def _gqa_sparse_fwd_kernel(
             )
             if USE_FP8:
                 k = k.to(q.dtype)
+            elif k.dtype == tl.float32:
+                k = k.to(tl.float16)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
@@ -190,6 +212,8 @@ def _gqa_sparse_fwd_kernel(
             )
             if USE_FP8:
                 v = v.to(q.dtype)
+            elif v.dtype == tl.float32:
+                v = v.to(tl.float16)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -310,6 +334,8 @@ def _gqa_sparse_decode_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
@@ -331,6 +357,8 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             k = k.to(q.dtype)
+        elif k.dtype == tl.float32:
+            k = k.to(tl.float16)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
@@ -350,6 +378,8 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             v = v.to(q.dtype)
+        elif v.dtype == tl.float32:
+            v = v.to(tl.float16)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -492,7 +522,7 @@ def minimax_m3_sparse_attn(
         BLOCK_SIZE_Q=1,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_FP8=use_fp8,
-        **_sparse_attn_num_stages_kwarg(),
+        **_sparse_attn_launch_kwargs(),
     )
 
 
@@ -568,7 +598,7 @@ def minimax_m3_sparse_attn_decode(
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_FP8=use_fp8,
         USE_PDL=use_pdl,
-        **_sparse_attn_num_stages_kwarg(),
+        **_sparse_attn_launch_kwargs(),
         **pdl_launch,
     )
     merge_grid = (total_q, num_heads)

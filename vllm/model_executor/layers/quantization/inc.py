@@ -20,7 +20,11 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
@@ -236,6 +240,13 @@ class INCConfig(QuantizationConfig):
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16
 
+    def get_unquantized_method(self, layer: torch.nn.Module):
+        if isinstance(layer, (VocabParallelEmbedding, ParallelLMHead)):
+            return UnquantizedEmbeddingMethod()
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None
+
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         if self.block_name_to_quantize is not None:
             self.block_name_to_quantize = hf_to_vllm_mapper.apply_list(
@@ -252,10 +263,10 @@ class INCConfig(QuantizationConfig):
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
-            else:
-                return None
+            return self.get_unquantized_method(layer)
+
+        if not isinstance(layer, (RoutedExperts, LinearBase, ParallelLMHead)):
+            return None
 
         logger.debug(
             "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
@@ -337,10 +348,10 @@ class INCConfig(QuantizationConfig):
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
-            else:
-                return None
+            return self.get_unquantized_method(layer)
+
+        if not isinstance(layer, (RoutedExperts, LinearBase, ParallelLMHead)):
+            return None
 
         logger.debug(
             "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
@@ -396,6 +407,7 @@ class INCConfig(QuantizationConfig):
                     "bits": weight_bits,
                     "group_size": group_size,
                     "sym": sym,
+                    "desc_act": False,
                     "lm_head": False,
                 }
                 return MoeWNA16Config.from_config(config).get_quant_method(
@@ -418,10 +430,7 @@ class INCConfig(QuantizationConfig):
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
 
         if not self.check_quantized(weight_bits):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
-            else:
-                return None
+            return self.get_unquantized_method(layer)
 
         if weight_bits != 4:
             raise NotImplementedError(
@@ -459,10 +468,7 @@ class INCConfig(QuantizationConfig):
     def apply_cpu_w4a16_quant_layer(self, layer, prefix: str, backend: str = "auto"):
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
-            else:
-                return None
+            return self.get_unquantized_method(layer)
 
         if weight_bits != 4:
             raise NotImplementedError(
@@ -498,7 +504,7 @@ class INCConfig(QuantizationConfig):
                 if (
                     layer_name == prefix or layer_name == f"model.{prefix}"
                 ) and self.extra_config[layer_name].get("bits", 16) >= 16:
-                    return UnquantizedLinearMethod()
+                    return self.get_unquantized_method(layer)
 
         if current_platform.is_xpu():
             return self.apply_xpu_w4a16_quant_layer(layer, prefix)

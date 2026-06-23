@@ -3,9 +3,9 @@ set -e
 
 # Settings
 # NB: run this script from this branch with:
-# chmod +x ./build_and_push_docker.sh && docker login -u aiinfos && ./build_and_push_docker.sh 
+# chmod +x ./build_and_push_docker.sh && docker login -u aiinfos && ./build_and_push_docker.sh
 # it will default to current branch name: v0.23.1rc0.x or from another branch: e.g. "./build_and_push_docker.sh v0.17.1rc0.x"
-# NB2: you can force ROCM/PyTorch versions with: 
+# NB2: you can force ROCM/PyTorch versions with:
 # MAX_JOBS=16 sudo ./build_and_push_docker.sh v0.23.1rc0.x 7.2.1 2.11.0
 IMAGE_NAME="aiinfos/vllm-gfx906-mobydick"
 IMAGE_TAG="${1:-v0.23.1rc0.x}"
@@ -52,7 +52,8 @@ FROM rocm_base AS build_base
 ENV MAX_JOBS=${MAX_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS}
 
-# Install necessary build tools
+# Install build tools + Rust/protobuf dependencies required by vLLM Rust extensions.
+# protobuf-compiler provides protoc, required by prost-build in vllm-server.
 RUN apt-get update && apt-get install -y \\
     git \\
     wget \\
@@ -60,9 +61,20 @@ RUN apt-get update && apt-get install -y \\
     cmake \\
     ninja-build \\
     build-essential \\
+    pkg-config \\
+    protobuf-compiler \\
+    libprotobuf-dev \\
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install ninja 'cmake>=3.26.1,<4' pybind11 packaging 'setuptools>=77.0.3,<80.0.0' 'setuptools-scm>=8' wheel
+RUN pip install \\
+    ninja \\
+    'cmake>=3.26.1,<4' \\
+    pybind11 \\
+    packaging \\
+    'setuptools>=77.0.3,<80.0.0' \\
+    'setuptools-scm>=8' \\
+    'setuptools-rust>=1.9.0' \\
+    wheel
 
 # ==========================================
 # Build Triton-gfx906
@@ -90,7 +102,7 @@ FROM build_base AS build_vllm
 WORKDIR /app
 RUN git clone https://github.com/ai-infos/vllm-gfx906-mobydick.git vllm-gfx906-mobydick && \\
     cd vllm-gfx906-mobydick && \\
-    pip install setuptools_rust && \\
+    ./build_rust.sh && \\
     pip install -r requirements/rocm.txt && \\
     pip wheel --no-build-isolation -v -w /dist .
 
@@ -104,8 +116,8 @@ WORKDIR /workspace/vllm-gfx906-mobydick
 ENV FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
 ENV VLLM_LOGGING_LEVEL=INFO
 
-# Bind mount the wheels directly and install them without bloating the layer
-# Install everything in a single pip command so pip resolves them together and doesn't fetch CUDA versions
+# Bind mount the wheels directly and install them without bloating the layer.
+# Install everything in a single pip command so pip resolves them together and doesn't fetch CUDA versions.
 RUN --mount=type=bind,from=build_triton,src=/dist/,target=/dist_triton \\
     --mount=type=bind,from=build_flash_attn,src=/dist/,target=/dist_flash_attn \\
     --mount=type=bind,from=build_vllm,src=/dist/,target=/dist_vllm \\
@@ -118,8 +130,9 @@ echo "Dockerfile has been created."
 
 echo "Building the Docker image: ${IMAGE_NAME}:${IMAGE_TAG}-rocm${ROCM_VERSION}-pytorch${PYTORCH_VERSION} ..."
 # Build the multi-stage image. Buildkit handles parallel stage execution.
-# Uncomment below line if you want to use --no-cache-filter build_vllm to ensure the latest vllm commits are always pulled without rebuilding triton/flash-attn.
-# DOCKER_BUILDKIT=1 docker build --no-cache-filter build_vllm -t ${IMAGE_NAME}:${IMAGE_TAG}-rocm${ROCM_VERSION}-pytorch${PYTORCH_VERSION} -t ${IMAGE_NAME}:latest .
+# Use the no-cache-filter line below when you want to force-refresh vLLM/Rust build layers
+# without rebuilding Triton and Flash-Attention.
+# DOCKER_BUILDKIT=1 docker build --no-cache-filter build_base --no-cache-filter build_vllm -t ${IMAGE_NAME}:${IMAGE_TAG}-rocm${ROCM_VERSION}-pytorch${PYTORCH_VERSION} -t ${IMAGE_NAME}:latest .
 DOCKER_BUILDKIT=1 docker build -t ${IMAGE_NAME}:${IMAGE_TAG}-rocm${ROCM_VERSION}-pytorch${PYTORCH_VERSION} -t ${IMAGE_NAME}:latest .
 
 echo "We need to authenticate with Docker Hub before pushing."

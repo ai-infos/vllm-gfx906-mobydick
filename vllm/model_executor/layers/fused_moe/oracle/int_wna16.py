@@ -176,6 +176,9 @@ def make_wna16_moe_quant_config(
     w2_bias: torch.Tensor | None = None,
     a1_gscale: torch.Tensor | None = None,
     a2_gscale: torch.Tensor | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """Create the FusedMoEQuantConfig for 4 or 8-bit WNA16 MoE."""
     if num_bits == 4:
@@ -189,6 +192,9 @@ def make_wna16_moe_quant_config(
             block_shape=[0, group_size],
             a1_gscale=a1_gscale,
             a2_gscale=a2_gscale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
     else:
         assert num_bits == 8
@@ -202,6 +208,9 @@ def make_wna16_moe_quant_config(
             block_shape=[0, group_size],
             a1_gscale=a1_gscale,
             a2_gscale=a2_gscale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
 
