@@ -222,7 +222,19 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    # The readout `o = state @ q` is accumulated in fp32 inside the kernel, but
+    # the output tensor was materialized in q's (activation) dtype. With an fp32
+    # SSM state cache (`--mamba-ssm-cache-dtype float32`) the GDN state is an
+    # unnormalized accumulator that can exceed fp16's 65504 max, so an fp16 output
+    # overflows to +/-inf at the store; RMSNormGated then yields inf/inf = NaN and
+    # decode collapses to a single repeated token on non-Blackwell GPUs (gfx906).
+    # Materialize in the state's precision; the fp16 fast path is unchanged.
+    o_dtype = (
+        torch.float32
+        if initial_state is not None and initial_state.dtype == torch.float32
+        else q.dtype
+    )
+    o = q.new_empty(NK, *v.shape, dtype=o_dtype)
     if inplace_final_state:
         final_state = initial_state
     else:
