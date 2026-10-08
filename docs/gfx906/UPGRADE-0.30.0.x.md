@@ -208,6 +208,8 @@ backend, the Rust frontend and every registered Rust Python extension, and that
 the sdist includes the vendored attention kernel source. Rust is required for
 this image build, rather than silently skipped as an optional wheel component.
 
+**Note that detailed guidances to build and push the docker image can be found [here](upgrade-0.30.0-inventory/guidances_build_publish_docker_image.md).**
+
 For an editable install inside the pinned build environment, after installing
 the pinned Triton/flash-attention wheels and `requirements/rocm.txt`:
 

@@ -2,23 +2,24 @@
 
 ## 🐳 Using Pre-built Docker Image (Recommended)
 
-Use Docker on a Linux x86_64 host with AMD GPU drivers and access to `/dev/kfd` and `/dev/dri`. Choose a published versioned tag, or build it locally below.
-For v0.30.0, build locally until a matching tag is published. The build helper does not update `latest`.
+You need Docker and the AMD ROCm drivers/kernel modules installed on your Linux host system in order to use our pre-built Docker image.
 
 ```bash
-IMAGE=aiinfos/vllm-gfx906-mobydick:v0.30.0.x-rocm7.14-pytorch2.13.0
+# Pull the last image tag (or specify another tag from [aiinfos docker hub](https://hub.docker.com/r/aiinfos/vllm-gfx906-mobydick/tags))
+IMAGE=aiinfos/vllm-gfx906-mobydick:v0.30.0.x-rocm7.14-pytorch2.13.0-260726fedb27
 docker pull "$IMAGE"
 
-docker run --rm -it --name vllm-gfx906-mobydick \
+# Run the container interactively (Make sure to pass ROCm devices into the container and have your models in host /home/ as we map /home:/home; feel free to edit the command below to a safer one, without priviledged and others)
+sudo docker run -it --name vllm-gfx906-mobydick \
+  -v /home:/home --network host \
   --device=/dev/kfd --device=/dev/dri \
   --group-add "$(getent group video | cut -d: -f3)" \
   --group-add "$(getent group render | cut -d: -f3)" \
-  --ipc=host -p 127.0.0.1:8000:8000 \
-  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  "$IMAGE"
+  --cap-add=SYS_ADMIN --volume /sys:/sys:ro --pid=host --privileged \
+  --ipc=host "$IMAGE"
 ```
 
-Inside the container, run the Quickstart below. The API is available at `http://localhost:8000` on the Docker host. Use `sudo docker` if required by your host's Docker setup.
+Once inside the container, you are all set! You can immediately start serving models (see the Quickstart example below).
 
 ---
 
@@ -27,13 +28,12 @@ Inside the container, run the Quickstart below. The API is available at `http://
 ```bash
 git clone https://github.com/ai-infos/vllm-gfx906-mobydick.git
 cd vllm-gfx906-mobydick
-MAX_JOBS=4 bash build_and_push_docker.sh
+# Reduce/increase MAX_JOBS parallelism if necessary (according to available RAM/CPU cores):
+MAX_JOBS=64 bash build_and_push_docker.sh
 ```
 
-See [the build and validation record](docs/gfx906/UPGRADE-0.30.0.x.md) for
-dependency pins, editable builds and package checks.
-Building requires no GPU. Adjust `MAX_JOBS` to the available RAM; the helper
-builds locally and only publishes when passed `--push` after Docker login.
+See [the build and validation record](docs/gfx906/UPGRADE-0.30.0.x.md) for dependency pins, editable builds and package checks.
+The above script builds locally and only publishes when passed `--push` after Docker login.
 
 After a successful local build, an example GPU container invocation is:
 
@@ -47,13 +47,9 @@ docker run --rm -it --device=/dev/kfd --device=/dev/dri \
   aiinfos/vllm-gfx906-mobydick:v0.30.0.x-rocm7.14-pytorch2.13.0
 ```
 
-Use the drivers and device access appropriate to your host. The reference's
-dual-GPU topology notes in `docs/gfx906/running.md` are historical environment
-evidence, not a driver-installation requirement established by this upgrade.
-
 ## Quickstart example (with Qwen3.8-27B-AWQ-INT4, 2x MI50/MI60 32GB)
 
-The image sets `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` and supplies the ROCm libraries. Docker users do not need to export `LD_LIBRARY_PATH` or `VLLM_GFX906_HIP_LIB_PATH`. For a host venv and the optional HIP blocking-sync workaround (not bundled in the image), see [running.md](docs/gfx906/running.md).
+The image sets `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` and supplies the ROCm libraries. So Docker users do not need to set `FLASH_ATTENTION_TRITON_AMD_ENABLE`, `LD_LIBRARY_PATH` and `VLLM_GFX906_HIP_LIB_PATH`.
 
 ```bash
 vllm serve cyankiwi/Qwen3.8-27B-AWQ-INT4 \
