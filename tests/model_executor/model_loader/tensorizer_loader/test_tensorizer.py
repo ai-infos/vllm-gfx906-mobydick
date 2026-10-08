@@ -36,7 +36,7 @@ try:
     import tensorizer
     from tensorizer import EncryptionParams
 except ImportError:
-    tensorizer = PlaceholderModule("tensorizer")
+    tensorizer = PlaceholderModule("tensorizer")  # type: ignore[assignment]
     EncryptionParams = tensorizer.placeholder_attr("EncryptionParams")
 
 
@@ -579,7 +579,7 @@ async def test_serialize_and_serve_entrypoints(tmp_path):
 
     try:
         await asyncio.wait_for(fut, 180)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         pytest.fail("Server did not start successfully")
     finally:
         proc.terminate()

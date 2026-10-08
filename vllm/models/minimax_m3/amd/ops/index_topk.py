@@ -26,6 +26,14 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 DECODE_SCORE_BALANCED_PROGRAM_BUDGET = 1024
@@ -139,6 +147,17 @@ def _decode_topk_launch_policy(
     )
 
 
+def _index_score_launch_kwargs() -> dict:
+    """Launch kwargs for index-score dot kernels on gfx906."""
+    if current_platform.is_rocm() and on_gfx906():
+        return {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+        }
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Bitonic top-k helpers (layout-agnostic).
 # ---------------------------------------------------------------------------
@@ -229,16 +248,17 @@ def _index_block_score_kernel(
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
 
-    q_desc = tl.make_tensor_descriptor(
+    q_ptrs = tl.make_block_ptr(
         base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=[q_len, head_dim],
-        strides=[stride_q_n, stride_q_d],
-        block_shape=[BLOCK_SIZE_Q, head_dim],
-        padding_option="zero",
+        shape=(q_len, head_dim),
+        strides=(stride_q_n, stride_q_d),
+        offsets=(pid_q * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, head_dim),
+        order=(1, 0),
     )
-
-    # 2. Perform the load by providing the multi-dimensional offset directly
-    q = q_desc.load([pid_q * BLOCK_SIZE_Q, 0])
+    q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -262,6 +282,8 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
+        if k.dtype == tl.float32:
+            k = k.to(tl.float16)
         qk = tl.dot(q, k)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
@@ -476,6 +498,10 @@ def _decode_index_score_kernel(
         mask=q_mask[None, :],
         other=0.0,
     )  # [D,HQ]
+    # gfx906: Triton MMA lacks fp32, and loop-carried types must stay stable,
+    # so cast q here instead of inside the loop.
+    if BLOCK_SIZE_HQ != 1 and q.dtype == tl.float32:
+        q = q.to(tl.float16)
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -499,6 +525,10 @@ def _decode_index_score_kernel(
             # are loaded in their stored dtype (bf16 or e4m3) and the MMA
             # accumulates in fp32 so the per-block max score is exact for the
             # fp8 indexer too.
+            # On gfx906, cast to fp16 (Triton MMA lacks fp32 there); q was cast
+            # before the loop, so only k needs it here.
+            if k.dtype == tl.float32:
+                k = k.to(tl.float16)
             kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
@@ -576,6 +606,9 @@ def _decode_index_score_mapped_range(
             mask=q_mask[None, :],
             other=0.0,
         )
+        # gfx906: cast q before the loop (loop-carried types must stay stable).
+        if BLOCK_SIZE_HQ != 1 and q.dtype == tl.float32:
+            q = q.to(tl.float16)
         for blk in tl.range(chunk_start_block, chunk_end_block):
             page = tl.load(bt_row + blk).to(tl.int64)
             pos = blk * BLOCK_SIZE_K + off_k
@@ -593,6 +626,10 @@ def _decode_index_score_mapped_range(
                     axis=1,
                 )[:, None]
             else:
+                # gfx906: Triton MMA lacks fp32; q was cast before the loop,
+                # so only k needs it here.
+                if k.dtype == tl.float32:
+                    k = k.to(tl.float16)
                 kq = tl.dot(k, q, out_dtype=tl.float32)
             kq = tl.where(
                 pos_mask & q_mask[None, :],
@@ -1237,6 +1274,8 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        # gfx906 index-score dot kernels need these launch params.
+        **_index_score_launch_kwargs(),
     )
     return score
 
@@ -1528,7 +1567,10 @@ def minimax_m3_index_decode(
             BLOCK_SIZE_Q=BLOCK_SIZE_Q,
             num_kv_chunks=num_kv_chunks,
             USE_PDL=use_pdl,
-            **score_kwargs,
+            # gfx906 index-score dot kernels need these launch params; merge so
+            # a gfx906 key already in score_kwargs (num_warps) is overridden
+            # instead of duplicating the keyword.
+            **{**score_kwargs, **_index_score_launch_kwargs()},
         )
 
     if out is not None:

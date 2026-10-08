@@ -17,7 +17,7 @@ requires restructuring the decoder-layer forward scheduling.
 
 import torch
 from torch import nn
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.model_executor.layers.hpc import HpcIHCHead, HpcIHCPost, HpcIHCPre
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -40,7 +40,7 @@ class HYV4HCPreLayer(nn.Module):
 
     def __init__(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         hidden_dim: int,
         hc_mult: int = 4,
         magnitude: float = 2.0,
@@ -107,7 +107,6 @@ class HYV4HCPreLayer(nn.Module):
         Returns:
             A tuple of the pre-gated reduction ``[num_tokens, d]`` and the post
             gates ``[num_tokens, hc]`` consumed by `HYV4HCPostLayer`.
-
         """
         if self.hpc_op is not None:
             return self.hpc_op(x)
@@ -163,7 +162,7 @@ class HYV4HCPostLayer(nn.Module):
         y[n, i, d] = post[n, i] * x[n, d] + residual[n, i, d]
     """
 
-    def __init__(self, config: PreTrainedConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
 
@@ -187,7 +186,6 @@ class HYV4HCPostLayer(nn.Module):
 
         Returns:
             The updated residual channels ``[num_tokens, hc, d]``.
-
         """
         if self.hpc_op is not None:
             return self.hpc_op(x, residual, post)
@@ -213,7 +211,7 @@ class HYV4HCHeadLayer(nn.Module):
 
     def __init__(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         hidden_size: int,
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
@@ -274,7 +272,6 @@ class HYV4HCHeadLayer(nn.Module):
 
         Returns:
             The merged hidden state ``[num_tokens, d]``.
-
         """
         if self.hpc_op is not None:
             return self.hpc_op(x)
@@ -301,7 +298,7 @@ class HYV4HCLayer(nn.Module):
 
     def __init__(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         layer_idx: int,
         init_std: float = 6e-3,
         base_noise_std: float = 0.0,
@@ -370,7 +367,6 @@ class HYV4HCLayer(nn.Module):
             A tuple of the reduced hidden states ``[num_tokens, d]``, the post
             gates ``[num_tokens, hc]`` (``None`` when iHC is disabled) and the
             residual (the untouched input).
-
         """
         if not self.enable_ihc:
             return hidden_states, None, hidden_states

@@ -8,7 +8,6 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.mla import rocm_aiter_mla_sparse as sparse_mod
 from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     _use_rocm_sparse_triton,
@@ -27,26 +26,6 @@ def _store_sparse_kv_row_offset_kernel(slot_ptr, output_ptr, stride: tl.constexp
     tl.store(output_ptr, _sparse_kv_row_offset(slot, stride))
 
 
-def _fit_kpool_indices_reference(
-    token_indices: torch.Tensor, topk_tokens: int
-) -> torch.Tensor:
-    history = token_indices[:, :topk_tokens]
-    tail = token_indices[:, topk_tokens:]
-    valid_history = (history >= 0).sum(dim=1)
-    valid_tail = (tail >= 0).sum(dim=1)
-    keep_history = torch.minimum(valid_history, topk_tokens - valid_tail)
-
-    columns = torch.arange(topk_tokens, device=token_indices.device).unsqueeze(0)
-    tail_offsets = columns - keep_history.unsqueeze(1)
-    tail_values = torch.gather(
-        tail, 1, tail_offsets.clamp(min=0, max=tail.shape[1] - 1)
-    )
-    output = torch.where(columns < keep_history.unsqueeze(1), history, tail_values)
-    valid_output = columns < (keep_history + valid_tail).unsqueeze(1)
-    return torch.where(valid_output, output, -1)
-
-
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
 def test_fit_kpool_indices_preserves_tail_and_best_history():
     token_indices = torch.tensor(
         [
@@ -55,7 +34,6 @@ def test_fit_kpool_indices_preserves_tail_and_best_history():
             [-1, -1, -1, -1, -1, -1, -1, -1],
         ],
         dtype=torch.int32,
-        device="cuda",
     )
 
     fitted = fit_kpool_indices_to_aiter(token_indices, topk_tokens=6)
@@ -65,28 +43,6 @@ def test_fit_kpool_indices_preserves_tail_and_best_history():
         [10, 9, 8, 100, -1, -1],
         [-1, -1, -1, -1, -1, -1],
     ]
-
-
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
-@pytest.mark.parametrize(
-    ("num_tokens", "topk_tokens", "tail_width"),
-    [(1, 4, 1), (7, 6, 2), (13, 128, 128), (3, 2048, 128)],
-)
-def test_fit_kpool_indices_matches_eager_reference(num_tokens, topk_tokens, tail_width):
-    """The Triton fit must reproduce the eager packing rule exactly."""
-    set_random_seed(topk_tokens + num_tokens)
-    width = topk_tokens + tail_width
-    token_indices = torch.randint(0, 4096, (num_tokens, width), dtype=torch.int32)
-    valid = torch.rand((num_tokens, width)) < 0.5
-    valid[0] = False
-    valid[-1] = True
-    token_indices = torch.where(valid, token_indices, -1).cuda()
-
-    fitted = fit_kpool_indices_to_aiter(token_indices, topk_tokens=topk_tokens)
-
-    torch.testing.assert_close(
-        fitted, _fit_kpool_indices_reference(token_indices, topk_tokens)
-    )
 
 
 def test_fit_kpool_indices_exact_width_is_noop():
@@ -224,3 +180,49 @@ def test_sparse_prefill_kv_row_offset_does_not_overflow_int32():
     _store_sparse_kv_row_offset_kernel[(1,)](slot, output, stride=512)
 
     assert output.item() == 6554 * 640 * 512
+
+
+def test_rocm_aiter_mla_sparse_fp16_route_uses_reference(monkeypatch):
+    """gfx906 `VLLM_ROCM_MLA_SPARSE_FP16=1` must bypass AITER and use the
+    reference chunked Torch MLA path (the fork's MI50 fp16-sparse early-return).
+
+    Tiny CPU tensors + a monkeypatched reference, mirroring the sink test: this
+    is the model-level gate for the fp16-sparse early-return re-applied by hand
+    after the 0.30.0 merge (no MiniMax-M3/DeepSeek weights needed).
+    """
+    captured = {}
+
+    def fake_reference(q, kv, indices, sm_scale, d_v):
+        captured["q_shape"] = tuple(q.shape)
+        captured["kv_shape"] = tuple(kv.shape)
+        captured["indices_shape"] = tuple(indices.shape)
+        captured["sm_scale"] = sm_scale
+        captured["d_v"] = d_v
+        return torch.zeros(q.shape[0], q.shape[1], d_v, dtype=q.dtype)
+
+    monkeypatch.setattr(sparse_mod, "reference_mla_sparse_prefill", fake_reference)
+    monkeypatch.setattr(
+        sparse_mod.envs, "VLLM_ROCM_MLA_SPARSE_FP16", True, raising=False
+    )
+
+    impl = object.__new__(sparse_mod.ROCMAiterMLASparseImpl)
+    impl.num_heads = 8
+    impl.kv_lora_rank = 512
+    impl.softmax_scale = 512**-0.5
+    impl.kv_cache_dtype = "float16"
+
+    q = torch.zeros(2, 8, 512, dtype=torch.float16)
+    kv = torch.zeros(4, 1, 512, dtype=torch.float16)
+    topk_indices = torch.zeros(2, 16, dtype=torch.int32)
+
+    output, lse = impl._forward_mla(
+        SimpleNamespace(), q, kv, SimpleNamespace(), topk_indices
+    )
+
+    assert captured["q_shape"] == (2, 8, 512)
+    assert captured["kv_shape"] == (4, 1, 512)
+    assert captured["indices_shape"] == (2, 1, 16)
+    assert captured["sm_scale"] == impl.softmax_scale
+    assert captured["d_v"] == 512
+    assert output.shape[0] == 2 and output.shape[-1] == 512
+    assert lse is None

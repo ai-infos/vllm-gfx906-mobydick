@@ -14,14 +14,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wrapper around `transformers` models."""
+"""Wrapper around `transformers` models"""
 
 from typing import TYPE_CHECKING
 
 import torch.nn.functional as F
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from vllm.model_executor.models.transformers.base import VLLM_ATTN_ATTR
+from vllm.model_executor.models.transformers.base import VLLM_ATTN_ATTR, Base
 from vllm.model_executor.models.transformers.causal import CausalMixin
 from vllm.model_executor.models.transformers.legacy import LegacyMixin
 from vllm.model_executor.models.transformers.moe import MoEMixin
@@ -126,10 +126,10 @@ ALL_ATTENTION_FUNCTIONS.register("vllm_mla", vllm_mla_attention_forward)
 
 
 # Text only models
-class TransformersForCausalLM(CausalMixin): ...
+class TransformersForCausalLM(CausalMixin, Base): ...
 
 
-class TransformersMoEForCausalLM(MoEMixin, CausalMixin): ...
+class TransformersMoEForCausalLM(MoEMixin, CausalMixin, Base): ...
 
 
 # Multimodal models
@@ -138,7 +138,7 @@ class TransformersMoEForCausalLM(MoEMixin, CausalMixin): ...
     info=MultiModalProcessingInfo,
     dummy_inputs=MultiModalDummyInputsBuilder,
 )
-class TransformersMultiModalForCausalLM(MultiModalMixin, CausalMixin): ...
+class TransformersMultiModalForCausalLM(MultiModalMixin, CausalMixin, Base): ...
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -146,14 +146,16 @@ class TransformersMultiModalForCausalLM(MultiModalMixin, CausalMixin): ...
     info=MultiModalProcessingInfo,
     dummy_inputs=MultiModalDummyInputsBuilder,
 )
-class TransformersMultiModalMoEForCausalLM(MoEMixin, MultiModalMixin, CausalMixin): ...
+class TransformersMultiModalMoEForCausalLM(
+    MoEMixin, MultiModalMixin, CausalMixin, Base
+): ...
 
 
 # Embedding models
-class TransformersEmbeddingModel(EmbeddingMixin, LegacyMixin): ...
+class TransformersEmbeddingModel(EmbeddingMixin, LegacyMixin, Base): ...
 
 
-class TransformersMoEEmbeddingModel(EmbeddingMixin, MoEMixin): ...
+class TransformersMoEEmbeddingModel(EmbeddingMixin, MoEMixin, Base): ...
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -161,17 +163,17 @@ class TransformersMoEEmbeddingModel(EmbeddingMixin, MoEMixin): ...
     info=MultiModalProcessingInfo,
     dummy_inputs=MultiModalDummyInputsBuilder,
 )
-class TransformersMultiModalEmbeddingModel(EmbeddingMixin, MultiModalMixin): ...
+class TransformersMultiModalEmbeddingModel(EmbeddingMixin, MultiModalMixin, Base): ...
 
 
 # Sequence classification models
 class TransformersForSequenceClassification(
-    SequenceClassificationMixin, LegacyMixin
+    SequenceClassificationMixin, LegacyMixin, Base
 ): ...
 
 
 class TransformersMoEForSequenceClassification(
-    SequenceClassificationMixin, MoEMixin
+    SequenceClassificationMixin, MoEMixin, Base
 ): ...
 
 
@@ -181,7 +183,7 @@ class TransformersMoEForSequenceClassification(
     dummy_inputs=MultiModalDummyInputsBuilder,
 )
 class TransformersMultiModalForSequenceClassification(
-    SequenceClassificationMixin, MultiModalMixin
+    SequenceClassificationMixin, MultiModalMixin, Base
 ): ...
 
 

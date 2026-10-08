@@ -131,6 +131,13 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
 
 def _get_moe_router_dtype(
     config: DeepseekV2Config | DeepseekV3Config,
@@ -396,7 +403,6 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fused_shared_expert_enabled
             else None,
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
-            shared_expert_prefix=f"{prefix}.shared_experts",
             router_logits_dtype=self.gate.out_dtype,
         )
 
@@ -541,9 +547,9 @@ class DeepseekV2Attention(nn.Module):
         )
         if config.rope_parameters["rope_type"] != "default":
             config.rope_parameters["rope_type"] = (
-                "deepseek_llama_scaling"
-                if config.rope_parameters.get("attention_factor") == 1.0
-                else "deepseek_yarn"
+                "deepseek_yarn"
+                if config.rope_parameters.get("apply_yarn_scaling", True)
+                else "deepseek_llama_scaling"
             )
 
         self.rotary_emb = get_rope(
@@ -659,18 +665,12 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
-            max_tp_shards=1,
             head_size=self.head_dim,
             dtype=self.dtype,
             cache_role=SparseCacheRole.INDEXER,
         )  # Only has one vector instead of K + V
 
     def forward(self): ...
-
-    @property
-    def uses_shuffled_layout(self) -> bool:
-        """Whether this cache's reader expects the shuffled value layout."""
-        return False
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV32IndexerBackend
@@ -707,17 +707,33 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.head_dim, self.n_head],
-            bias=False,
-            quant_config=None,
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
-        )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
+        if on_gfx906():
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wk",
+            )
+            self.weights_proj = ReplicatedLinear(
+                hidden_size,
+                self.n_head,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.weights_proj",
+            )
+        else:
+            # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
+            # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
+            self.wk_weights_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [self.head_dim, self.n_head],
+                bias=False,
+                quant_config=None,
+                disable_tp=True,
+                prefix=f"{prefix}.wk_weights_proj",
+            )
+        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"
@@ -727,10 +743,20 @@ class Indexer(nn.Module):
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
         #       per self.quant_block_size element
-        assert cache_config is not None
+        self.use_fp16_sparse = on_gfx906() and envs.VLLM_ROCM_MLA_SPARSE_FP16
+        if self.use_fp16_sparse:
+            assert cache_config is not None and cache_config.block_size == 64, (
+                "The gfx906 FP16 sparse MLA path requires block_size=64."
+            )
+        else:
+            assert cache_config is not None
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+            head_dim=(
+                self.head_dim
+                if self.use_fp16_sparse
+                else self.head_dim + self.head_dim // self.quant_block_size * 4
+            ),
+            dtype=torch.float16 if self.use_fp16_sparse else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -766,6 +792,14 @@ class Indexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
+        if on_gfx906():
+            k, _ = self.wk(hidden_states)
+            weights, _ = self.weights_proj(hidden_states)
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
+            weights = kw[:, self.head_dim :]
+
         if current_platform.is_rocm() and self.is_inplace_rope:
             # This path should works on all platform, will remove extra
             # branches in the future
@@ -773,11 +807,6 @@ class Indexer(nn.Module):
             # On ROCm, this is only valid for kernels used as custom ops.
             # In pytorch-native rope for inductor fusion, rotated q/k tensors
             # are not mutated inplace but returned as new tensors.
-            # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
-            k = kw[:, : self.head_dim]
-            weights = kw[:, self.head_dim :]
-
             k = self.k_norm(k)
 
             rotary_emb(
@@ -816,11 +845,6 @@ class Indexer(nn.Module):
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
-            # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
-            k = kw[:, : self.head_dim]
-            weights = kw[:, self.head_dim :]
-
             k = self.k_norm(k)
             k_pe, k_nope = torch.split(
                 k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -839,6 +863,11 @@ class Indexer(nn.Module):
             k = torch.cat([k_pe, k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
+        if self.use_fp16_sparse:
+            q_quant = q.to(torch.float16)
+            weights = weights * self.softmax_scale * self.n_head**-0.5
+            return self.indexer_op(hidden_states, q_quant, k, weights)
+
         q = q.view(-1, self.head_dim)
         q_fp8, q_scale = per_token_group_quant_fp8(
             q,
@@ -857,7 +886,8 @@ class Indexer(nn.Module):
 def _try_load_fp8_indexer_wk(
     name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
 ):
-    """We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
+    """
+    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
     in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.
     Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK
     weights and scale, and when both are available, dequantizes to BF16 and stores into
@@ -917,7 +947,8 @@ def _min_latency_fused_qkv_a_proj_impl(
     input_: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Dynamically run min-latency gemm if num_tokens <= 16.
+    """
+    Dynamically run min-latency gemm if num_tokens <= 16.
     This must be wrapped in a custom op because our torch.compile integration
     does not support runtime dispatching on num_tokens.
     """
@@ -998,7 +1029,8 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
 
 
 class DeepseekV2MLAAttention(nn.Module):
-    """Main reference: DeepseekV2 paper, and FlashInfer Implementation
+    """
+    Main reference: DeepseekV2 paper, and FlashInfer Implementation
     (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
 
         For more info see MLACommonImpl in:
@@ -1114,9 +1146,9 @@ class DeepseekV2MLAAttention(nn.Module):
 
         if config.rope_parameters["rope_type"] != "default":
             config.rope_parameters["rope_type"] = (
-                "deepseek_llama_scaling"
-                if config.rope_parameters.get("attention_factor") == 1.0
-                else "deepseek_yarn"
+                "deepseek_yarn"
+                if config.rope_parameters.get("apply_yarn_scaling", True)
+                else "deepseek_llama_scaling"
             )
 
         self.rotary_emb = get_rope(
@@ -1607,15 +1639,19 @@ class DeepseekV2Model(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
-        _pending_wk_fp8 = getattr(self, "_pending_indexer_wk_fp8", None)
-        if _pending_wk_fp8 is None:
-            self._pending_indexer_wk_fp8 = _pending_wk_fp8 = {}
+        # gfx906 uses the fp16-sparse path (no fp8 indexer wk), so skip the
+        # fused wk_weights_proj mapping there.
+        _pending_wk_fp8: dict = {}
+        if not on_gfx906():
+            _pending_wk_fp8 = getattr(self, "_pending_indexer_wk_fp8", None)
+            if _pending_wk_fp8 is None:
+                self._pending_indexer_wk_fp8 = _pending_wk_fp8 = {}
 
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
+            indexer_fused_mapping = [
+                ("wk_weights_proj", "wk", 0),
+                ("wk_weights_proj", "weights_proj", 1),
+            ]
+            stacked_params_mapping.extend(indexer_fused_mapping)
 
         if self.use_mha:
             stacked_params_mapping.extend(mha_params_mapping)
@@ -1663,7 +1699,7 @@ class DeepseekV2Model(nn.Module):
                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
 
-            if _try_load_fp8_indexer_wk(
+            if not on_gfx906() and _try_load_fp8_indexer_wk(
                 name,
                 loaded_weight,
                 _pending_wk_fp8,

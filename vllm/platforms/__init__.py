@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 
 def vllm_version_matches_substr(substr: str) -> bool:
-    """Check to see if the vLLM version matches a substring."""
+    """
+    Check to see if the vLLM version matches a substring.
+    """
     from importlib.metadata import PackageNotFoundError, version
 
     try:
@@ -119,10 +121,27 @@ def rocm_platform_plugin() -> str | None:
             else:
                 logger.debug("ROCm platform is not available because no GPU is found.")
         finally:
-            amdsmi.amdsmi_shut_down()
+            # A shut_down failure (e.g. AMDSMI_STATUS_NOT_INIT after an init
+            # that returned 0 handles) must not reach the outer except below
+            # and misattribute the detection result.
+            try:
+                amdsmi.amdsmi_shut_down()
+            except Exception as error:
+                logger.debug("amdsmi_shut_down failed during detection: %r", error)
     except Exception as e:
         logger.debug("ROCm platform is not available because: %s", str(e))
 
+    # On some ROCm builds (notably gfx906-native TheRock / ROCm 7.14) amdsmi
+    # returns 0 processor handles after torch has been imported, even though the
+    # GPU works. Fall back to torch.version.hip to detect ROCm robustly.
+    if not is_rocm:
+        try:
+            import torch
+            if torch.version.hip:
+                is_rocm = True
+                logger.debug("Confirmed ROCm platform via torch.version.hip.")
+        except Exception as e:
+            logger.debug("ROCm platform fallback detection failed: %s", str(e))
     if not is_rocm and in_wsl():
         try:
             import torch
@@ -214,15 +233,6 @@ def cpu_platform_plugin() -> str | None:
             logger.debug(
                 "AMD Zen CPU detected but zentorch not installed, "
                 "falling back to CpuPlatform."
-            )
-        except OSError:
-            # An ABI-mismatched build fails here with an undefined-symbol
-            # error; other failures are not known to be safe to recover from.
-            logger.warning(
-                "AMD Zen CPU detected but zentorch failed to import, falling "
-                "back to CpuPlatform. This usually means the zentorch build "
-                "does not match the installed torch version.",
-                exc_info=True,
             )
 
     return "vllm.platforms.cpu.CpuPlatform"

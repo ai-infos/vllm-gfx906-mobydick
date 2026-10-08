@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Radio vision model configuration."""
+"""Radio vision model configuration"""
 
 from typing import Any
 
-from transformers.configuration_utils import PreTrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -20,8 +20,9 @@ OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 OPENAI_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
-class RadioConfig(PreTrainedConfig):
-    r"""This is the configuration class to store the configuration of a Radio
+class RadioConfig(PretrainedConfig):
+    r"""
+    This is the configuration class to store the configuration of a Radio
     vision model. It is used to instantiate a Radio model according to the
     specified arguments, defining the model architecture.
 
@@ -54,7 +55,6 @@ class RadioConfig(PreTrainedConfig):
             dedicated video patch embedder (3*T*P*P -> hidden) separate from the
             image embedder (3*P*P -> hidden). When False, a single embedder with
             input size 3*T*P*P is used for both (images are duplicated T times).
-
     """
 
     model_type = "radio"

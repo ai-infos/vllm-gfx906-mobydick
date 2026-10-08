@@ -3,6 +3,16 @@
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
+## 0. Repository model (local fork)
+
+`main` on this box is a **permanent local fork** of upstream vLLM, not a
+candidate for direct upstream merge. It periodically pulls upstream
+`main`; gfx906 work lands here via reviewed trains from long-lived topic
+branches (dead-ended experiments go to `archive/*` branches, never
+deleted). Section 1's contribution policy governs the separate,
+selective process of contributing upstreamable wins back upstream —
+local train merges follow the review-train checklists instead.
+
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks
@@ -31,7 +41,6 @@ Do not open one-off PRs for tiny edits (single typo, isolated style change, one 
     - Test commands run and results.
     - Model evaluation results when the change affects output, accuracy, or serving.
     - Clear statement that AI assistance was used.
-- Before opening a PR (drafts included) or requesting re-review, run the [`pr-checklist`](.agents/skills/pr-checklist/SKILL.md) skill and address its findings.
 
 ### Fail-closed behavior
 
@@ -114,6 +123,9 @@ pre-commit run --all-files
 
 # Run a specific hook:
 pre-commit run ruff-check --all-files
+
+# Run mypy as it is in CI:
+pre-commit run mypy-3.12 --all-files --hook-stage manual
 ```
 
 The line length limit for Python code is 88 characters. If you are not sure, use pre-commit to check.
@@ -151,6 +163,24 @@ Security reviewers should start with [`SECURITY.md`](SECURITY.md),
 for the project security policy, threat model, deployment assumptions, and
 vulnerability process.
 
+- **gfx906 kernel work**: [`docs/gfx906/`](docs/gfx906/) — the gfx906
+  optimization hub: measured ISA facts, latency-hiding patterns, and the
+  LDS layout standard for MI50, plus the change inventory, benchmark
+  record (`README.md`, the `DEVLOG-*.md` set), run/build recipes
+  (`running.md`), and the roadmap (`ROADMAP.md` for open work,
+  `REFRIGERATOR.md` for parked items). Read the kernel notes before
+  writing or modifying gfx906 kernels or interpreting kernel benchmarks.
+  **Clocks/DVFS**: read [`docs/gfx906/dvfs-mi50.md`](docs/gfx906/dvfs-mi50.md)
+  before trusting any standalone benchmark (idle mclk 350 MHz vs 1 GHz under
+  load; ATen `mm` standalone ≠ the production dispatch — see the "standalone-≠production trap").
+  **Profiling methods**: same doc has the official-vLLM-vs-CUDA-event-harness
+  comparison + verdict (harness stays: only per-module GPU-time method on this
+  host; nsys untested/absent). Full process → skill
+  `mi50-kernel-time-benchmarking`.
+  **Dev logs**: read
+  [`AGENTS.md`](docs/gfx906/AGENTS.md) before writing/updating any
+  `DEVLOG-*.md`/dev-log in `docs/gfx906/` (verdict-first entries, gate
+  rules, grouping, merge-train budget).
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.

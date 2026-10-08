@@ -22,7 +22,9 @@ class AiterCustomAllreduce:
 
     @classmethod
     def effective_max_size(cls) -> int:
-        """Max input byte size eligible for AITER custom allreduce."""
+        """
+        Max input byte size eligible for AITER custom allreduce.
+        """
         return cls.MAX_SIZE // 2
 
     def __init__(

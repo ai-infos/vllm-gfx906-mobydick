@@ -16,7 +16,6 @@ from vllm.outputs import (
     CompletionOutput,
     PoolingOutput,
     PoolingRequestOutput,
-    RequestError,
     RequestOutput,
     SamplingMask,
 )
@@ -50,7 +49,8 @@ EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
 
 
 class RequestOutputCollector:
-    """Collects streamed RequestOutputs per individual request,
+    """
+    Collects streamed RequestOutputs per individual request,
     for hand-off to the consuming asyncio generate task.
 
     When streaming deltas, RequestOutputs are merged if the
@@ -155,7 +155,6 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
-        remote_prefill_cached_tokens: int | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -180,7 +179,6 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
-        self.remote_prefill_cached_tokens = remote_prefill_cached_tokens
         # Per-sequence spec-decode accumulator; arrives once (on finish) via
         # EngineCoreOutput, then attached to this sequence's CompletionOutput.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
@@ -232,18 +230,7 @@ class RequestState:
         log_stats: bool,
         stream_interval: int,
     ) -> "RequestState":
-        remote_prefill_cached_tokens = None
         if sampling_params := request.sampling_params:
-            # In a remote prefill scenario, report cached tokens
-            # as cache hit rate on the remote P worker.
-            if sampling_params.extra_args:
-                kv_transfer_params = sampling_params.extra_args.get(
-                    "kv_transfer_params"
-                )
-                if kv_transfer_params and kv_transfer_params.get("do_remote_prefill"):
-                    cached = kv_transfer_params.get("remote_prefill_cached_tokens")
-                    if isinstance(cached, int):
-                        remote_prefill_cached_tokens = cached
             if not sampling_params.detokenize:
                 tokenizer = None
             output_kind = sampling_params.output_kind
@@ -294,7 +281,6 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
-            remote_prefill_cached_tokens=remote_prefill_cached_tokens,
         )
 
     def make_request_output(
@@ -305,7 +291,6 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
-        error: RequestError | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -344,7 +329,6 @@ class RequestState:
                 external_req_id,
                 [self._new_pooling_output(pooling_output)],
                 finished,
-                error=error,
             )
 
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
@@ -372,7 +356,6 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
-        error: RequestError | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -389,18 +372,13 @@ class RequestState:
                 num_cached_tokens=self.num_cached_tokens,
                 prompt_token_ids=prompt_token_ids,
                 finished=finished,
-                error=error,
             )
         assert self.logprobs_processor is not None
         if self.output_kind == RequestOutputKind.DELTA:
             # Side effect: logprobs processor forgets prompt logprobs
             prompt_logprobs = self.logprobs_processor.pop_prompt_logprobs()
-            prompt_token_id_logprobs = (
-                self.logprobs_processor.pop_prompt_token_id_logprobs()
-            )
         else:
             prompt_logprobs = self.logprobs_processor.prompt_logprobs
-            prompt_token_id_logprobs = self.logprobs_processor.prompt_token_id_logprobs
 
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
@@ -408,7 +386,6 @@ class RequestState:
             prompt=self.prompt,
             prompt_token_ids=prompt_token_ids,
             prompt_logprobs=prompt_logprobs,
-            prompt_token_id_logprobs=prompt_token_id_logprobs,
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
@@ -444,16 +421,10 @@ class RequestState:
             logprobs = logprobs[-num_new_tokens:] if num_new_tokens else logprobs[:0]
 
         sampling_mask = None
-        if (delta or finished) and self.sampling_mask_chunks:
+        if finished and self.sampling_mask_chunks:
             sampling_mask = SamplingMask(
-                [
-                    position
-                    for chunk in self.sampling_mask_chunks
-                    for position in chunk.to_nested_list()
-                ]
+                [chunk.token_ids.tolist() for chunk in self.sampling_mask_chunks]
             )
-            if delta:
-                self.sampling_mask_chunks.clear()
 
         # Concatenate routed experts on finish
         routed_experts = None
@@ -521,6 +492,7 @@ class OutputProcessor:
 
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
+
         for _, state in self.request_states.items():
             assert state.queue is not None
             state.queue.put(e)
@@ -660,7 +632,8 @@ class OutputProcessor:
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
-        """Process the EngineCoreOutputs:
+        """
+        Process the EngineCoreOutputs:
         1) Compute stats for logging
         2) Detokenize
         3) Create and handle RequestOutput objects:
@@ -680,6 +653,7 @@ class OutputProcessor:
         If you need to touch every element of the batch, do it from
         within the loop below.
         """
+
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
         for engine_core_output in engine_core_outputs:
@@ -713,25 +687,10 @@ class OutputProcessor:
                     req_state.num_cache_creation_tokens = (
                         engine_core_output.prefill_stats.num_cache_creation_tokens
                     )
-                if req_state.remote_prefill_cached_tokens is not None:
-                    req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
                 req_state.is_prefilling = False
 
             if engine_core_output.spec_decode_metrics is not None:
                 req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
-
-            request_error = None
-            if (
-                req_state.detokenizer is None
-                and engine_core_output.mm_cache_miss_hashes
-                and finish_reason == FinishReason.ERROR
-            ):
-                request_error = RequestError(
-                    code="multimodal_cache_miss",
-                    message="Multi-modal processor cache miss.",
-                    retryable=True,
-                )
-                pooling_output = EMPTY_CPU_TENSOR
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -760,7 +719,6 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 ec_transfer_params,
-                error=request_error,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

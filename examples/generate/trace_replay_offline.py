@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Trace-replay with vLLM offline inference.
+"""
+Trace-replay with vLLM offline inference.
 
 Trace-replay lets you supply a known sequence of decode token IDs alongside
 the prompt.  Instead of sampling from the model distribution, the engine

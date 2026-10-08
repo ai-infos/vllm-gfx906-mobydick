@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Test DeepEP v2 (ElasticBuffer) dispatch-combine logic.
+"""
+Test DeepEP v2 (ElasticBuffer) dispatch-combine logic.
 Compares against a pure-PyTorch reference MoE implementation.
 """
 

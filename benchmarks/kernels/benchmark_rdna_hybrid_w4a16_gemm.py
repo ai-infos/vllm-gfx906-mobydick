@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark the RDNAHybridW4A16LinearKernel across decode and prefill shapes.
+"""
+Benchmark the RDNAHybridW4A16LinearKernel across decode and prefill shapes.
 
 Usage:
     python benchmark_int4_gemm.py
@@ -15,9 +16,6 @@ import os
 
 import torch
 
-from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
-    pack_skinny_int4,
-)
 from vllm.triton_utils import triton
 
 # ---------------------------------------------------------------------------
@@ -59,25 +57,20 @@ def prepare_hybrid_weights(K, N, group_size, device="cuda"):
 
     Returns (w_q_skinny, w_s_skinny, w_fp16, w_zp). The triton path derives
     its int32 view from w_q_skinny, so no separate int32 buffer is returned.
-
-    Weights go through ``pack_skinny_int4``, the packer the layer uses, so the
-    benchmark sees the production row stride rather than an always-dense one.
     """
     num_groups = K // group_size
 
-    # Values don't matter for throughput, but the layout does.
-    unpacked = torch.randint(0, 16, (N, K), dtype=torch.int32, device=device)
-    w_q_skinny = pack_skinny_int4(unpacked)
-    del unpacked
+    # Random packed weights — actual values don't matter for throughput
+    w_q_skinny_i32 = torch.randint(
+        0, 2**31, (N, K // 8), dtype=torch.int32, device=device
+    )
+    w_q_skinny = w_q_skinny_i32.view(torch.int8).contiguous()
     w_s_skinny = torch.randn(N, num_groups, dtype=torch.float16, device=device) * 0.01
 
-    # Per-group zero-points for asymmetric benchmarks, in the packed layout the
-    # kernels read: [N//8, num_groups] int32, row n's nibble at bits 4*(n%8).
-    zp_raw = torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device)
-    shifts = (torch.arange(8, device=device, dtype=torch.int32) * 4)[:, None]
-    w_zp = torch.sum(
-        (zp_raw.view(N // 8, 8, num_groups) & 0xF) << shifts, dim=1, dtype=torch.int32
-    ).contiguous()
+    # Raw per-group zero-points for asymmetric benchmarks
+    w_zp = torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device).to(
+        torch.float16
+    )
 
     # FP16 baseline for F.linear
     w_fp16 = torch.randn(N, K, dtype=torch.float16, device=device) * 0.01
@@ -105,13 +98,6 @@ PROVIDERS = ["torch-fp16", "hybrid-w4a16", "hybrid-w4a16-zp"]
     )
 )
 def benchmark(batch_size, provider, N, K, group_size, weights):
-    """Time one GEMM.
-
-    ``do_bench`` rather than ``do_bench_cudagraph``: it zeroes a 256 MB buffer
-    between reps, so the weight is read from DRAM as it would be in a model.
-    With a cudagraph replay the weight stays resident in the 32 MB MALL, which
-    flatters wide-BLOCK_N tiles and hides row-stride effects entirely.
-    """
     M = batch_size
     device = "cuda"
     dtype = torch.float16
@@ -121,7 +107,7 @@ def benchmark(batch_size, provider, N, K, group_size, weights):
 
     if provider == "torch-fp16":
         w_fp16 = weights["w_fp16"]
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: torch.nn.functional.linear(a, w_fp16),
             quantiles=quantiles,
         )
@@ -148,7 +134,7 @@ def benchmark(batch_size, provider, N, K, group_size, weights):
                 group_size,
             )
 
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             run,
             quantiles=quantiles,
         )

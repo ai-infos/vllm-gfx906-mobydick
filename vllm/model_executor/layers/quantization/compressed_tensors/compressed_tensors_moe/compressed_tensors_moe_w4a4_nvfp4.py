@@ -38,7 +38,6 @@ _EPLB_SUPPORTED_NVFP4_BACKENDS = frozenset(
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
-        NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
     }
 )
 
@@ -62,6 +61,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             weight_key=kNvfp4Static,
             activation_key=None if use_a16 else kNvfp4Dynamic,
         )
+
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
@@ -155,8 +155,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_weight_scale_2, extra_weight_attrs)
 
         w2_weight_scale_2 = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32),
-            requires_grad=False,
+            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
         )
         layer.register_parameter("w2_weight_global_scale", w2_weight_scale_2)
         extra_weight_attrs.update(
@@ -176,8 +175,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32),
-            requires_grad=False,
+            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
         )
         layer.register_parameter("w2_input_global_scale", w2_input_scale)
         extra_weight_attrs.update(
@@ -186,7 +184,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
+        """
+        Convert NVFP4 MoE weights into kernel format and setup the kernel.
+        """
         # NOTE(rob): wN_weight_packed -> wN_weight is because ModularKernelMethod
         # requires this naming convention. However, the name change breaks
         # reloading because the state dict no longer matches disk. Once we
@@ -295,7 +295,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
-            routing_sink=layer.routing_sink,
         )
 
     def apply(
@@ -306,7 +305,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor | UnfinalizedMoEOutput:
+    ) -> torch.Tensor:
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             x,

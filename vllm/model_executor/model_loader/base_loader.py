@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import time
 from abc import ABC, abstractmethod
 
 import torch
@@ -28,11 +27,6 @@ class BaseModelLoader(ABC):
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
-
-    def get_external_weight_memory(self, vllm_config: VllmConfig) -> int:
-        """Get weights memory from external process;
-        0 when the weights are not external."""
-        return 0
 
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
@@ -71,16 +65,10 @@ class BaseModelLoader(ABC):
         target_device = torch.device(load_device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                time_before_load = time.perf_counter()
                 model = self.create_model(
                     vllm_config=vllm_config,
                     model_config=model_config,
                     prefix=prefix,
-                )
-                time_after_load = time.perf_counter()
-                logger.info_once(
-                    "Initializing model took %.6f seconds",
-                    time_after_load - time_before_load,
                 )
 
             logger.debug("Loading weights on %s ...", load_device)
@@ -101,7 +89,6 @@ class BaseModelLoader(ABC):
                 finalize_layerwise_processing(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
-            log_online_quantization_time(vllm_config)
 
         return model.eval()
 
@@ -116,8 +103,8 @@ def log_model_inspection(model: nn.Module) -> None:
     logger.info("vLLM model structure:\n%s", format_model_inspection(model))
 
 
-def _get_online_quantization_config(vllm_config: VllmConfig):
-    """Return the online quantization config when one is configured."""
+def log_online_quantization(vllm_config: VllmConfig) -> None:
+    """Log the online-quantized layer count and types, when applicable."""
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
@@ -129,32 +116,12 @@ def _get_online_quantization_config(vllm_config: VllmConfig):
     if isinstance(online_quantization_config, OnlineQuantizationConfig):
         quant_config = online_quantization_config
     if not isinstance(quant_config, OnlineQuantizationConfig):
-        return None
-    return quant_config
-
-
-def log_online_quantization(vllm_config: VllmConfig) -> None:
-    """Log the online-quantized layer count and types, when applicable."""
-    quant_config = _get_online_quantization_config(vllm_config)
-    if quant_config is None:
         return
 
     logger.info(
-        "Quantizing %d layers of types: %s",
+        "Quantized %d layers of types: %s",
         len(quant_config.quantized_layers),
         "; ".join(quant_config.quantized_layer_summaries),
-    )
-
-
-def log_online_quantization_time(vllm_config: VllmConfig) -> None:
-    """Log online quantization processing time, when applicable."""
-    quant_config = _get_online_quantization_config(vllm_config)
-    if quant_config is None:
-        return
-
-    logger.info(
-        "Online quantization as part of model loading took %.2f seconds",
-        quant_config.online_quantization_time,
     )
 
 

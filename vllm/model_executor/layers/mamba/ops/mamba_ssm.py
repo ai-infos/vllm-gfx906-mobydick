@@ -67,7 +67,8 @@ def _canonical_cache_dtype(cache_dtype: str) -> str:
 def get_ssm_configs(
     headdim: int, dstate: int, cache_dtype: str
 ) -> dict[int, Any] | None:
-    """Return tuned (BLOCK_SIZE_M, num_warps) configs for *selective_state_update*
+    """
+    Return tuned (BLOCK_SIZE_M, num_warps) configs for *selective_state_update*
     keyed by ``effective_batch = batch * nheads``, or ``None`` if no config
     file is found for the (headdim, dstate, cache_dtype, device) combination.
 
@@ -332,7 +333,15 @@ def _selective_scan_update_kernel(
     if HAS_STATE_BATCH_INDICES:
         if IS_SPEC_DECODING:
             num_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64)
+            # Preserve the existing zero-count clamp while bounding the
+            # accepted-token-derived state lookup to this request's row.
+            # The bound is the ROW stride (elements per batch row), matching
+            # fused_recurrent.py's i_t < stride_indices_seq: for a contiguous
+            # [batch, T] tensor stride(0) == T. stride(1) would be 1 there,
+            # which rejects every accepted count > 1 (and a padded row keeps
+            # any overshoot inside this request's allocated slack).
             init_token_idx = tl.maximum(num_accepted - 1, 0)
+            valid_initial_token = init_token_idx < stride_state_indices_batch
         else:
             init_token_idx = 0
 
@@ -346,9 +355,21 @@ def _selective_scan_update_kernel(
                 dst_state_batch_idx * stride_state_batch + pid_h * stride_state_head
             )
 
-        state_batch_indices_ptr += (
-            pid_b * stride_state_indices_batch + init_token_idx * stride_state_indices_T
-        )
+        state_batch_indices_ptr += pid_b * stride_state_indices_batch
+        if IS_SPEC_DECODING and not valid_initial_token:
+            # Bounds port of upstream PR #50021 (SYV-10, vendored FLA
+            # file): invalid initial token -> zero-fill the output rows
+            # instead of reading state through a garbage block id.
+            # Gated: tests/kernels/mamba/test_spec_decode_bounds.py.
+            offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            zero = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
+            out_ptr += bos * stride_out_batch + pid_h * stride_out_head
+            for _ in range(seq_len):
+                tl.store(out_ptr + offs_m * stride_out_dim, zero, mask=offs_m < dim)
+                out_ptr += stride_out_batch
+            return
+
+        state_batch_indices_ptr += init_token_idx * stride_state_indices_T
         state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     else:
@@ -514,29 +535,30 @@ def selective_state_update(
     enable_stochastic_rounding=False,
     cache_philox_rounds=0,
 ):
-    """Argument:
-    state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
-    x: (batch, dim) or (batch, nheads, dim)
-    dt: (batch, dim) or (batch, nheads, dim)
-    A: (dim, dstate) or (nheads, dim, dstate)
-    B: (batch, dstate) or (batch, ngroups, dstate)
-    C: (batch, dstate) or (batch, ngroups, dstate)
-    D: (dim,) or (nheads, dim)
-    z: (batch, dim) or (batch, nheads, dim)
-    dt_bias: (dim,) or (nheads, dim)
-    null_block_id: int
-        if state_batch_indices is passed, lets the kernel identify
-        padded entries that will not be processed,
-        for example: state_batch_indices = [null_block_id, 1, 20,
-        null_block_id] in this case, the kernel will not process
-        entries at indices 0 and 3
-    out: Preallocated ssm output tensor. Assume same shape as x.
-         In-place updated.
-    num_accepted_tokens: (batch,)
-        number of accepted tokens from previous verification step,
-        tells the kernel which initial state to use
-    cu_seqlens: (batch,)
-        length per sequence, for variable length in speculative decoding cases
+    """
+    Argument:
+        state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
+        x: (batch, dim) or (batch, nheads, dim)
+        dt: (batch, dim) or (batch, nheads, dim)
+        A: (dim, dstate) or (nheads, dim, dstate)
+        B: (batch, dstate) or (batch, ngroups, dstate)
+        C: (batch, dstate) or (batch, ngroups, dstate)
+        D: (dim,) or (nheads, dim)
+        z: (batch, dim) or (batch, nheads, dim)
+        dt_bias: (dim,) or (nheads, dim)
+        null_block_id: int
+            if state_batch_indices is passed, lets the kernel identify
+            padded entries that will not be processed,
+            for example: state_batch_indices = [null_block_id, 1, 20,
+            null_block_id] in this case, the kernel will not process
+            entries at indices 0 and 3
+        out: Preallocated ssm output tensor. Assume same shape as x.
+             In-place updated.
+        num_accepted_tokens: (batch,)
+            number of accepted tokens from previous verification step,
+            tells the kernel which initial state to use
+        cu_seqlens: (batch,)
+            length per sequence, for variable length in speculative decoding cases
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -721,7 +743,8 @@ def selective_scan_fn(
     cu_chunk_seqlen=None,
     last_chunk_indices=None,
 ) -> torch.Tensor:
-    """u: (dim, total_length) for varlen or (batch, dim, seqlen)
+    """
+    u: (dim, total_length) for varlen or (batch, dim, seqlen)
         applies changes in place.
     ssm_states: (batch, dim, dstate) or (batch, nheads, dim, dstate)
         applies changes in place.
@@ -766,12 +789,9 @@ def selective_scan_fn(
     initial_state_idx: (batch,), dtype int32
         The pointer into cache_indices, where the cache block
         containing the initial state is located.
-
-    Returns
-    -------
+    returns
         output: (dim, total_length) for varlen or (batch, dim, seqlen)
                 supports inplace replacement
-
     """
     if u.stride(-1) != 1:
         u = u.contiguous()

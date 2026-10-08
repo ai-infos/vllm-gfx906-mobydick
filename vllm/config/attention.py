@@ -10,7 +10,19 @@ from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-IndexerKVDType = Literal["auto", "bf16", "fp8", "mxfp4", "nvfp4"]
+# gfx906 (Minimax M3): accept fp16/fp32 spellings in addition to the
+# upstream set; see 0ccc37a118 / a0c1d17893.
+IndexerKVDType = Literal[
+    "auto",
+    "bf16",
+    "float16",
+    "fp16",
+    "float32",
+    "fp32",
+    "fp8",
+    "mxfp4",
+    "nvfp4",
+]
 MiniMaxM3MSADecodeBackend = Literal["triton", "cutlass"]
 
 
@@ -86,18 +98,6 @@ class AttentionConfig:
     indexer). Quantized formats (fp8, mxfp4, nvfp4) require indexer kernel
     support in the backend."""
 
-    indexer_sparse_logits: bool = False
-    """DeepSeek V4.1 two-level indexer: score only the candidate blocks with
-    DeepGEMM's sparse MQA-logits kernels instead of computing dense logits over
-    the whole context and masking them. Requires `indexer_kv_dtype="mxfp4"`,
-    an SM100-class GPU, DeepGEMM >= 2.8 and the DeepSelect top-k extension
-    (the top-k runs on the kernels' bf16 logits). The sparse path costs
-    O(candidate blocks) per query regardless of context length, so it pays off
-    for long contexts (roughly 32K tokens and beyond) and is slower below.
-    On ROCm gfx950 it runs aiter's paged MXFP4 MQA-logits kernel over the
-    candidate pool instead, with fp32 logits, and keeps the masked dense walk
-    for steps whose contexts are too short for the pool to pay."""
-
     hisparse_config: HiSparseConfig | None = None
     """HiSparse host-resident KV configuration. Setting this enables experimental
     Model Runner V2-only HiSparse sparse-MLA decode hot-buffering. It is inferred
@@ -146,6 +146,14 @@ class AttentionConfig:
             # layers still use the platform's normal automatic backend.
             self.backend = None
 
+        # gfx906 (MiniMax M3): the Literal accepts the fp16/fp32 spellings;
+        # canonicalize them so downstream dtype resolution never has to know
+        # about the aliases (the indexer maps "float16" -> torch.float16).
+        if self.indexer_kv_dtype == "fp16":
+            self.indexer_kv_dtype = "float16"
+        elif self.indexer_kv_dtype == "fp32":
+            self.indexer_kv_dtype = "float32"
+
     def resolve_indexer_kv_dtype(self, default: IndexerKVDType) -> IndexerKVDType:
         """Resolve `indexer_kv_dtype`, substituting `default` for "auto"."""
         if self.indexer_kv_dtype == "auto":
@@ -153,7 +161,8 @@ class AttentionConfig:
         return self.indexer_kv_dtype
 
     def compute_hash(self) -> str:
-        """Provide a hash that uniquely identifies all the configs
+        """
+        Provide a hash that uniquely identifies all the configs
         that affect the structure of the computation
         graph from input ids/embeddings to the final hidden states,
         excluding anything before input ids/embeddings and after

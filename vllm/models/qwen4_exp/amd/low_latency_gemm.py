@@ -11,4 +11,5 @@ def enable_qwen4_exp_low_latency_gemm(
     dtype: torch.dtype,
 ) -> None:
     """Keep the standard vLLM linear methods on AMD ROCm."""
+
     del module, dtype

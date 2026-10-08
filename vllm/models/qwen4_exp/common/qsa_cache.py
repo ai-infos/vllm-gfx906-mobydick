@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Paged side-cache ownership and metadata for Qwen4Exp QSA.
 
 Each QSA layer keeps a fixed circular buffer of raw index keys (the
@@ -44,9 +45,16 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+# The QSA attention and indexer kernels read 2-byte float activations and caches.
+# Both dtypes share one kernel path; hardware without native bf16 (gfx906) runs
+# the fp16 side, so fp16 is accepted everywhere bf16 is.
+QSA_ACTIVATION_DTYPES: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
+QSA_KV_CACHE_DTYPES: tuple[CacheDType, ...] = ("auto", "float16", "bfloat16")
+
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
+
     if positions.ndim == 1:
         positions = positions.unsqueeze(0).expand(3, -1)
     elif positions.ndim != 2 or positions.shape[0] not in (1, 3):
@@ -114,6 +122,7 @@ def circular_qsa_slot_mapping(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map each request to its fixed physical block as a circular token ring."""
+
     if compressor_state_size <= 0:
         raise ValueError("QSA circular buffer size must be positive")
     if block_table.ndim != 2:
@@ -165,6 +174,7 @@ def compressed_qsa_slot_mapping(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build boundary-only slots for an ``MLAAttentionSpec`` QSA cache."""
+
     if storage_block_size <= 0 or compress_ratio <= 0:
         raise ValueError("QSA block size and compression ratio must be positive")
     compressed_positions = torch.div(
@@ -724,11 +734,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
 class QSAStateBackend(AttentionBackend):
     """Key-only dummy backend for out-of-band QSA side-cache operations."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = list(QSA_ACTIVATION_DTYPES)
     # fp8 entries allow the optional e4m3 compressed indexer cache.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "bfloat16",
+        *QSA_KV_CACHE_DTYPES,
         "fp8",
         "fp8_e4m3",
     ]
@@ -806,9 +815,11 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
 
 
 class QSAKeyStateCache(_QSAStateCache):
-    """Raw BF16 key, optionally followed by exact int64 MRoPE positions."""
+    """Raw 2-byte-float key, optionally followed by exact int64 MRoPE positions."""
 
-    _BF16_PER_INT64 = 4
+    # 8 B per int64 over 2 B per key element; the position tail is viewed as
+    # int64 once bound (see ``bind_kv_cache``).
+    _ELEMS_PER_INT64 = 4
     _NUM_ROPE_AXES = 3
 
     def __init__(self, *, cache_rope_positions: bool = False, **kwargs) -> None:
@@ -816,27 +827,24 @@ class QSAKeyStateCache(_QSAStateCache):
         self.key_head_size = key_head_size
         self.cache_rope_positions = bool(cache_rope_positions)
         self.rope_position_offset = (
-            (key_head_size + self._BF16_PER_INT64 - 1) // self._BF16_PER_INT64
-        ) * self._BF16_PER_INT64
+            (key_head_size + self._ELEMS_PER_INT64 - 1) // self._ELEMS_PER_INT64
+        ) * self._ELEMS_PER_INT64
         storage_head_size = key_head_size
         if self.cache_rope_positions:
             storage_head_size = self.rope_position_offset + (
-                self._NUM_ROPE_AXES * self._BF16_PER_INT64
+                self._NUM_ROPE_AXES * self._ELEMS_PER_INT64
             )
         super().__init__(head_size=storage_head_size, **kwargs)
 
-    # Derived on access so `kv_cache` stays the only reference to the bound
-    # storage: clearing it (e.g. after CUDA graph memory profiling) must free
-    # the cache, or the freed block stays pinned in the allocator.
-    @property
-    def key_cache(self) -> torch.Tensor:
-        return self.kv_cache[..., : self.key_head_size]
-
-    @property
-    def rope_position_cache(self) -> torch.Tensor | None:
-        if not self.cache_rope_positions:
-            return None
-        return self.kv_cache[..., self.rope_position_offset :].view(torch.int64)
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        qsa_cache = self.kv_cache
+        self.key_cache = qsa_cache[..., : self.key_head_size]
+        if self.cache_rope_positions:
+            position_tail = qsa_cache[..., self.rope_position_offset :]
+            self.rope_position_cache = position_tail.view(torch.int64)
+        else:
+            self.rope_position_cache = None
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Hold the open group's committed keys plus every row a speculative
@@ -860,7 +868,7 @@ class QSAKeyStateCache(_QSAStateCache):
 
 
 class QSACompressedKeyCache(_QSAStateCache):
-    """Normed, group-first-RoPE key at one row per complete group."""
+    """Normalized, group-first-RoPE 2-byte-float key at one row per group."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config

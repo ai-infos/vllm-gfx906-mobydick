@@ -497,7 +497,7 @@ def causal_conv1d_fn(
     metadata=None,
     validate_data=False,
 ):
-    """Support varlen + continuous batching when x is 2D tensor.
+    """support varlen + continuous batching when x is 2D tensor
 
     x: (dim,cu_seq_len)
         cu_seq_len = total tokens of all seqs in that batch
@@ -871,9 +871,25 @@ def _causal_conv1d_update_kernel(
         # - accept 1 tokens: [history2, ..., historyM, draft1]
         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
         # - and so on.
-        conv_state_token_offset = (
-            tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1
-        )
+        # Bounds port of upstream PR #50021 (SYV-10, vendored FLA file):
+        # num_accepted outside [1, seqlen] previously read state rows out
+        # of range (positive garbage block id for i_n > 0). Zero-fill and
+        # return. Gated: tests/kernels/mamba/test_spec_decode_bounds.py.
+        num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
+        if (num_accepted < 1) | (num_accepted > seqlen):
+            zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for idx_token in tl.range(seqlen):
+                o_ptrs = (
+                    o_ptr
+                    + o_offset
+                    + idx_token * stride_o_token
+                    + idx_feats * stride_o_dim
+                )
+                tl.store(o_ptrs, zero, mask=idx_feats < dim)
+            if launch_pdl:
+                tl.extra.cuda.gdc_launch_dependents()
+            return
+        conv_state_token_offset = num_accepted - 1
     else:
         conv_state_token_offset = 0
 
@@ -1109,7 +1125,8 @@ def causal_conv1d_update(
     validate_data=False,
     out: torch.Tensor | None = None,
 ):
-    """x: Input tensor which can take the following shapes:
+    """
+    x: Input tensor which can take the following shapes:
 
     - `[batch, dim]` - single token prediction
     - `[batch, dim, seqlen]` - single or multiple tokens prediction

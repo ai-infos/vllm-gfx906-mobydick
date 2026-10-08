@@ -229,7 +229,6 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             max_tokens=1,
             temperature=0.0,
             allowed_token_ids=allowed_token_ids,
-            watermarking=False,
         )
 
         result_generator = self.engine_client.generate(
@@ -359,7 +358,8 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         segment_class: type[SpeechToTextSegment],
         start_time: float = 0,
     ) -> list[SpeechToTextSegment]:
-        """Convert tokens to verbose segments.
+        """
+        Convert tokens to verbose segments.
 
         This method expects the model to produce
         timestamps as tokens (similar to Whisper).

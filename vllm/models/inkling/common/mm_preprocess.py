@@ -13,7 +13,9 @@ import torch
 from transformers.feature_extraction_utils import BatchFeature
 
 from vllm.config.multimodal import (
-    MultiModalDummyOptions,
+    AudioDummyOptions,
+    BaseDummyOptions,
+    ImageDummyOptions,
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import (
@@ -143,7 +145,7 @@ class InklingDummyInputsBuilder(BaseDummyInputsBuilder[InklingProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: MultiModalDummyOptions,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         config = self.info.get_hf_config()
         num_images = mm_counts.get("image", 0)
@@ -154,11 +156,12 @@ class InklingDummyInputsBuilder(BaseDummyInputsBuilder[InklingProcessingInfo]):
             patch_size = getattr(config.vision_config, "patch_size", 40)
             # A square image ~4 patches wide so the dummy emits several patches.
             side = patch_size * 4
+            image_overrides = mm_options.get("image")
             mm_data["image"] = self._get_dummy_images(
                 width=side,
                 height=side,
                 num_images=num_images,
-                overrides=mm_options.get("image"),
+                overrides=cast(ImageDummyOptions | None, image_overrides),
             )
         if num_audios:
             # Size the dummy at the maximum allowed audio so memory/encoder
@@ -166,10 +169,11 @@ class InklingDummyInputsBuilder(BaseDummyInputsBuilder[InklingProcessingInfo]):
             params = self.info.get_hf_processor().audio_feature_extractor.params
             hop = int(round(params.audio_token_duration_s * params.sample_rate))
             audio_len = MAX_AUDIO_TOKENS * hop
+            audio_overrides = mm_options.get("audio")
             mm_data["audio"] = self._get_dummy_audios(
                 length=audio_len,
                 num_audios=num_audios,
-                overrides=mm_options.get("audio"),
+                overrides=cast(AudioDummyOptions | None, audio_overrides),
             )
         return mm_data
 
@@ -178,19 +182,20 @@ class InklingMultiModalProcessor(BaseMultiModalProcessor[InklingProcessingInfo])
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        mm_data, hf_kwargs, passthrough_data = self._get_hf_mm_inputs(
-            mm_items, hf_kwargs
+        valid_mm_items = mm_items.select(
+            {k for k, c in mm_items.get_all_counts().items() if c > 0}
         )
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
 
         prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
 
-        processor = self.info.get_hf_processor(**hf_kwargs)
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
 
         images = mm_data.get("images") or []
-        audios = mm_data.get("audio") or []
+        audios = mm_data.get("audios") or []
         if not isinstance(images, list):
             images = list(cast(Iterable[Any], images))
         if not isinstance(audios, list):
@@ -230,9 +235,8 @@ class InklingMultiModalProcessor(BaseMultiModalProcessor[InklingProcessingInfo])
             data["num_audio_tokens"] = torch.tensor(num_audio_tokens, dtype=torch.int64)
 
         processed_data = BatchFeature(data=data, tensor_type=None)
-        return self._finalize_hf_mm_data(
-            mm_data, hf_kwargs, passthrough_data, processed_data
-        )
+        processed_data.update(passthrough_data)
+        return processed_data
 
     def _tokenize_with_placeholders(
         self,

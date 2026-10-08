@@ -6,11 +6,13 @@ import logging
 import os
 import uuid
 
-from vllm import LLM
+from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
+from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader.tensorizer import (
     TensorizerArgs,
     TensorizerConfig,
+    tensorize_lora_adapter,
     tensorize_vllm_model,
     tensorizer_kwargs_arg,
 )
@@ -103,6 +105,21 @@ loading with tensorizer that are given to `TensorizerConfig`, run:
 under the `tensorizer options` section. These can also be used for
 deserialization in this example script, although `--tensorizer-uri` and
 `--path-to-tensors` are functionally the same in this case.
+
+Tensorizer can also be used to save and load LoRA adapters. A LoRA adapter
+can be serialized directly with the path to the LoRA adapter on HF Hub and
+a TensorizerConfig object. In this script, passing a HF id to a LoRA adapter
+will serialize the LoRA adapter artifacts to `--serialized-directory`.
+
+You can then use the LoRA adapter with `vllm serve`, for instance, by ensuring 
+the LoRA artifacts are in your model artifacts directory and specifying 
+`--enable-lora`. For instance:
+
+```
+vllm serve s3://my-bucket/vllm/facebook/opt-125m/v1 \
+    --load-format tensorizer \
+    --enable-lora 
+```
 """
 
 
@@ -116,6 +133,18 @@ def get_parser():
         "use it."
     )
     parser = EngineArgs.add_cli_args(parser)
+
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        required=False,
+        help="Path to a LoRA adapter to "
+        "serialize along with model tensors. This can then be deserialized "
+        "along with the model by instantiating a TensorizerConfig object, "
+        "creating a dict from it with TensorizerConfig.to_serializable(), "
+        "and passing it to LoRARequest's initializer with the kwarg "
+        "tensorizer_config_dict.",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -234,12 +263,42 @@ def merge_extra_config_with_tensorizer_config(extra_cfg: dict, cfg: TensorizerCo
 
 
 def deserialize(args, tensorizer_config):
-    llm = LLM(
-        model=args.model,
-        load_format="tensorizer",
-        tensor_parallel_size=args.tensor_parallel_size,
-        model_loader_extra_config=tensorizer_config,
-    )
+    if args.lora_path:
+        tensorizer_config.lora_dir = tensorizer_config.tensorizer_dir
+        llm = LLM(
+            model=args.model,
+            load_format="tensorizer",
+            tensor_parallel_size=args.tensor_parallel_size,
+            model_loader_extra_config=tensorizer_config,
+            enable_lora=True,
+        )
+        sampling_params = SamplingParams(
+            temperature=0, max_tokens=256, stop=["[/assistant]"]
+        )
+
+        # Truncating this as the extra text isn't necessary
+        prompts = ["[user] Write a SQL query to answer the question based on ..."]
+
+        # Test LoRA load
+        print(
+            llm.generate(
+                prompts,
+                sampling_params,
+                lora_request=LoRARequest(
+                    "sql-lora",
+                    1,
+                    args.lora_path,
+                    tensorizer_config_dict=tensorizer_config.to_serializable(),
+                ),
+            )
+        )
+    else:
+        llm = LLM(
+            model=args.model,
+            load_format="tensorizer",
+            tensor_parallel_size=args.tensor_parallel_size,
+            model_loader_extra_config=tensorizer_config,
+        )
     return llm
 
 
@@ -306,6 +365,10 @@ def main():
             serialization_kwargs=args.serialization_kwargs or {},
             **credentials,
         )
+
+        if args.lora_path:
+            tensorizer_config.lora_dir = tensorizer_config.tensorizer_dir
+            tensorize_lora_adapter(args.lora_path, tensorizer_config)
 
         merge_extra_config_with_tensorizer_config(extra_config, tensorizer_config)
         tensorize_vllm_model(engine_args, tensorizer_config)

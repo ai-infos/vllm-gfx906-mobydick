@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -47,10 +47,8 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   9: Add block_strides
 #  10: Add dense virtual transfer pages for compressed MLA caches
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
-#  12: Add per-region member names for PP push
-#  13: Add packed-member layouts and order-independent packed-push backend hashes
 #
-NIXL_CONNECTOR_VERSION: int = 13
+NIXL_CONNECTOR_VERSION: int = 11
 
 
 @dataclass
@@ -73,15 +71,12 @@ class NixlAgentMetadata:
     region_mem_types: list[str] | None = None
     dcp_size: int = 1
     pcp_size: int = 1
-    # Layer names sharing each advertised region, in region order.
-    region_members: list[list[str]] = field(default_factory=list)
-    # Packed member -> (byte offset in its region's block, bytes per page).
-    packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass
 class NixlHandshakePayload(KVConnectorHandshakeMetadata):
-    """Wrapper for NIXL handshake sent over the wire.
+    """
+    Wrapper for NIXL handshake sent over the wire.
 
     Enables two-phase decoding for graceful compatibility checking:
     1. Decode NixlHandshakePayload to get compatibility_hash
@@ -144,7 +139,8 @@ def compute_nixl_compatibility_hash(
     attn_backend_name: str,
     transfer_mode: str = "pull",
 ) -> str:
-    """Compute compatibility hash for NIXL KV transfer.
+    """
+    Compute compatibility hash for NIXL KV transfer.
 
     Hash only the factors that affect whether two NIXL instances can
     successfully transfer KV cache data.
@@ -170,7 +166,6 @@ def compute_nixl_compatibility_hash(
 
     Returns:
         SHA-256 hex digest
-
     """
     from vllm import __version__ as vllm_version
     from vllm.config.utils import hash_factors

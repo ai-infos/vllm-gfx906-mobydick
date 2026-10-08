@@ -82,7 +82,6 @@ def register_quantization_config(quantization: str):
         >>>
         >>> get_quantization_config("my_quant")
         <class 'MyQuantConfig'>
-
     """  # noqa: E501
 
     def _wrapper(quant_config_cls):

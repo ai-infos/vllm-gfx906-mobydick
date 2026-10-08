@@ -13,7 +13,6 @@ import soundfile as sf
 import vllm.benchmarks.datasets.datasets as datasets_module
 import vllm.benchmarks.lib.endpoint_request_func as request_func_module
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
-from vllm.tokenizers import TokenizerLike
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -43,10 +42,6 @@ class CohereAsrTokenizer(_Tokenizer):
 class _CohereNameOnlyTokenizer(_Tokenizer):
     def __init__(self) -> None:
         super().__init__("cohere/some-local-checkpoint")
-
-
-def _as_tokenizer(tokenizer: _Tokenizer) -> TokenizerLike:
-    return cast(TokenizerLike, tokenizer)
 
 
 def _write_wav(path: Path, duration_s: float = 0.1, sample_rate: int = 16_000) -> None:
@@ -98,17 +93,6 @@ class _FakeSession:
         return _FakeResponse()
 
 
-class _FakeProfileSession:
-    def __init__(self) -> None:
-        self.url: str | None = None
-        self.headers: dict[str, str] | None = None
-
-    def post(self, *, url: str, headers: dict[str, str]):
-        self.url = url
-        self.headers = headers
-        return _FakeResponse()
-
-
 def test_asr_dataset_sample_handles_local_audio_paths(tmp_path: Path) -> None:
     audio_path = tmp_path / "earnings.wav"
     _write_wav(audio_path, duration_s=0.1)
@@ -125,7 +109,7 @@ def test_asr_dataset_sample_handles_local_audio_paths(tmp_path: Path) -> None:
     ]
 
     samples = dataset.sample(
-        tokenizer=_as_tokenizer(_Tokenizer()),
+        tokenizer=_Tokenizer(),
         num_requests=1,
         output_len=32,
         asr_min_audio_len_sec=0.0,
@@ -162,7 +146,7 @@ def test_asr_dataset_sample_handles_embedded_audio_bytes(
     ]
 
     samples = dataset.sample(
-        tokenizer=_as_tokenizer(_Tokenizer()),
+        tokenizer=_Tokenizer(),
         num_requests=1,
         output_len=32,
         asr_min_audio_len_sec=0.0,
@@ -233,42 +217,6 @@ def test_async_request_openai_audio_handles_decoded_audio_arrays(
     assert output.generated_text == "hello"
 
 
-def test_audio_request_rejects_profile_endpoint() -> None:
-    request_input = RequestFuncInput(
-        prompt="",
-        api_url="http://localhost:8000/start_profile",
-        prompt_len=1,
-        output_len=32,
-        model="openai/whisper-large-v3",
-    )
-
-    with pytest.raises(ValueError, match="OpenAI Audio API"):
-        asyncio.run(
-            request_func_module.async_request_openai_audio(
-                request_input, _FakeProfileSession()
-            )
-        )
-
-
-@pytest.mark.parametrize("endpoint", ["start_profile", "stop_profile"])
-def test_audio_benchmark_profile_request_has_no_inference_payload(
-    endpoint: str,
-) -> None:
-    session = _FakeProfileSession()
-
-    output = asyncio.run(
-        request_func_module.async_request_profile(
-            f"http://localhost:8000/{endpoint}",
-            session,
-            extra_headers={"X-Test-Header": "profile"},
-        )
-    )
-
-    assert output.success is True
-    assert session.url == f"http://localhost:8000/{endpoint}"
-    assert session.headers == {"X-Test-Header": "profile"}
-
-
 _COHERE_ASR_PROMPT = (
     "<|startofcontext|><|startoftranscript|>"
     "<|emo:undefined|><|en|><|en|><|pnc|><|noitn|>"
@@ -292,7 +240,7 @@ def _make_asr_dataset(tmp_path: Path) -> datasets_module.ASRDataset:
 def test_asr_dataset_cohere_class_name_gets_decoder_prompt(tmp_path: Path) -> None:
     dataset = _make_asr_dataset(tmp_path)
     samples = dataset.sample(
-        tokenizer=_as_tokenizer(CohereAsrTokenizer()),
+        tokenizer=CohereAsrTokenizer(),
         num_requests=1,
         output_len=32,
         asr_min_audio_len_sec=0.0,
@@ -307,7 +255,7 @@ def test_asr_dataset_cohere_name_or_path_fallback_gets_decoder_prompt(
 ) -> None:
     dataset = _make_asr_dataset(tmp_path)
     samples = dataset.sample(
-        tokenizer=_as_tokenizer(_CohereNameOnlyTokenizer()),
+        tokenizer=_CohereNameOnlyTokenizer(),
         num_requests=1,
         output_len=32,
         asr_min_audio_len_sec=0.0,
@@ -320,7 +268,7 @@ def test_asr_dataset_cohere_name_or_path_fallback_gets_decoder_prompt(
 def test_asr_dataset_unknown_tokenizer_gets_empty_prompt(tmp_path: Path) -> None:
     dataset = _make_asr_dataset(tmp_path)
     samples = dataset.sample(
-        tokenizer=_as_tokenizer(_Tokenizer(name_or_path="some-other/asr-model")),
+        tokenizer=_Tokenizer(name_or_path="some-other/asr-model"),
         num_requests=1,
         output_len=32,
         asr_min_audio_len_sec=0.0,

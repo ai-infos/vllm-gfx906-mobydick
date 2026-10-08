@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -109,7 +109,7 @@ class ClsToken(nn.Module):
 class ViTPatchGenerator(nn.Module):
     def __init__(
         self,
-        #  config: PreTrainedConfig,
+        #  config: PretrainedConfig,
         patch_size: int,
         embed_dim: int,
         input_dims: input_dim_t,
@@ -227,7 +227,6 @@ class ViTPatchGenerator(nn.Module):
 
         Returns:
             Embedded patches with temporal compression applied.
-
         """
         assert self.temporal_patch_size > 1
         T = self.temporal_patch_size
@@ -535,7 +534,7 @@ class RadioInternVisionModel(nn.Module):
 
     def __init__(
         self,
-        config: PreTrainedConfig = None,
+        config: PretrainedConfig = None,
         quant_config: QuantizationConfig | None = None,
         *,
         num_hidden_layers_override: int | None = None,
@@ -670,7 +669,7 @@ class RadioModel(nn.Module):
 
     def __init__(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         quant_config: QuantizationConfig | None = None,
         *,
         num_hidden_layers_override: int | None = None,

@@ -11,7 +11,6 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
@@ -24,12 +23,6 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
     """
 
     uses_meta_device: bool = True
-
-    def set_requantization_source(self, source_method: QuantizeMethodBase) -> None:
-        """Reject requantization from a checkpoint-quantized MoE method."""
-        raise NotImplementedError(
-            "Requantizing checkpoint-quantized MoE layers is not supported."
-        )
 
     def create_weights(
         self,
@@ -163,7 +156,6 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
-            routing_sink=layer.routing_sink,
         )
 
     def apply(
@@ -174,7 +166,7 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor | UnfinalizedMoEOutput:
+    ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

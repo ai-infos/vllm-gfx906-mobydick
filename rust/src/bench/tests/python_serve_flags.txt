@@ -86,6 +86,9 @@
 --sharegpt-output-len
 --skip-chat-template
 --skip-tokenizer-init
+--sonnet-input-len
+--sonnet-output-len
+--sonnet-prefix-len
 --spec-bench-category
 --spec-bench-output-len
 --speed-bench-category

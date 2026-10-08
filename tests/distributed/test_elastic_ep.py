@@ -10,8 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import requests
 
-from vllm.platforms import current_platform
-
 from ..evals.gsm8k.gsm8k_eval import evaluate_gsm8k
 from ..utils import RemoteOpenAIServer, multi_gpu_test
 
@@ -235,8 +233,6 @@ def test_elastic_ep_scaling(
 
     if not has_nixl():
         pytest.skip("Async EPLB with elastic EP requires NIXL (not installed)")
-    if current_platform.is_xpu():
-        pytest.skip("Elastic EP with NIXL is not supported on XPU")
     if all2all_backend == "nixl_ep" and not has_nixl_ep():
         pytest.skip("NIXL EP is not installed")
 

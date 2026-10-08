@@ -24,17 +24,14 @@ if TYPE_CHECKING:
 
 
 class AiterFlashAttnPrefillBackend(MLAPrefillBackend):
-    """AITER FlashAttention backend for MLA prefill."""
+    """AITER FlashAttention backend for MLA prefill"""
 
     @staticmethod
     def get_name() -> str:
         return "ROCM_AITER_FA"
 
     @classmethod
-    def supports_compute_capability(
-        cls,
-        device_capability: "DeviceCapability | None",
-    ) -> bool:
+    def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
         if not current_platform.is_rocm():
             return False
         from vllm.platforms.rocm import on_mi3xx

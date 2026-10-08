@@ -4,10 +4,9 @@
 
 An encoder-only instance -- `--mm-encoder-only`, or the producer side of
 encoder-cache disaggregation -- encodes the multi-modal items and publishes the
-embeddings. It runs no language model: no KV cache, sampler, or decoder graphs.
+embeddings. It runs no language model: no KV cache, no sampler, no CUDA graphs.
 """
 
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
@@ -16,9 +15,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
-from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import (
     ModelRunnerOutput,
@@ -27,12 +24,9 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm.v1.worker.workspace import lock_workspace
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-
-logger = init_logger(__name__)
 
 
 class MMEncoderModelRunner(GPUModelRunner):
@@ -73,31 +67,8 @@ class MMEncoderModelRunner(GPUModelRunner):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 
-    @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
-        encoder_runner = self.model_state.encoder_runner
-        if not encoder_runner.has_cudagraph():
-            return 0
-
-        start_time = time.perf_counter()
-        with freeze_gc_for_cudagraph_capture():
-            torch.accelerator.empty_cache()
-            start_free_memory = torch.accelerator.get_memory_info()[0]
-            encoder_runner.capture()
-            graph_memory = start_free_memory - torch.accelerator.get_memory_info()[0]
-
-        if not profile_only:
-            lock_workspace()
-
-        manager = encoder_runner.cudagraph_manager
-        assert manager is not None
-        logger.info(
-            "Encoder graph capturing finished in %.0f secs, took %.2f GiB (%d graphs)",
-            time.perf_counter() - start_time,
-            graph_memory / (1 << 30),
-            manager.get_num_graphs_to_capture(),
-        )
-        return graph_memory
+        return 0
 
     def needs_cudagraph_capture(self) -> bool:
         return False
@@ -143,15 +114,13 @@ class MMEncoderModelRunner(GPUModelRunner):
 
             batch_req_state, _ = self.gather_batch_req_state(scheduler_output, False)
             assert batch_req_state is not None
-            # No decoder graph or DP padding; encoder graphs run independently.
+            # No CUDA graph, and no DP peer to agree a padded shape with.
             batch_desc = BatchExecutionDescriptor(
                 cg_mode=CUDAGraphMode.NONE,
                 num_tokens=batch_req_state.num_tokens,
                 num_reqs=None,
             )
-            self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc, num_active_loras=0
-            )
+            self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
 
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if self.lora_config is not None:

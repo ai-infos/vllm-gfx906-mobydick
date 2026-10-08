@@ -36,13 +36,11 @@ void moe_sum(torch::stable::Tensor& input, torch::stable::Tensor& output,
              std::optional<torch::stable::Tensor> topk_ids,
              std::optional<torch::stable::Tensor> expert_map);
 
-void moe_align_block_size(torch::stable::Tensor topk_ids, int64_t num_experts,
-                          int64_t block_size,
-                          torch::stable::Tensor sorted_token_ids,
-                          torch::stable::Tensor experts_ids,
-                          torch::stable::Tensor num_tokens_post_pad,
-                          std::optional<torch::stable::Tensor> maybe_expert_map,
-                          std::optional<torch::stable::Tensor> scatter_idx);
+void moe_align_block_size(
+    torch::stable::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+    torch::stable::Tensor sorted_token_ids, torch::stable::Tensor experts_ids,
+    torch::stable::Tensor num_tokens_post_pad,
+    std::optional<torch::stable::Tensor> maybe_expert_map);
 
 void batched_moe_align_block_size(
     int64_t max_tokens_per_batch, int64_t block_size,
@@ -58,7 +56,6 @@ void moe_lora_align_block_size(
     torch::stable::Tensor num_tokens_post_pad,
     torch::stable::Tensor adapter_enabled, torch::stable::Tensor lora_ids,
     std::optional<torch::stable::Tensor> maybe_expert_map);
-#ifndef USE_ROCM
 torch::stable::Tensor moe_wna16_gemm(
     torch::stable::Tensor input, torch::stable::Tensor output,
     torch::stable::Tensor b_qweight, torch::stable::Tensor b_scales,
@@ -69,6 +66,7 @@ torch::stable::Tensor moe_wna16_gemm(
     int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N, int64_t BLOCK_SIZE_K,
     int64_t bit);
 
+#ifndef USE_ROCM
 std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
     const torch::stable::Tensor& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,

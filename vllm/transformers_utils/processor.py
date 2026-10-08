@@ -80,7 +80,9 @@ _V = TypeVar("_V", bound=BaseVideoProcessor, default=BaseVideoProcessor)
 
 
 class HashableDict(dict):
-    """A dictionary that can be hashed by lru_cache."""
+    """
+    A dictionary that can be hashed by lru_cache.
+    """
 
     # NOTE: pythonic dict is not hashable,
     # we override on it directly for simplicity
@@ -89,7 +91,9 @@ class HashableDict(dict):
 
 
 class HashableList(list):
-    """A list that can be hashed by lru_cache."""
+    """
+    A list that can be hashed by lru_cache.
+    """
 
     def __hash__(self) -> int:  # type: ignore[override]
         return hash(tuple(self))
@@ -181,11 +185,7 @@ def get_video_processor_cls_name_from_config(
     # given type when torchvision is unavailable; callers then use opencv.
     model_config = get_hf_file_to_dict("config.json", processor_name, revision=revision)
     if model_config and "model_type" in model_config:
-        video_processor = VIDEO_PROCESSOR_MAPPING_NAMES.get(model_config["model_type"])
-        # Transformers >= 5.19 maps to {"torchvision": name}
-        if isinstance(video_processor, dict):
-            video_processor = video_processor.get("torchvision")
-        return video_processor
+        return VIDEO_PROCESSOR_MAPPING_NAMES.get(model_config["model_type"])
     return None
 
 

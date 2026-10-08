@@ -25,7 +25,6 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.model_executor.models import (
     supports_multimodal,
     supports_multimodal_embeddings,
@@ -36,6 +35,7 @@ from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.model_executor.models.qwen3_eagle3 import Eagle3Qwen3ForCausalLM
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -165,7 +165,10 @@ class SpecDecodeBaseProposer:
         self.max_positions = self.max_num_tokens
 
         # Multi-modal data support
-        self.supports_mm_inputs = vllm_config.model_config.supports_multimodal_inputs
+        self.mm_registry = MULTIMODAL_REGISTRY
+        self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
+            vllm_config.model_config
+        )
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
@@ -296,6 +299,16 @@ class SpecDecodeBaseProposer:
                 DeepseekV32IndexerMetadata,
                 MiniMaxM3SparseMetadata,
             ]
+            # gfx906 custom FA backend: opt its metadata into the multi-step
+            # drafting allowlist (same shape contract as RocmAttentionMetadata
+            # for the draft loop: num_actual_tokens / max_query_len /
+            # query_start_loc / seq_lens).
+            from vllm.platforms.rocm import on_gfx906
+
+            if on_gfx906():
+                from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FAMetadata
+
+                rocm_types.append(Gfx906FAMetadata)
             # ROCM_AITER_FA is an optional backend
             # We check is_enabled() here to avoid importing the backend module during
             # auto-discovery when VLLM_ROCM_USE_AITER=0, which would trigger aiter
@@ -306,11 +319,26 @@ class SpecDecodeBaseProposer:
             if find_spec(
                 AttentionBackendEnum.ROCM_AITER_FA.get_path(include_classname=False)
             ):
-                from vllm.v1.attention.backends.rocm_aiter_fa import (
-                    AiterFlashAttentionMetadata,
-                )
-
-                rocm_types.append(AiterFlashAttentionMetadata)
+                # The module can exist while its optional `aiter` package is
+                # absent (e.g. gfx906 builds ship no AITER: its kernels are not
+                # usable there). Spec decode must not depend on an optional
+                # attention backend's third-party package, so a missing
+                # dependency skips the metadata type instead of failing drafter
+                # init (0.29 regression: the module-level aiter import in
+                # rocm_aiter_fa.py turned every MTP/EAGLE serve into an
+                # `ModuleNotFoundError` on such boxes).
+                try:
+                    from vllm.v1.attention.backends.rocm_aiter_fa import (
+                        AiterFlashAttentionMetadata,
+                    )
+                except ImportError as exc:
+                    logger.warning_once(
+                        "Skipping the ROCM_AITER_FA metadata type for the "
+                        "drafter: %s",
+                        exc,
+                    )
+                else:
+                    rocm_types.append(AiterFlashAttentionMetadata)
 
             # TRITON_MLA backend support for MLA models (e.g., DeepSeek)
             from vllm.model_executor.layers.attention.mla_attention import (
@@ -1021,7 +1049,8 @@ class SpecDecodeBaseProposer:
         gpu_input_batch: InputBatch,
         num_scheduled_tokens: dict[str, int],
     ) -> torch.Tensor:
-        """This function is used to prepare the inputs for speculative decoding.
+        """
+        This function is used to prepare the inputs for speculative decoding.
         It calculates the next token ids for each request based on the sampled
         token ids from the CPU. If a request has no sampled token ids (e.g.,
         during the initial decoding steps), it falls back to using the request
@@ -1053,7 +1082,8 @@ class SpecDecodeBaseProposer:
         gpu_input_batch: InputBatch,
         discard_request_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This function is used to prepare the inputs for speculative decoding.
+        """
+        This function is used to prepare the inputs for speculative decoding.
         It calculates the next token ids and the number of valid sampled tokens
         for each request, considering the "discarded" requests whose next token
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
@@ -1102,7 +1132,8 @@ class SpecDecodeBaseProposer:
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
     ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
-        """This function is used to prepare the inputs for speculative decoding
+        """
+        This function is used to prepare the inputs for speculative decoding
         It updates the common_attn_metadata for speculative decoding,
         but does not consider the rejected tokens. Instead, all tokens
         are included as inputs to the speculator, with the rejected tokens
@@ -1160,7 +1191,8 @@ class SpecDecodeBaseProposer:
         sampled_token_ids: list[list[int]],
         num_draft_tokens: list[int],
     ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
-        """This function is used to prepare the inputs for speculative decoding.
+        """
+        This function is used to prepare the inputs for speculative decoding.
         It updates to the common_attn_metadata to account for the rejected
         tokens (and newly sampled tokens). It also returns the token indices
         of the tokens that should be fed to the speculator.
@@ -1279,6 +1311,7 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
@@ -1301,8 +1334,10 @@ class SpecDecodeBaseProposer:
 
         return base
 
+
     def _get_model(self) -> nn.Module:
-        """Default method to call get_model(). Can be overridden by subclasses which
+        """
+        Default method to call get_model(). Can be overridden by subclasses which
         need to customize model loading.
         """
         from vllm.compilation.backends import set_model_tag
@@ -1312,7 +1347,7 @@ class SpecDecodeBaseProposer:
             model = get_model(
                 vllm_config=draft_vllm_config,
                 model_config=self.speculative_config.draft_model_config,
-                load_config=get_draft_load_config(draft_vllm_config),
+                load_config=self.speculative_config.draft_load_config,
             )
         return model
 
@@ -1414,7 +1449,8 @@ class SpecDecodeBaseProposer:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
-        """Some draft models may not have their own embedding layers, and some may
+        """
+        Some draft models may not have their own embedding layers, and some may
         have a duplicate copy of the target model's embedding layers. In these cases,
         we share the target model's embedding layers with the draft model to save
         memory.
@@ -1506,7 +1542,8 @@ class SpecDecodeBaseProposer:
             )
 
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
-        """Some draft models may not have their own LM head, and some may have a
+        """
+        Some draft models may not have their own LM head, and some may have a
         duplicate copy of the target model's LM head. In these cases, we share
         the target model's LM head with the draft model to save memory.
         """
@@ -1670,7 +1707,8 @@ class SpecDecodeBaseProposer:
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
-        """Some eagle3 heads (e.g., nvidia/gpt-oss-120b-Eagle3-v2) do not use auxiliary
+        """
+        Some eagle3 heads (e.g., nvidia/gpt-oss-120b-Eagle3-v2) do not use auxiliary
         hidden states and directly uses the last layer output just like eagle1.
         They might indicate this by setting "use_aux_hidden_state" to False
         inside the "eagle_config" dict of their hf_config.
@@ -1685,7 +1723,8 @@ class SpecDecodeBaseProposer:
         return use_aux_hidden_state
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
-        """Validate that all drafting layers belong to the same KVCacheGroup.
+        """
+        Validate that all drafting layers belong to the same KVCacheGroup.
         Need this assumption to ensure all drafting layers can use the
         same AttentionMetadata.
         May extend to multiple AttentionMetadata in the future.
@@ -1711,7 +1750,8 @@ class SpecDecodeBaseProposer:
         kv_cache_config: KVCacheConfig,
         kernel_block_sizes: list[int] | None = None,
     ) -> None:
-        """Initialize AttentionGroups for draft layers using kv_cache_config.
+        """
+        Initialize AttentionGroups for draft layers using kv_cache_config.
         Called from the model runner's initialize_metadata_builders.
         """
         all_attn_layers = get_layers_from_vllm_config(

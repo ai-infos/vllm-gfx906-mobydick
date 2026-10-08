@@ -3,7 +3,9 @@
 import sys
 from abc import ABC, abstractmethod
 
+import tokenizers
 import tokenizers.decoders
+from packaging import version
 from tokenizers import Tokenizer
 from transformers import TokenizersBackend
 
@@ -18,13 +20,12 @@ from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
 
+# Only tokenizers >= 0.22.0 supports DecodeStream with native prefill
+# (ids parameter) used for FastIncrementalDetokenizer.
+USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0.22.0")
+
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
-
-
-def uses_fast_detokenizer(tokenizer: TokenizerLike) -> bool:
-    """Whether the engine detokenizes with `FastIncrementalDetokenizer`."""
-    return isinstance(tokenizer, TokenizersBackend)
 
 
 class IncrementalDetokenizer:
@@ -57,7 +58,7 @@ class IncrementalDetokenizer:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
-        if uses_fast_detokenizer(tokenizer):
+        if USE_FAST_DETOKENIZER and isinstance(tokenizer, TokenizersBackend):
             # Fast tokenizer => use tokenizers library DecodeStream.
             return FastIncrementalDetokenizer(tokenizer, request)
 
@@ -93,7 +94,8 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         self.output_text = ""
 
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
-        """Update RequestState for the request_id by:
+        """
+        Update RequestState for the request_id by:
             1) Detokenize the new token ids incrementally.
             2) Evaluate stop criteria.
 
@@ -147,6 +149,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         """If delta is True, only new text since the last call to
         this method is returned"""
+
         # We return the full output text if the sequence is finished.
         buffer_length = 0 if finished else self.stop_buffer_length
         if not delta:

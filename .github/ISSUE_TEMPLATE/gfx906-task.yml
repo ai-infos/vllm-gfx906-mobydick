@@ -1,0 +1,55 @@
+name: 🧩 gfx906 task (perf / infra / onboarding)
+description: Internal gfx906 work item — kernel, dispatch, serving, build, host, model onboarding.
+title: "[gfx906]: "
+labels: ["roadmap"]
+body:
+  - type: input
+    id: roadmap_id
+    attributes:
+      label: Roadmap ID
+      description: Stable item ID (C5, MTP-1b, LING-1, …). Leave blank for a new item.
+      placeholder: e.g. C5
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - attention
+        - moe
+        - spec-decode
+        - qsa
+        - v2-runner
+        - tp
+        - onboarding
+        - infra
+  - type: textarea
+    id: deliverable
+    attributes:
+      label: Deliverable
+      description: What concrete change or measurement closes this item?
+    validations:
+      required: true
+  - type: textarea
+    id: gate
+    attributes:
+      label: Gate
+      description: >
+        The ONE measurement that decides the verdict. For perf work this must be a
+        serving A/B (interleaved arms, ms/step lead), not a standalone kernel number.
+      placeholder: e.g. `_bench_gfx906.py` pp2048/tg256 4 samples, mclk 1000, A-B-A
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: References
+      description: Dev logs, prior records, branches, `/local/tmp` artifacts.
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Measurement hygiene (docs/gfx906/AGENTS.md)
+      options:
+        - label: Identical prompts across arms (no arm label in the prompt; `prompt_sha1` asserted)
+        - label: Arms interleaved (A,B,A) and mclk logged for every window
+        - label: Clean boot / canary checked before the session

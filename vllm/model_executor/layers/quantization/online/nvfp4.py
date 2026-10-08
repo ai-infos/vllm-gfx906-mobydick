@@ -19,15 +19,12 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    trtllm_nvfp4_hidden_alignment,
-)
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     FLOAT4_E2M1_MAX,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_weight_quant,
-    kNvfp4DynamicToken,
+    kNvfp4Dynamic,
     kNvfp4Static,
     weight_amax,
 )
@@ -90,8 +87,6 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     (SM100) only.
     """
 
-    activation_quant_key = kNvfp4DynamicToken
-
     def __init__(
         self,
         *,
@@ -105,12 +100,8 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
             weight_key=kNvfp4Static,
-            activation_key=self.activation_quant_key,
+            activation_key=kNvfp4Dynamic,
         )
-
-    @property
-    def per_token_activation(self) -> bool:
-        return self.activation_quant_key == kNvfp4DynamicToken
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -165,10 +156,6 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
-            trtllm_hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                per_token_activation=self.per_token_activation,
-                is_act_and_mul=self.moe.is_act_and_mul,
-            ),
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -189,16 +176,8 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 experts_cls=self.experts_cls,
                 backend=self.nvfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
-                per_token_activation=self.per_token_activation,
+                per_token_activation=True,
             )
-        else:
-            # Reload creates new scale tensors; derived kernel scales must use
-            # their new values before layerwise reload restores captured storage.
-            assert self.moe_quant_config is not None
-            assert self.moe_quant_config.g1_alphas is not None
-            assert self.moe_quant_config.g2_alphas is not None
-            self.moe_quant_config.g1_alphas.copy_(w13_scale_2)
-            self.moe_quant_config.g2_alphas.copy_(w2_scale_2)
 
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 

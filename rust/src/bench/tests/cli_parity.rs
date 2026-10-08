@@ -36,6 +36,13 @@ const PYTHON_ONLY: &[&str] = &[
     // spec_bench dataset
     "--spec-bench-category",
     "--spec-bench-output-len",
+    // timed-trace dataset
+    "--timed-trace-chunk-hash-size",
+    "--timed-trace-label-hash-ids",
+    "--timed-trace-label-input-length",
+    "--timed-trace-label-output-length",
+    "--timed-trace-label-timestamp",
+    "--timed-trace-sec-multiplier",
     // client-side chat templating / request shaping
     "--chat-template-kwargs",
     "--custom-ensure-client-side-data",
@@ -46,6 +53,8 @@ const PYTHON_ONLY: &[&str] = &[
     "--timeline-itl-thresholds",
     // misc python-side controls
     "--hf-name",
+    "--no-self-timed",
+    "--self-timed",
     "--no-stream",
     "--probe-request-rate",
 ];

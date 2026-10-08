@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E501
-"""This example shows how to use vLLM for running offline inference with
+"""
+This example shows how to use vLLM for running offline inference with
 the correct prompt format on vision language models for multimodal embedding.
 
 For most models, the prompt format should follow corresponding examples

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 
-import importlib.metadata
 import os
 import platform
 from datetime import timedelta
@@ -22,19 +22,9 @@ from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.kernel import IrOpPriorityConfig
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-    from vllm.v1.attention.backend import AttentionBackend
-    from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
-    from vllm.v1.attention.backends.mla.prefill.selector import (
-        MLAPrefillSelectorConfig,
-    )
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
 logger = init_logger(__name__)
-
-_KV_CACHE_DTYPE_REASON = "kv_cache_dtype not supported"
-_TURBOQUANT_LAYOUT_REASON = "no KV cache layout in common with TURBOQUANT"
-_ULTRAQUANT_LAYOUT_REASON = "no KV cache layout in common with ULTRAQUANT"
 
 try:
     from amdsmi import (
@@ -163,14 +153,36 @@ _sync_hip_cuda_env_vars()
 # the major benefit of using AMDSMI is that it will not initialize CUDA
 
 
+def _shut_down_amdsmi(query_succeeded: bool) -> None:
+    # On some ROCm builds (gfx906-native ROCm 7.14) the library inits
+    # "successfully" with 0 processor handles after torch import — the state
+    # get_device_name's GCN-arch fallback handles — and shut_down then returns
+    # AMDSMI_STATUS_NOT_INIT. A cleanup failure must never mask the wrapped
+    # call's outcome: the query result/exception always wins.
+    try:
+        amdsmi_shut_down()
+    except Exception as error:
+        if query_succeeded:
+            logger.warning_once(
+                "amdsmi_shut_down failed after a successful query: %r",
+                error,
+                scope="process",
+            )
+        else:
+            logger.debug("amdsmi_shut_down failed after a failed query: %r", error)
+
+
 def with_amdsmi_context(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         amdsmi_init()
+        succeeded = False
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            succeeded = True
+            return result
         finally:
-            amdsmi_shut_down()
+            _shut_down_amdsmi(succeeded)
 
     return wrapper
 
@@ -198,15 +210,27 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 
 
 def _get_gcn_arch() -> str:
-    """Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
-    Called once at module level; result stored in _GCN_ARCH.
-    """
     try:
-        return _query_gcn_arch_from_amdsmi()
+        arch = _query_gcn_arch_from_amdsmi()
+        if _capability_from_gcn_arch(arch) is not None:
+            return arch
+        logger.debug("amdsmi returned implausible GCN arch %r, falling back", arch)
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-    # Ultimate fallback: use torch.cuda (will initialize CUDA)
     return torch.cuda.get_device_properties("cuda").gcnArchName
+
+
+# def _get_gcn_arch() -> str:
+#     """
+#     Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
+#     Called once at module level; result stored in _GCN_ARCH.
+#     """
+#     try:
+#         return _query_gcn_arch_from_amdsmi()
+#     except Exception as e:
+#         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
+#     # Ultimate fallback: use torch.cuda (will initialize CUDA)
+#     return torch.cuda.get_device_properties("cuda").gcnArchName
 
 
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
@@ -224,6 +248,7 @@ _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 _ON_GFX90A = "gfx90a" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
+_ON_GFX906 = "gfx906" in _GCN_ARCH
 _ON_GFX1250 = "gfx1250" in _GCN_ARCH
 
 _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
@@ -233,7 +258,8 @@ _ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
-    """Parse (major, minor) from a GCN arch string, mirroring how
+    """
+    Parse (major, minor) from a GCN arch string, mirroring how
     HIP derives hipDeviceProp_t.major / .minor.
 
     Format: gfx<MAJOR><MINOR><STEPPING>
@@ -247,7 +273,6 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
     Returns None only when the string is not gfx-prefixed at all
     (i.e. not a ROCm arch string). Raises on any string that looks
     like a GCN arch but does not match a known layout.
-
     """
     m = re.match(r"gfx(\d+)", gcn_arch)
     if not m:
@@ -351,6 +376,10 @@ def on_gfx950() -> bool:
     return _ON_GFX950
 
 
+def on_gfx906() -> bool:
+    return _ON_GFX906
+
+
 def on_cdna() -> bool:
     return _ON_CDNA
 
@@ -369,25 +398,6 @@ def get_cdna_version() -> int:
     if on_gfx1250():
         return 5
     return 0
-
-
-@cache
-def get_rocm_version() -> tuple[int, ...] | None:
-    """Return the installed ROCm release as (major, minor, patch), or None."""
-    # ROCm 10+ ships as the `rocm` pip SDK; older releases install to /opt/rocm.
-    try:
-        version = importlib.metadata.version("rocm")
-    except importlib.metadata.PackageNotFoundError:
-        rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
-        try:
-            with open(os.path.join(rocm_path, ".info", "version")) as f:
-                version = f.read()
-        except OSError:
-            return None
-    match = re.match(r"\s*(\d+)\.(\d+)(?:\.(\d+))?", version)
-    if match is None:
-        return None
-    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 # Enable HIP online tuning early, before hipBLASLt initializes.
@@ -415,6 +425,16 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
+    #
+    # gfx906 (MI50/Vega20, GCN5) is NOT CDNA even though its arch string
+    # contains "gfx9". The ROCm C++ paged-attention kernel selected by the
+    # CDNA branch drives the HIP runtime into an illegal state
+    # (hipErrorIllegalState) when invoked from the V2 mixed prefill+decode
+    # path on gfx906. Fall back to the Triton paged-attention kernel, which
+    # already carries gfx906-specific launch tuning and correctly no-ops
+    # prefill tokens via filter_by_query_len.
+    if on_gfx906():
+        return False
     if on_cdna():
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
@@ -475,6 +495,76 @@ def flash_attn_triton_available() -> bool:
         return False
 
 
+def _guard_gfx906_fa_fallback(
+    attn_selector_config,
+    invalid_reasons,
+    selected_backend,
+) -> None:
+    """Fail loudly when gfx906 loses the custom FA to a fallback backend.
+
+    A non-CUSTOM pick is a silent performance cliff: the fallback may be unable to
+    use CUDA graphs and is typically several times slower per step, and gfx906 FA
+    tuning does not apply to it. Warn once, or raise when
+    ``VLLM_GFX906_FA_STRICT=1`` so a deployment that must not degrade quietly fails
+    closed instead. See DEVLOG-fa-coverage.md.
+    """
+    if not on_gfx906():
+        return
+    custom_reasons = [
+        reason
+        for backend, reasons in invalid_reasons.items()
+        if backend.name == AttentionBackendEnum.CUSTOM.name
+        for reason in reasons
+    ]
+    if not custom_reasons:
+        return
+    hint = ""
+    if any("head_size" in reason for reason in custom_reasons):
+        from vllm.gfx906_fa.gfx906_fa_backend import _pad_head_dim
+
+        if _pad_head_dim(attn_selector_config.head_size) is not None:
+            hint = (
+                f" This head dim ({attn_selector_config.head_size}) is pad-able: set "
+                "GFX906_FA_PAD=1 to serve it with the custom FA rather than the "
+                "fallback (the KV row widens to the padded dim)."
+            )
+    message = (
+        f"gfx906: attention backend {selected_backend.name} was selected for "
+        f"{attn_selector_config.attn_type}, but the custom gfx906 FA is unavailable "
+        f"({'; '.join(custom_reasons)}). Expect a large per-step slowdown (the "
+        "fallback may also be unable to use CUDA graphs), and note that gfx906 FA "
+        "tuning does not apply to it. See docs/gfx906/DEVLOG-fa-coverage.md." + hint
+    )
+    if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
+        raise RuntimeError(message)
+    logger.warning_once(message)
+
+
+def _guard_gfx906_forced_backend(selected_backend, attn_selector_config) -> None:
+    """Warn or fail (``VLLM_GFX906_FA_STRICT=1``) when a non-CUSTOM backend is forced.
+
+    ``--attention-backend`` and *model config code* (e.g. Gemma-4's
+    ``verify_and_update_config``, which forces TRITON_ATTN for its heterogeneous 256/512
+    head dims when FA4 is unavailable) both arrive as an explicit selection, so the
+    selector never sees them. Same consequence: gfx906 loses the tuned kernel and the
+    step cost grows. See DEVLOG-fa-coverage.md.
+    """
+    if not on_gfx906():
+        return
+    if selected_backend.name == AttentionBackendEnum.CUSTOM.name:
+        return
+    message = (
+        f"gfx906: attention backend {selected_backend.name} was selected explicitly "
+        f"for {attn_selector_config.attn_type} instead of the custom gfx906 FA "
+        "(either --attention-backend or the model's own config). Expect a large "
+        "per-step slowdown, and note that gfx906 FA tuning does not apply to it. "
+        "See docs/gfx906/DEVLOG-fa-coverage.md."
+    )
+    if os.environ.get("VLLM_GFX906_FA_STRICT", "0") == "1":
+        raise RuntimeError(message)
+    logger.warning_once(message)
+
+
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
@@ -498,6 +588,29 @@ def _get_backend_priorities(
             ]
 
     backends = []
+    # On gfx906 (MI50/MI60), the vendored custom Q8 FlashAttention kernels
+    # (AttentionBackendEnum.CUSTOM) are the default for dense decoder
+    # attention. They only support fp16/half KV, no MLA/sparse, no sliding
+    # window, so validate_configuration keeps the fallback path for anything
+    # unsupported. Only include CUSTOM when it is actually registered (its
+    # plugin entry point ran), otherwise it degrades to the stock backends.
+    if on_gfx906() and not AttentionBackendEnum.CUSTOM.is_overridden():
+        # The vllm.general_plugins entry point only resolves from installed
+        # metadata; source-tree runs (PYTHONPATH) with a stale egg-info miss
+        # it. Register explicitly so the default priority below sees it.
+        try:
+            from vllm.gfx906_fa.gfx906_fa_backend import (
+                register as _register_gfx906_fa,
+            )
+
+            _register_gfx906_fa()
+        except ImportError:
+            logger.warning(
+                "gfx906_fa extension not found; falling back to stock "
+                "attention backends on gfx906."
+            )
+    if on_gfx906() and AttentionBackendEnum.CUSTOM.is_overridden():
+        backends.append(AttentionBackendEnum.CUSTOM)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:
@@ -510,87 +623,8 @@ def _get_backend_priorities(
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
-    backends.append(AttentionBackendEnum.ULTRAQUANT)
 
     return backends
-
-
-def _uses_turboquant(vllm_config: "VllmConfig | None") -> bool:
-    """Whether the run's KV cache dtype is one of the turboquant_* presets."""
-    cache_config = getattr(vllm_config, "cache_config", None)
-    return cache_config is not None and str(cache_config.cache_dtype).startswith(
-        "turboquant_"
-    )
-
-
-def _uses_ultraquant(vllm_config: "VllmConfig | None") -> bool:
-    """Whether the run's KV cache dtype is the UltraQuant 4-bit format."""
-    cache_config = getattr(vllm_config, "cache_config", None)
-    return (
-        cache_config is not None and str(cache_config.cache_dtype) == "ultraquant_4bit"
-    )
-
-
-def _shares_layout_with_turboquant(backend_class: type["AttentionBackend"]) -> bool:
-    """Whether this backend reads a KV cache layout TURBOQUANT reads too.
-
-    A turboquant_* run keeps its boundary layers at the native dtype (see
-    TurboQuantConfig.get_boundary_skip_layers), so those layers pick a backend of
-    their own while every other layer picks TURBOQUANT. One layout has to serve
-    the whole worker, and get_supported_kv_cache_layouts() turns an empty
-    intersection into a hard error at engine startup.
-    """
-    layouts = backend_class.supported_kv_cache_layouts()
-    turboquant_layouts = (
-        AttentionBackendEnum.TURBOQUANT.get_class().supported_kv_cache_layouts()
-    )
-    if layouts is None or turboquant_layouts is None:
-        return True
-    return not set(layouts).isdisjoint(turboquant_layouts)
-
-
-def _shares_layout_with_ultraquant(backend_class: type["AttentionBackend"]) -> bool:
-    """Whether this backend reads a KV cache layout ULTRAQUANT reads too.
-
-    Same constraint as _shares_layout_with_turboquant: an ultraquant_4bit run
-    keeps its boundary layers at the native dtype, and one layout has to serve
-    the whole worker.
-    """
-    layouts = backend_class.supported_kv_cache_layouts()
-    ultraquant_layouts = (
-        AttentionBackendEnum.ULTRAQUANT.get_class().supported_kv_cache_layouts()
-    )
-    if layouts is None or ultraquant_layouts is None:
-        return True
-    return not set(layouts).isdisjoint(ultraquant_layouts)
-
-
-def _get_invalid_reasons(
-    backend_class: type["AttentionBackend"],
-    device_capability: DeviceCapability,
-    attn_selector_config: "AttentionSelectorConfig",
-    *,
-    is_turboquant_run: bool,
-    is_ultraquant_run: bool = False,
-) -> list[str]:
-    """Why this backend cannot serve the layer, empty when it can."""
-    invalid_reasons = backend_class.validate_configuration(
-        device_capability=device_capability,
-        **attn_selector_config._asdict(),
-    )
-    if (
-        not invalid_reasons
-        and is_turboquant_run
-        and not _shares_layout_with_turboquant(backend_class)
-    ):
-        invalid_reasons = [_TURBOQUANT_LAYOUT_REASON]
-    if (
-        not invalid_reasons
-        and is_ultraquant_run
-        and not _shares_layout_with_ultraquant(backend_class)
-    ):
-        invalid_reasons = [_ULTRAQUANT_LAYOUT_REASON]
-    return invalid_reasons
 
 
 class RocmPlatform(Platform):
@@ -602,21 +636,25 @@ class RocmPlatform(Platform):
     dist_backend: str = "nccl"
     # rocm shares the same device control env var as CUDA
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
-    # Set in pre_register_and_update, so it exists only on the driver; Ray
-    # workers are separate processes and copy env vars by allowlist.
-    additional_env_vars: list[str] = ["GPU_PINNED_MIN_XFER_SIZE"]
     ray_noset_device_env_vars: list[str] = [
         "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     ]
 
+    @property
+    def supports_native_bf16(self) -> bool:
+        # gfx906 (CDNA1/Vega20) has no native bfloat16 instructions;
+        # bf16 is emulated via fp32 and the gfx906 kernel stack is
+        # fp16-only, so bf16 models should run in float16 there.
+        return not _ON_GFX906
+
     supported_quantization: list[str] = [
         "awq",
         "auto_awq",
         "awq_marlin",  # will be overwritten with awq
         "gptq",
-        "auto_gptq",
+        "auto_gpt",
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",
@@ -699,14 +737,12 @@ class RocmPlatform(Platform):
         # TODO: Make this explicit in the selector in a future PR.
         if is_encoder_decoder and AttentionBackendEnum.ROCM_ATTN in backend_priorities:
             backend_priorities.remove(AttentionBackendEnum.ROCM_ATTN)
-        is_turboquant_run = _uses_turboquant(vllm_config)
         for priority, backend in enumerate(backend_priorities):
             try:
-                invalid_reasons_i = _get_invalid_reasons(
-                    backend.get_class(),
-                    device_capability,
-                    attn_selector_config,
-                    is_turboquant_run=is_turboquant_run,
+                backend_class = backend.get_class()
+                invalid_reasons_i = backend_class.validate_configuration(
+                    device_capability=device_capability,
+                    **attn_selector_config._asdict(),
                 )
             except ImportError:
                 invalid_reasons_i = ["ImportError"]
@@ -720,7 +756,7 @@ class RocmPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend: "AttentionBackendEnum | None",
+        selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
@@ -729,57 +765,39 @@ class RocmPlatform(Platform):
 
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
-            # Keep lazy: vllm.config imports current_platform during initialization.
-            from vllm.config import get_current_vllm_config_or_none
-
-            vllm_config = get_current_vllm_config_or_none()
-            is_turboquant_run = _uses_turboquant(vllm_config)
-            is_ultraquant_run = _uses_ultraquant(vllm_config)
             try:
-                sel_invalid_reasons = _get_invalid_reasons(
-                    selected_backend.get_class(),
-                    device_capability,
-                    attn_selector_config,
-                    is_turboquant_run=is_turboquant_run,
-                    is_ultraquant_run=is_ultraquant_run,
+                backend_class = selected_backend.get_class()
+                sel_invalid_reasons = backend_class.validate_configuration(
+                    device_capability=device_capability,
+                    **attn_selector_config._asdict(),
                 )
             except ImportError:
                 sel_invalid_reasons = ["ImportError"]
             if not sel_invalid_reasons:
+                _guard_gfx906_forced_backend(selected_backend, attn_selector_config)
                 logger.info_once(
                     "Using %s backend (selected via --attention-backend).",
                     selected_backend.name,
                 )
                 return selected_backend.get_path()
-            # Only tolerate the mismatch when turboquant or ultraquant is in play:
-            # boundary layers keep the native dtype while every other layer needs
-            # the packed backend, so no single --attention-backend can serve every
-            # layer. For any other dtype the selection is genuinely invalid -> fail
-            # loud.
+            # Only tolerate the mismatch for turboquant_* KV-cache layers:
+            # boundary layers keep the native dtype (served by the selected
+            # backend) while turboquant_* layers need TURBOQUANT, so no single
+            # --attention-backend can serve every layer. For any other dtype
+            # the explicit selection is genuinely invalid -> fail loud.
             kv_dtype = attn_selector_config.kv_cache_dtype
-            layer_is_turboquant = kv_dtype is not None and str(kv_dtype).startswith(
-                "turboquant"
-            )
-            is_packed_kv_fallback = (
-                is_turboquant_run or layer_is_turboquant or is_ultraquant_run
-            ) and sel_invalid_reasons in (
-                [_KV_CACHE_DTYPE_REASON],
-                [_TURBOQUANT_LAYOUT_REASON],
-                [_ULTRAQUANT_LAYOUT_REASON],
-            )
-            if not is_packed_kv_fallback:
+            if not (kv_dtype is not None and str(kv_dtype).startswith("turboquant")):
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "
                     f"this configuration. Reason: {sel_invalid_reasons}"
                 )
             # NOTE: pass a str (not the list) -- info_once hashes its args.
             logger.info_once(
-                "Selected backend %s is incompatible with this layer (%s) of "
-                "the %s run; using the auto-selected per-layer backend. "
+                "Selected backend %s is incompatible with this turboquant "
+                "layer (%s); using the auto-selected per-layer backend. "
                 "Reason: %s",
                 selected_backend.name,
                 attn_selector_config.attn_type,
-                "ultraquant" if is_ultraquant_run else "turboquant",
                 str(sel_invalid_reasons),
             )
 
@@ -837,13 +855,18 @@ class RocmPlatform(Platform):
         )
         if invalid_reasons:
             rejected_str = ", ".join(b.name for b in invalid_reasons)
+            _guard_gfx906_fa_fallback(
+                attn_selector_config, invalid_reasons, selected_backend
+            )
             logger.info(
                 "Found incompatible backend(s) [%s] with %s. "
-                "Overriding with %s out of potential backends: %s.",
+                "Overriding with %s out of potential backends: %s. "
+                "Reasons: %s.",
                 rejected_str,
                 attn_selector_config.attn_type,
                 selected_backend.name,
                 valid_str,
+                reasons_str,
             )
         else:
             logger.info_once(
@@ -856,12 +879,17 @@ class RocmPlatform(Platform):
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
-        return [
+        backends = [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.ROCM_AITER_FA,
             AttentionBackendEnum.TRITON_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
         ]
+        if on_gfx906():
+            # VIT-1: the custom Q8 FA serves the ViT through its dense non-paged
+            # entry (explicit opt-in via --mm-encoder-attn-backend custom).
+            backends.insert(0, AttentionBackendEnum.CUSTOM)
+        return backends
 
     @classmethod
     def get_vit_attn_backend(
@@ -879,6 +907,52 @@ class RocmPlatform(Platform):
             return backend
 
         from importlib.util import find_spec
+
+        # gfx906 (VIT-1): prefer the custom Q8 FA for the ViT. Default ON since the
+        # 2026-09-15 serving gate (image-prompt TTFT -11.5 % @1024x1024, -55 s of
+        # fresh-boot Triton JIT); `GFX906_FA_VIT=0` restores the upstream path and
+        # `GFX906_FA_VIT_AUTO=0` opts out of auto-selection only. An explicit
+        # `--mm-encoder-attn-backend custom` always works.
+        if on_gfx906():
+            from vllm.gfx906_fa.gfx906_fa_mm_encoder import (
+                vit_auto_enabled,
+                vit_enabled,
+                vit_unsupported_reason,
+            )
+
+            if vit_auto_enabled():
+                reason = vit_unsupported_reason(head_size, dtype)
+                if reason is None:
+                    logger.info_once(
+                        "Using CUSTOM (gfx906 FA) backend for ViT attention."
+                    )
+                    return AttentionBackendEnum.CUSTOM
+                # LOUD on purpose: this is a silent-loss path otherwise. The ViT
+                # keeps working, but it loses the MI50-tuned kernel and pays the
+                # per-boot Triton JIT; worse, depending on what is installed the
+                # fall-through chain can end at TORCH_SDPA (unfused) rather than
+                # flash-attn. Note `on_cdna()` is a substring test that is TRUE on
+                # gfx906, so the "CDNA" branch below is the usual upstream pick.
+                logger.warning_once(
+                    "gfx906 CUSTOM ViT attention UNAVAILABLE (%s); falling back to "
+                    "the upstream ViT backend. VIT-1's image-prompt win (-11.5 %% "
+                    "TTFT at 1024x1024) and its fresh-boot saving do NOT apply to "
+                    "this model. See docs/gfx906/DEVLOG-vit1.md.",
+                    reason,
+                )
+            elif not vit_enabled():
+                logger.info_once(
+                    "gfx906 CUSTOM ViT attention disabled by GFX906_FA_VIT=0 "
+                    "(upstream ViT path in use)."
+                )
+            else:
+                logger.info_once(
+                    "gfx906 CUSTOM ViT attention is available for head_size=%d %s "
+                    "but auto-selection is off (GFX906_FA_VIT_AUTO=0); upstream "
+                    "ViT path in use.",
+                    head_size,
+                    dtype,
+                )
 
         from vllm._aiter_ops import rocm_aiter_ops
 
@@ -909,59 +983,10 @@ class RocmPlatform(Platform):
         return AttentionBackendEnum.TORCH_SDPA
 
     @classmethod
-    def get_mla_prefill_backend_cls(
-        cls,
-        mla_selector_config: "MLAPrefillSelectorConfig",
-    ) -> "type[MLAPrefillBackend]":
-        """On ROCm, prefer the AITER FlashAttention backend, falling back to
-        FlashAttention.
-
-        Raises:
-            ValueError: If neither backend is valid for the configuration.
-
-        """
-        from vllm.v1.attention.backends.mla.prefill.registry import (
-            MLAPrefillBackendEnum,
-        )
-
-        device_capability = cls.get_device_capability()
-        all_invalid_reasons: dict[str, list[str]] = {}
-        for backend_enum in (
-            MLAPrefillBackendEnum.ROCM_AITER_FA,
-            MLAPrefillBackendEnum.FLASH_ATTN,
-        ):
-            try:
-                backend_cls = backend_enum.get_class()
-                invalid_reasons = backend_cls.validate_configuration(
-                    device_capability, mla_selector_config
-                )
-            except ImportError:
-                invalid_reasons = ["ImportError"]
-            if not invalid_reasons:
-                return backend_cls
-            all_invalid_reasons[backend_enum.name] = invalid_reasons
-
-        reasons_str = (
-            "{"
-            + ", ".join(
-                f"{name}: [{', '.join(reasons)}]"
-                for name, reasons in all_invalid_reasons.items()
-            )
-            + "}"
-        )
-        logger.debug_once(
-            "Some MLA prefill backends are not valid with %s. Reasons: %s.",
-            repr(mla_selector_config),
-            reasons_str,
-        )
-        raise ValueError(
-            f"No valid MLA prefill backend found with {mla_selector_config!r}. "
-            f"Reasons: {reasons_str}."
-        )
-
-    @classmethod
     def set_device(cls, device: torch.device) -> None:
-        """Set the device for the current platform."""
+        """
+        Set the device for the current platform.
+        """
         torch.cuda.set_device(device)
 
     @classmethod
@@ -986,7 +1011,9 @@ class RocmPlatform(Platform):
     @classmethod
     @with_amdsmi_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
-        """Query if the set of gpus are fully connected by xgmi (1 hop)."""
+        """
+        Query if the set of gpus are fully connected by xgmi (1 hop)
+        """
         handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
@@ -1006,7 +1033,16 @@ class RocmPlatform(Platform):
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = amdsmi_get_processor_handles()[physical_device_id]
+        handles = amdsmi_get_processor_handles()
+        if physical_device_id >= len(handles):
+            # On some ROCm builds (notably gfx906-native TheRock / ROCm 7.14)
+            # amdsmi returns 0 processor handles after torch import, even though
+            # the GPU works. Derive a config-file-friendly name from the resolved
+            # GCN arch (e.g. "gfx906" -> "AMD_GFX906"), matching the naming used
+            # by the tuned-kernel config files.
+            arch = _GCN_ARCH.split(":")[0].split("-")[0].strip()
+            return f"AMD_{arch.upper()}"
+        handle = handles[physical_device_id]
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:
@@ -1047,20 +1083,27 @@ class RocmPlatform(Platform):
         return torch.cuda.get_device_properties(device_id).total_memory
 
     @classmethod
-    def pre_register_and_update(
-        cls, parser: "FlexibleArgumentParser | None" = None
-    ) -> None:
-        # Keep mmap'd weight pages on the HIP staging path: above this
-        # threshold the runtime registers the pageable source instead, and each
-        # registration's MMU notifier makes KFD suspend our queues. In KB, so
-        # 4 GiB.
-        os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
-
-    @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.config.compilation import CUDAGraphMode
 
         compilation_config = vllm_config.compilation_config
+        model_config = vllm_config.model_config
+        if (
+            compilation_config.cudagraph_mode is None
+            and model_config is not None
+            and on_gfx950()
+            and vllm_config.use_v2_model_runner
+            and model_config.architecture
+            in {
+                "DeepseekV4ForCausalLM",
+                "DeepseekV4ForConditionalGeneration",
+            }
+        ):
+            # Default to eager after reported gfx950/MRV2 accuracy regressions:
+            # https://github.com/vllm-project/vllm/issues/52644
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         use_aiter_fused_moe = rocm_aiter_ops.is_fused_moe_enabled()
         use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
         use_aiter_fused_se = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
@@ -1093,6 +1136,12 @@ class RocmPlatform(Platform):
 
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
+
+        if (
+            parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError("PCP does not support data parallelism on ROCm yet.")
 
         if (
             compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -1173,7 +1222,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_cdna() or on_rdna4()
+        return on_cdna() or on_rdna4() or on_gfx906()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
@@ -1199,27 +1248,6 @@ class RocmPlatform(Platform):
     @classmethod
     def is_navi(cls) -> bool:
         return "gfx1" in _GCN_ARCH
-
-    @classmethod
-    def enable_multi_stream_overlap(
-        cls,
-        aux_stream_list: list[torch.cuda.Stream] | None,
-        attn_metadata: object,
-    ) -> bool:
-        """ROCm multi-stream gates: streams and capture region.
-
-        Dict metadata marks piecewise cudagraph, whose eager breaks rebuild
-        the attention inputs on the owning stream. Forking side streams
-        there would rely on runtime HIP event sync, which is unreliable in
-        this overlap on ROCm (event waits can hang), so multi-stream only
-        runs where the fork/join becomes static graph edges: inside capture,
-        or with non-dict metadata (full cudagraph or the profile run), which
-        has no eager breaks.
-        """
-        return aux_stream_list is not None and (
-            torch.cuda.is_current_stream_capturing()
-            or not isinstance(attn_metadata, dict)
-        )
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:

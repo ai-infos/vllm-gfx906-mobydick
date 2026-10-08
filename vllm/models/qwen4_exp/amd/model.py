@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Inference-only Qwen4Exp model."""
 
 from collections.abc import Iterable
@@ -7,7 +8,6 @@ from itertools import islice
 
 import torch
 from torch import nn
-from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -15,7 +15,6 @@ from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
-from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -48,6 +47,7 @@ from vllm.model_executor.models.qwen3_5 import (
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
+    Qwen3NextMLP,
     Qwen3NextSparseMoeBlock,
 )
 from vllm.model_executor.models.qwen3_vl import (
@@ -71,26 +71,52 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.transformers_utils.configs.qwen4_exp import (
+    Qwen4ExpTextConfig,
+)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
-
-# Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
-# TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
-_QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
 
 
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
     """Return ``None`` for weights excluded from Qwen4Exp ModelOpt-FP4."""
+
     if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
         return None
     return quant_config
+
+
+# ``Whittle-Qwen-3.8-35B-A3B`` repacks the PLE embedding table out of the PLE
+# layer and onto the checkpoint root -- ``ngram_embedding.shard_<n>.weight`` and
+# ``ple_embedding.layer_multipliers`` -- where the parent family serializes them
+# as ``layers.<ple>.ple.ple_embedding.<...>``. Each root key maps to itself under
+# the owning layer's ``ple_embedding`` child, and the match is anchored at the
+# start of the name so parent-style names, which already carry a layer prefix,
+# are left alone.
+_PACKED_PLE_ROOT_PREFIXES = {
+    "ngram_embedding.": "ngram_embedding.",
+    "ple_embedding.": "",
+}
+
+
+def _remap_packed_ple_table_name(name: str, ple_layer_index: int | None) -> str:
+    """Move a root-packed PLE embedding table onto its owning layer."""
+
+    if ple_layer_index is None:
+        return name
+    for root_prefix, child_prefix in _PACKED_PLE_ROOT_PREFIXES.items():
+        if name.startswith(root_prefix):
+            leaf = name[len(root_prefix) :]
+            return f"layers.{ple_layer_index}.ple.ple_embedding.{child_prefix}{leaf}"
+    return name
 
 
 def _remap_qsa_cache_scale_name(
@@ -103,6 +129,7 @@ def _remap_qsa_cache_scale_name(
     that cache directly, so only QSA layers need the final path component
     moved to the owner's persistent ``_k_scale``/``_v_scale`` buffers.
     """
+
     scale_suffixes = {
         "k_proj.k_scale": "_k_scale",
         "k_proj.output_scale": "_k_scale",
@@ -140,9 +167,9 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_input_scale",
 ]
 
-# The checkpoint stores these projections separately; runtime packs each group
-# into adjacent logical shards of a MergedColumnParallelLinear.
-_EXTRA_WEIGHTS_MAPPER = WeightsMapper(
+# The checkpoint keeps down and injection projections separate; runtime packs
+# them into adjacent logical shards of one MergedColumnParallelLinear.
+_HC_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_stacked={
         "hyper_connection.input_mix_weight_down.weight": (
             "hyper_connection.input_mix_weight_down_block_inject.weight",
@@ -152,8 +179,6 @@ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
             "hyper_connection.input_mix_weight_down_block_inject.weight",
             1,
         ),
-        "ple.key_proj": ("ple.kv_proj", 0),
-        "ple.value_proj": ("ple.kv_proj", 1),
     }
 )
 
@@ -181,6 +206,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
         self.config = config
@@ -213,13 +240,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
-        elif layer_type in _QSA_LAYER_TYPES:
+        elif layer_type == "full_attention":
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
             if not use_qsa:
                 self.self_attn = Qwen3NextAttention(
                     config,
-                    model_config=vllm_config.model_config,
-                    cache_config=vllm_config.cache_config,
+                    model_config=model_config,
+                    cache_config=cache_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
                 )
@@ -234,14 +261,29 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen4ExpSparseMoeBlock(
-            vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        num_experts = getattr(config, "num_experts", 0) or 0
+        absolute_layer_id = self.layer_idx + 1
+        is_moe_layer = self.layer_idx not in mlp_only_layers and (
+            num_experts > 0 and absolute_layer_id % config.decoder_sparse_step == 0
         )
+        if is_moe_layer:
+            self.mlp = Qwen4ExpSparseMoeBlock(
+                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+            )
+        else:
+            self.mlp = Qwen3NextMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
 
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=vllm_config.model_config.dtype,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -278,7 +320,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = self.ple(
+            hidden_states = hidden_states + self.ple(
                 hidden_states,
                 input_ids,
                 query_start_loc,
@@ -295,7 +337,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
-        elif self.layer_type in _QSA_LAYER_TYPES:
+        elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
                 hidden_states=block_input,
                 positions=positions,
@@ -373,7 +415,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     }
 )
 class Qwen4ExpModel(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _HC_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -386,8 +428,15 @@ class Qwen4ExpModel(nn.Module):
         self._qsa_layer_ids = frozenset(
             layer_idx
             for layer_idx, layer_type in enumerate(config.layer_types)
-            if layer_type in _QSA_LAYER_TYPES
+            if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
+        )
+        # A root-packed embedding table (see ``_remap_packed_ple_table_name``) can
+        # only be placed when the model owns exactly one PLE layer to hold it;
+        # ``ple_layer_ids`` is 1-based, the layer prefix is not.
+        ple_layer_ids = sorted(set(getattr(config, "ple_layer_ids", ()) or ()))
+        self._ple_layer_index = (
+            ple_layer_ids[0] - 1 if len(ple_layer_ids) == 1 else None
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
@@ -417,7 +466,7 @@ class Qwen4ExpModel(nn.Module):
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
                 hidden_size=config.hidden_size,
-                params_dtype=torch.bfloat16,
+                params_dtype=vllm_config.model_config.dtype,
                 hc_lowrank=config.hc_lowrank,
                 rms_norm_eps=config.rms_norm_eps,
                 hc_per_branch_norm=True,
@@ -543,6 +592,13 @@ class Qwen4ExpModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
             (
+                _remap_packed_ple_table_name(name, self._ple_layer_index),
+                weight,
+            )
+            for name, weight in weights
+        )
+        weights = (
+            (
                 _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
                 weight,
             )
@@ -596,7 +652,6 @@ class Qwen4ExpForCausalLM(
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
-        "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
         "input_mix_weight_down_block_inject": [
@@ -618,6 +673,11 @@ class Qwen4ExpForCausalLM(
         self.quant_config = vllm_config.quant_config
         self.config = config
         self.scheduler_config = vllm_config.scheduler_config
+        if vllm_config.cache_config.mamba_cache_mode == "all":
+            raise NotImplementedError(
+                "Qwen4Exp currently does not support 'all' prefix caching, "
+                "please use '--mamba-cache-mode=align' instead"
+            )
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -647,6 +707,8 @@ class Qwen4ExpForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
+        # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(
             input_ids,
             positions,
@@ -826,12 +888,11 @@ class Qwen4ExpForConditionalGeneration(
     requires_raw_input_tokens = True
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
-        "kv_proj": ["key_proj", "value_proj"],
         "input_mix_weight_down_block_inject": [
             "input_mix_weight_down",
             "block_inject_weight",
             "_input_mix_padding",
-        ],
+        ]
     }
 
     @staticmethod
@@ -872,7 +933,6 @@ class Qwen4ExpForConditionalGeneration(
                     config.vision_config,
                     norm_eps=config.text_config.rms_norm_eps,
                     quant_config=quant_config,
-                    input_norm=build_mm_input_norm(self.model_config),
                     prefix=maybe_prefix(prefix, "visual"),
                 )
 

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import inspect
 import math
 from types import SimpleNamespace
 from typing import Any
@@ -10,21 +9,15 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.models.qwen4_exp.amd import indexer_qsa
 from vllm.models.qwen4_exp.amd import (
     model as _qwen4_exp_model,  # noqa: F401
 )
 from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module
 from vllm.models.qwen4_exp.amd.indexer_qsa import (
-    QSAIndexer,
     apply_qsa_rmsnorm,
     apply_qsa_rope,
 )
 from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
-from vllm.models.qwen4_exp.amd.ops.qsa_pre_indexer import (
-    qsa_pre_indexer,
-    supports_fused_pre_indexer,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
@@ -39,7 +32,26 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
-def test_ple_ngram_embedding_custom_op_uses_resident_weight(
+def _stage_host_table_buffers(ngram_embedding: torch.nn.Module) -> None:
+    """Provide the pinned staging buffers the host-table PLE path needs.
+
+    ``MmapShardedNGramEmbedding`` (the host-RAM PLE implementation) drives the
+    custom op through per-layer pinned ``_pinned_ngram_ids`` / ``_pinned_output``
+    buffers -- the device-resident implementation does not. Adding them when the
+    implementation exists lets this test exercise the op on either path; on the
+    device path it is a no-op.
+    """
+    if not hasattr(ple_layer_module, "MmapShardedNGramEmbedding"):
+        return
+    ngram_embedding._pinned_ngram_ids = torch.empty(
+        (4, 2), dtype=torch.long, device="cpu"
+    ).pin_memory()
+    ngram_embedding._pinned_output = torch.empty(
+        (4, 6), dtype=torch.float32, device="cpu"
+    ).pin_memory()
+
+
+def test_ple_ngram_embedding_custom_op_matches_reference_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer_name = "model.layers.0.ple"
@@ -47,6 +59,7 @@ def test_ple_ngram_embedding_custom_op_uses_resident_weight(
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = torch.nn.Module()
     layer.ple_embedding.ngram_embedding = torch.nn.Embedding(8, 3)
+    _stage_host_table_buffers(layer.ple_embedding)
     context = SimpleNamespace(no_compile_layers={layer_name: layer})
     monkeypatch.setattr(ple_layer_module, "get_forward_context", lambda: context)
 
@@ -92,6 +105,28 @@ def _qsa_sparse_paged_attention_reference(
     return output
 
 
+def _qsa_mqa_paged_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pages = page_table.index_select(0, token_to_req.long()).long()
+    keys = k_cache[pages, :, 0, :].flatten(1, 2)
+    scores = torch.einsum("rhd,rnd->rnh", q.float(), keys.float())
+    logits = torch.relu(scores).sum(dim=-1) / math.sqrt(q.shape[-1])
+    visible = torch.minimum(
+        (query_positions + 1) // compress_ratio,
+        sequence_lengths.index_select(0, token_to_req.long()) // compress_ratio,
+    )
+    positions = torch.arange(keys.shape[1], device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(positions >= visible.unsqueeze(1), -torch.inf)
+    return logits, visible.to(torch.int32)
+
+
 def test_qsa_rope_uses_platform_dispatch() -> None:
     tensor = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
     positions = torch.tensor([0, 1])
@@ -125,149 +160,6 @@ def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config) -> None:
     output = apply_qsa_rmsnorm(norm, tensor)
 
     torch.testing.assert_close(output, norm.forward_native(tensor))
-
-
-def _make_indexer(*, use_fused: bool, num_tokens: int = 2) -> QSAIndexer:
-    """A QSAIndexer whose unfused path runs for real, with no projection weights.
-
-    Both branches have to be reachable: a fused-path test is only meaningful if
-    the unfused one it replaces would otherwise have executed.
-    """
-    heads, head_dim = 2, 4
-    indexer = QSAIndexer.__new__(QSAIndexer)
-    torch.nn.Module.__init__(indexer)
-    indexer.index_n_heads = heads
-    indexer.index_kv_heads = 1
-    indexer.index_head_dim = head_dim
-    indexer.compress_ratio = 2
-    indexer.use_fused_pre_indexer = use_fused
-    indexer.skip_topk = True
-    indexer.index_qk_proj = lambda hidden_states: (
-        torch.zeros(hidden_states.shape[0], (heads + 1) * head_dim),
-        None,
-    )
-    indexer.q_layernorm = GemmaRMSNorm(head_dim, eps=1e-6)
-    indexer.k_layernorm = GemmaRMSNorm(head_dim, eps=1e-6)
-    indexer.rotary_emb = SimpleNamespace(
-        cos_sin_cache=torch.zeros(16, head_dim),
-        rotary_dim=head_dim // 2,
-        apply_rotary_emb=lambda tensor, cos, sin: tensor,
-        _match_cos_sin_cache_dtype=lambda _: torch.zeros(16, head_dim),
-    )
-    # The raw cache's full width carries the MRoPE position tail that the fused
-    # kernel writes; key_cache is only the leading key columns.
-    indexer.raw_key_cache = SimpleNamespace(
-        kv_cache=torch.zeros(1, 4, 1, head_dim + 12),
-        key_cache=torch.zeros(1, 4, 1, head_dim),
-        cache_rope_positions=True,
-        rope_position_offset=head_dim,
-    )
-    indexer.compressed_key_cache = SimpleNamespace(
-        kv_cache=torch.zeros(1, 2, 1, head_dim)
-    )
-    raw_metadata = SimpleNamespace(
-        num_actual_tokens=num_tokens,
-        slot_mapping=torch.arange(num_tokens),
-        block_table=torch.zeros(1, 1, dtype=torch.int32),
-        query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
-        logical_positions=torch.arange(num_tokens),
-        token_to_req=torch.zeros(num_tokens, dtype=torch.int32),
-    )
-    compressed_metadata = SimpleNamespace(
-        num_actual_tokens=num_tokens,
-        slot_mapping=torch.arange(num_tokens),
-        k_work_metadata=torch.zeros(1, 2, dtype=torch.int32),
-    )
-    indexer._metadata = lambda: (raw_metadata, compressed_metadata)
-    indexer.test_metadata = (raw_metadata, compressed_metadata)
-    return indexer
-
-
-@pytest.mark.usefixtures("default_vllm_config")
-def test_qsa_fused_pre_indexer_replaces_the_unfused_chain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    indexer = _make_indexer(use_fused=True)
-    calls = []
-    monkeypatch.setattr(
-        indexer_qsa,
-        "qsa_pre_indexer",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
-    )
-    monkeypatch.setattr(
-        QSAIndexer,
-        "_update_and_compress",
-        lambda *args, **kwargs: pytest.fail("fused path ran the unfused chain"),
-    )
-    rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
-
-    actual = QSAIndexer.forward(indexer, torch.zeros(2, 8), torch.tensor([7, 8]), rows)
-
-    assert actual is rows
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    passed = inspect.signature(qsa_pre_indexer).bind(*args, **kwargs).arguments
-    _, compressed_metadata = indexer.test_metadata
-    # The kernel addresses the raw cache at its full width and writes the MRoPE
-    # position tail itself, so it needs kv_cache, not the key_cache view.
-    assert passed["state_cache"] is indexer.raw_key_cache.kv_cache
-    assert passed["compressed_cache"] is indexer.compressed_key_cache.kv_cache
-    assert passed["k_work_metadata"] is compressed_metadata.k_work_metadata
-    assert passed["compress_ratio"] == indexer.compress_ratio
-    assert passed["rope_pos_offset"] == indexer.index_head_dim
-
-
-@pytest.mark.usefixtures("default_vllm_config")
-def test_qsa_unsupported_config_keeps_the_unfused_chain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    indexer = _make_indexer(use_fused=False)
-    monkeypatch.setattr(
-        indexer_qsa,
-        "qsa_pre_indexer",
-        lambda *args, **kwargs: pytest.fail("unfused path ran the fused kernel"),
-    )
-    updates = []
-    monkeypatch.setattr(
-        QSAIndexer,
-        "_update_and_compress",
-        lambda *args, **kwargs: updates.append(args),
-    )
-    rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
-
-    actual = QSAIndexer.forward(indexer, torch.zeros(2, 8), torch.tensor([7, 8]), rows)
-
-    assert actual is rows
-    assert len(updates) == 1
-
-
-@pytest.mark.parametrize(
-    ("overrides", "expected"),
-    [
-        pytest.param({}, True, id="qwen3_8_flash_next"),
-        pytest.param({"is_neox_style": False}, False, id="not-neox"),
-        pytest.param({"rotary_dim": 128}, False, id="rotary-dim"),
-        pytest.param({"mrope_interleaved": False}, False, id="mrope-not-interleaved"),
-        pytest.param({"mrope_section": (11, 11, 10, 0)}, False, id="mrope-section-len"),
-    ],
-)
-def test_fused_pre_indexer_gate_is_config_shaped(overrides, expected) -> None:
-    # Qwen3.8-Flash-Next's indexer geometry, which both vendors satisfy.
-    rotary = SimpleNamespace(
-        rotary_dim=64,
-        is_neox_style=True,
-        mrope_section=(11, 11, 10),
-        mrope_interleaved=True,
-    )
-    for name, value in overrides.items():
-        setattr(rotary, name, value)
-
-    assert (
-        supports_fused_pre_indexer(
-            rotary, head_dim=128, num_kv_heads=1, compress_ratio=4
-        )
-        is expected
-    )
 
 
 def test_qsa_selection_uses_portable_topk_on_rocm(
@@ -347,6 +239,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
     [
@@ -362,6 +255,7 @@ def test_qsa_sparse_paged_attention_matches_reference(
     num_query_heads: int,
     num_kv_heads: int,
     page_size: int,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
@@ -372,16 +266,14 @@ def test_qsa_sparse_paged_attention_matches_reference(
     indexer_budget = 2048
     indexer_compress_ratio = 4
     selection_width = indexer_budget + indexer_compress_ratio - 1
-    q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
     kv_cache = torch.randn(
         num_cache_blocks,
         page_size,
         num_kv_heads,
         2 * head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
     block_table = (
@@ -445,3 +337,289 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def _qsa_mqa_paged_case(
+    dtype: torch.dtype, *, num_rows: int, uniform: bool
+) -> tuple[Any, ...]:
+    """One indexer-scoring case.
+
+    ``uniform`` puts every row on request 0, which is the row-tiled route's
+    precondition; otherwise the rows are split across two requests, so the
+    per-row kernel must be used.
+    """
+    torch.manual_seed(3)
+    head_dim = 128
+    num_query_heads = 4
+    page_size, num_pages, num_requests = 64, 20, 2
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
+    k_cache = torch.randn(num_pages, page_size, 1, head_dim, device="cuda", dtype=dtype)
+    page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        num_requests, num_pages // num_requests
+    )
+    if uniform:
+        token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
+    else:
+        token_to_req = torch.repeat_interleave(
+            torch.arange(num_requests, device="cuda", dtype=torch.int32),
+            num_rows // num_requests,
+        )
+    sequence_lengths = torch.tensor(
+        [num_pages * page_size, num_pages * page_size - 37],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    request_lengths = sequence_lengths.index_select(0, token_to_req.long())
+    query_positions = (
+        request_lengths - num_rows + torch.arange(num_rows, device="cuda")
+    ).to(torch.int32)
+    return q, k_cache, page_table, token_to_req, query_positions, sequence_lengths
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("uniform", [False, True], ids=["per-row", "tiled"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_qsa_mqa_paged_matches_reference(dtype: torch.dtype, uniform: bool) -> None:
+    """The indexer's scoring kernel reads the compressed-key cache in its own dtype.
+
+    Both routes -- the per-row kernel and the row-tiled one that the uniform
+    prefill gate selects -- must reproduce the reference.
+    """
+    compress_ratio = 4
+    num_rows = 64
+    q, k_cache, page_table, token_to_req, query_positions, sequence_lengths = (
+        _qsa_mqa_paged_case(dtype, num_rows=num_rows, uniform=uniform)
+    )
+
+    actual, actual_visible = qsa_ops.qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+    expected, expected_visible = _qsa_mqa_paged_reference(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_visible, expected_visible)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("dtype", "num_rows", "uniform", "expect_tiled"),
+    [
+        # fp16 is a native tl.dot everywhere; uniform prefill rows take the tiled route.
+        (torch.float16, 64, True, True),
+        # ... but only at prefill scale, and only when the rows share a request.
+        (torch.float16, 32, True, False),
+        (torch.float16, 64, False, False),
+        # bf16 is a hardware dot only where the platform has native bf16 (gfx906
+        # emulates it: the tiled route measured 0.42x there vs 1.39x in fp16).
+        (torch.bfloat16, 64, True, False),
+    ],
+    ids=["fp16-uniform", "fp16-small", "fp16-mixed-req", "bf16-uniform"],
+)
+def test_qsa_mqa_paged_route_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    num_rows: int,
+    uniform: bool,
+    expect_tiled: bool,
+) -> None:
+    """Pin the row-tiled gate: it must not be entered for bf16 on gfx906.
+
+    The tiled kernel's win is a hardware ``tl.dot``; where that is emulated
+    (bf16 on gfx906) it is 2.4x slower, so the gate -- not just correctness --
+    is the regression guard.
+    """
+    compress_ratio = 4
+    launched: list[str] = []
+
+    def recorder(name: str, original: Any) -> Any:
+        """Stand-in for a Triton kernel that records the launch and delegates."""
+
+        class _Recorder:
+            def __getitem__(self, grid: Any) -> Any:
+                def launch(*args: Any, **kwargs: Any) -> Any:
+                    launched.append(name)
+                    return original[grid](*args, **kwargs)
+
+                return launch
+
+        return _Recorder()
+
+    for name in ("_qsa_mqa_paged_tiled_kernel", "_qsa_mqa_paged_kernel"):
+        monkeypatch.setattr(qsa_ops, name, recorder(name, getattr(qsa_ops, name)))
+
+    q, k_cache, page_table, token_to_req, query_positions, sequence_lengths = (
+        _qsa_mqa_paged_case(dtype, num_rows=num_rows, uniform=uniform)
+    )
+    qsa_ops.qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+    if not expect_tiled and dtype == torch.bfloat16 and uniform and num_rows >= 64:
+        # bf16 is expected to take the tiled route only where the dot is native.
+        assert current_platform.supports_native_bf16 is False
+
+    assert launched == (
+        ["_qsa_mqa_paged_tiled_kernel"] if expect_tiled else ["_qsa_mqa_paged_kernel"]
+    )
+
+
+def test_reference_block_ranks_follows_the_kernel_contract() -> None:
+    """The reference selection mirrors ``top_k_per_row_decode``'s output contract.
+
+    Per row: the top ``block_topk`` visible blocks by score, -1 past the row's
+    visible end. Row ends are block counts, as ``qsa_mqa_paged`` returns them.
+    """
+
+    logits = torch.tensor(
+        [[0.5, 3.0, 1.0, 2.0], [4.0, 0.25, 0.0, -1.0]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([3, 1], dtype=torch.int32)
+    blocks = torch.full((2, 2), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 2)
+
+    # Row 0 sees blocks 0..2 -> 1 (3.0) and 2 (1.0); row 1 sees block 0 only.
+    assert blocks.tolist() == [[1, 2], [0, -1]]
+
+
+def test_reference_block_ranks_clamps_a_width_wider_than_the_cache() -> None:
+    logits = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    row_ends = torch.tensor([3], dtype=torch.int32)
+    blocks = torch.full((1, 8), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 8)
+
+    assert blocks.tolist() == [[2, 1, 0, -1, -1, -1, -1, -1]]
+
+
+def test_reference_block_ranks_handles_an_empty_cache() -> None:
+    blocks = torch.full((2, 4), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(
+        torch.empty((2, 0), dtype=torch.float32),
+        torch.zeros((2,), dtype=torch.int32),
+        blocks,
+        4,
+    )
+
+    assert blocks.tolist() == [[-1, -1, -1, -1], [-1, -1, -1, -1]]
+
+
+def test_reference_block_ranks_pads_by_visibility_not_position() -> None:
+    """Blocks past a row's visible end must never be selected.
+
+    Regression from the prefill-scale probe: padding by output position leaked real
+    block indices for blocks the row cannot see (the kernel never scans them), which
+    only shows up once the width exceeds the row's visible block count.
+    """
+
+    logits = torch.tensor(
+        [[5.0, 4.0, 3.0, 2.0], [0.1, 0.4, 0.3, 0.2]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([1, 4], dtype=torch.int32)
+    blocks = torch.full((2, 4), 123, dtype=torch.int32)
+
+    qsa_ops._reference_block_ranks(logits, row_ends, blocks, 4)
+
+    # Row 0 sees only block 0, so the other three slots are invalid, not blocks 1..3.
+    assert blocks[0].tolist() == [0, -1, -1, -1]
+    # Row 1 sees everything, in descending score order.
+    assert blocks[1].tolist() == [1, 2, 3, 0]
+
+
+def test_select_qsa_block_ranks_dispatches_by_measured_ceiling(monkeypatch) -> None:
+    """Kernel up to the verified width ceiling, reference above it.
+
+    The ceiling is measured, not assumed: on gfx906 the decode kernel agrees with
+    the reference selection at 8192 and corrupts memory at 12288/16384
+    (`/local/tmp/wht1/topk_case.py`). A model whose indexer budget covers its
+    context selects 65536 blocks, which is past the ceiling by construction.
+    """
+
+    calls: list[int] = []
+
+    def _fake_kernel(logits, next_n, row_ends, blocks, num_rows, s0, s1, topk):
+        calls.append(topk)
+        blocks.fill_(-1)
+
+    monkeypatch.setattr(qsa_ops.ops, "top_k_per_row_decode", _fake_kernel)
+
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+    row_ends = torch.tensor([4], dtype=torch.int32)
+    blocks = torch.empty((1, 4), dtype=torch.int32)
+
+    for width in (2, 512, 2048, qsa_ops._TOPK_KERNEL_MAX_WIDTH):
+        qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
+
+    assert calls == [2, 512, 2048, 8192]
+
+    # Just past the ceiling -- and the width of the model this was written for.
+    for width in (8193, 65536):
+        qsa_ops._select_qsa_block_ranks(logits, row_ends, blocks, width)
+
+    # Above the ceiling the reference path answers, so the kernel is not called.
+    assert calls == [2, 512, 2048, 8192]
+
+
+@pytest.mark.parametrize(
+    ("budget", "ratio", "max_model_len", "expected"),
+    [
+        # Whittle-Qwen-3.8-35B-A3B: a full-context budget on a 32k server.
+        (262144, 4, 32768, 8192),
+        # The same checkpoint served at its full 262144 context.
+        (262144, 4, 262144, 65536),
+        # A budget that already fits is untouched.
+        (2048, 4, 262144, 2048),
+        (8192, 4, 32768, 8192),
+    ],
+)
+def test_addressable_token_topk_caps_a_full_context_budget(
+    budget: int, ratio: int, max_model_len: int, expected: int
+) -> None:
+    """An indexer budget wider than the context can address buys nothing.
+
+    Unclamped, the selection buffer is ``max_num_batched_tokens x
+    (budget + ratio - 1)`` int32 *per layer*: 4 GiB per layer for Whittle at
+    MBT 4096, which OOMed the loader at layer 7 of 40.
+    """
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import addressable_token_topk
+
+    assert addressable_token_topk(budget, ratio, max_model_len) == expected
+
+
+def test_addressable_token_topk_never_truncates_an_addressable_row() -> None:
+    """The cap stays above every row's reachable compressed tokens.
+
+    A row addresses at most ``ceil(max_model_len / ratio)`` compressed tokens, so
+    the cap must not fall below that -- and must stay divisible by the compression
+    ratio, which the index-expansion kernel requires.
+    """
+
+    from vllm.models.qwen4_exp.amd.indexer_qsa import addressable_token_topk
+
+    for max_model_len in (1, 63, 64, 65, 4096, 32768, 32770, 131072, 262144):
+        for ratio in (2, 4, 8):
+            width = addressable_token_topk(10**9, ratio, max_model_len)
+            assert width >= math.ceil(max_model_len / ratio)
+            assert width % ratio == 0

@@ -93,7 +93,6 @@ impl ManagedEngineArgs {
         shutdown_timeout: u64,
         handshake_port: u16,
         limit_mm_per_prompt: Option<String>,
-        hf_overrides: Option<String>,
     ) -> ManagedEngineConfig {
         let mut python_args = self.python_args;
         // Manually forward some args to the Python engine.
@@ -136,10 +135,6 @@ impl ManagedEngineArgs {
         if let Some(limit_mm_per_prompt) = limit_mm_per_prompt {
             python_args.push("--limit-mm-per-prompt".to_string());
             python_args.push(limit_mm_per_prompt);
-        }
-        if let Some(hf_overrides) = hf_overrides {
-            python_args.push("--hf-overrides".to_string());
-            python_args.push(hf_overrides);
         }
 
         ManagedEngineConfig {

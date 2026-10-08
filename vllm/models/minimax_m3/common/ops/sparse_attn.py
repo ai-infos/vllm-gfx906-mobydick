@@ -32,6 +32,39 @@ _FP8_DTYPES = (
     torch.float8_e5m2fnuz,
 )
 
+_SPARSE_ATTN_LAUNCH_KWARGS: dict | None = None
+
+
+def _sparse_attn_launch_kwargs() -> dict:
+    """Triton launch overrides for the sparse-attn GEMM kernels.
+
+    Forced only where required: gfx906/MI50 and CDNA3 (gfx942) cap LDS at
+    64 KB, and the default multi-stage pipeline double-buffers the 128x128 K/V
+    tiles to beyond that ("out of resource: shared memory"), so pin gfx906 +
+    gfx942 to a single stage (~32 KB, which fits). Everywhere else (NVIDIA,
+    CDNA4 gfx950) return empty kwargs and let Triton keep its default.
+    Cached: the arch is fixed per process.
+    """
+    global _SPARSE_ATTN_LAUNCH_KWARGS
+    if _SPARSE_ATTN_LAUNCH_KWARGS is None:
+        kwargs: dict = {}
+
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx942, on_gfx906
+
+            if on_gfx906():
+                kwargs = {
+                    "num_warps": 4,
+                    "num_stages": 1,
+                    "waves_per_eu": 1,
+                }
+            elif on_gfx942():
+                # MI300 tuning
+                kwargs = {"num_stages": 1}
+
+        _SPARSE_ATTN_LAUNCH_KWARGS = kwargs
+
+    return _SPARSE_ATTN_LAUNCH_KWARGS
 
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
@@ -110,9 +143,7 @@ def _gqa_sparse_fwd_kernel(
     bt_row = block_table_ptr + pid_b * stride_bt_b
     off_n = tl.arange(0, BLOCK_SIZE_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    off_h = tl.arange(0, BLOCK_SIZE_H)
     d_mask = off_d < head_dim
-    h_mask = off_h < gqa_group_size
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
@@ -120,20 +151,15 @@ def _gqa_sparse_fwd_kernel(
         q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
         valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
         real_topk = tl.minimum(max_topk, valid_blocks)
-        off_qi = pid_q_j * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-        qo_mask = (
-            (off_qi < q_len)[:, None, None]
-            & h_mask[None, :, None]
-            & d_mask[None, None, :]
+        q_ptrs = tl.make_block_ptr(
+            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+            shape=(q_len, gqa_group_size, head_dim),
+            strides=(stride_qn, stride_qh, stride_qd),
+            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
+            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(2, 1, 0),
         )
-        q = tl.load(
-            q_ptr
-            + (q_start + off_qi)[:, None, None] * stride_qn
-            + (pid_h + off_h)[None, :, None] * stride_qh
-            + off_d[None, None, :] * stride_qd,
-            mask=qo_mask,
-            other=0.0,
-        )
+        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
@@ -144,6 +170,8 @@ def _gqa_sparse_fwd_kernel(
         lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+        if q.dtype == tl.float32:
+            q = q.to(tl.float16)
         for _ in range(real_topk):
             blk = tl.load(t_ptr_j).to(tl.int32)
             t_ptr_j = t_ptr_j + stride_tk
@@ -173,6 +201,9 @@ def _gqa_sparse_fwd_kernel(
                         other=1.0,
                     )
                     k = (k * k_scale[None, :]).to(q.dtype)
+            elif k.dtype == tl.float32:
+                # gfx906: Triton MMA lacks fp32 support, cast to fp16.
+                k = k.to(tl.float16)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
@@ -205,19 +236,23 @@ def _gqa_sparse_fwd_kernel(
                         other=1.0,
                     )
                     v = (v * v_scale[:, None]).to(q.dtype)
+            elif v.dtype == tl.float32:
+                # gfx906: Triton MMA lacks fp32 support, cast to fp16.
+                v = v.to(tl.float16)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        tl.store(
-            o_ptr
-            + (q_start + off_qi)[:, None, None] * stride_on
-            + (pid_h + off_h)[None, :, None] * stride_oh
-            + off_d[None, None, :] * stride_od,
-            acc_o.to(o_ptr.dtype.element_ty),
-            mask=qo_mask,
+        o_ptrs = tl.make_block_ptr(
+            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
+            shape=(q_len, gqa_group_size, head_dim),
+            strides=(stride_on, stride_oh, stride_od),
+            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
+            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(2, 1, 0),
         )
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -312,23 +347,23 @@ def _gqa_sparse_decode_kernel(
 
     off_n = tl.arange(0, BLOCK_SIZE_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    off_h = tl.arange(0, BLOCK_SIZE_H)
     d_mask = off_d < head_dim
-    h_mask = off_h < gqa_group_size
-    hd_mask = h_mask[:, None] & d_mask[None, :]
     bt_row = block_table_ptr + req_id * stride_bt_b
 
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q = tl.load(
-        q_ptr
-        + pid_b * stride_qn
-        + (pid_h + off_h)[:, None] * stride_qh
-        + off_d[None, :] * stride_qd,
-        mask=hd_mask,
-        other=0.0,
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
+        shape=(gqa_group_size, head_dim),
+        strides=(stride_qh, stride_qd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(1, 0),
     )
+    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    if q.dtype == tl.float32:
+        q = q.to(tl.float16)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
@@ -360,6 +395,9 @@ def _gqa_sparse_decode_kernel(
                     other=1.0,
                 )
                 k = (k * k_scale[None, :]).to(q.dtype)
+        elif k.dtype == tl.float32:
+            # gfx906: Triton MMA lacks fp32 support, cast to fp16.
+            k = k.to(tl.float16)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
@@ -389,6 +427,9 @@ def _gqa_sparse_decode_kernel(
                     other=1.0,
                 )
                 v = (v * v_scale[:, None]).to(q.dtype)
+        elif v.dtype == tl.float32:
+            # gfx906: Triton MMA lacks fp32 support, cast to fp16.
+            v = v.to(tl.float16)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -400,23 +441,24 @@ def _gqa_sparse_decode_kernel(
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    tl.store(
-        o_ptr
-        + pid_c * stride_o_c
-        + pid_b * stride_o_b
-        + (pid_h + off_h)[:, None] * stride_o_h
-        + off_d[None, :] * stride_o_d,
-        acc_o.to(o_ptr.dtype.element_ty),
-        mask=hd_mask,
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
+        shape=(gqa_group_size, head_dim),
+        strides=(stride_o_h, stride_o_d),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(1, 0),
     )
-    tl.store(
-        lse_ptr
-        + pid_c * stride_l_c
-        + pid_b * stride_l_b
-        + (pid_h + off_h) * stride_l_h,
-        lse_i.to(lse_ptr.dtype.element_ty),
-        mask=h_mask,
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+    lse_ptrs = tl.make_block_ptr(
+        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+        shape=(gqa_group_size,),
+        strides=(stride_l_h,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE_H,),
+        order=(0,),
     )
+    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
 @triton.heuristics(
@@ -451,16 +493,16 @@ def _merge_topk_attn_out_kernel(
 
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
-    o_ptrs = (
-        o_ptr
-        + pid_b * stride_o_b
-        + pid_h * stride_o_h
-        + off_c[:, None] * stride_o_c
-        + off_d[None, :] * stride_o_d
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
+        shape=(NUM_TOPK_CHUNKS, head_dim),
+        strides=(stride_o_c, stride_o_d),
+        offsets=(0, 0),
+        block_shape=(NUM_TOPK_CHUNKS, BLOCK_SIZE_D),
+        order=(1, 0),
     )
     lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
-    o = tl.load(o_ptrs, mask=d_mask[None, :], other=0.0)
+    o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
     weights = tl.exp2(lse - lse_max)
@@ -469,7 +511,7 @@ def _merge_topk_attn_out_kernel(
     out_ptrs = (
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     )
-    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=d_mask)
+    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +643,7 @@ def minimax_m3_sparse_attn(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
+        **_sparse_attn_launch_kwargs(),
     )
 
 
@@ -705,6 +748,7 @@ def minimax_m3_sparse_attn_decode(
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
         USE_PDL=use_pdl,
+        **_sparse_attn_launch_kwargs(),
         **pdl_launch,
     )
     merge_grid = (total_q, num_heads)

@@ -26,7 +26,6 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     DEFAULT_PACKED_NUM_BUFFERS,
 )
-from vllm.utils.nccl import unpinned_nccl_env
 
 
 def decode_nccl_unique_id(
@@ -143,7 +142,8 @@ def stateless_init_process_group(
     world_size: int,
     device,
 ) -> "PyNcclCommunicator":
-    """VLLM provides `StatelessProcessGroup` to create a process group
+    """
+    vLLM provides `StatelessProcessGroup` to create a process group
     without considering the global process group in torch.distributed.
     It is recommended to create `StatelessProcessGroup`, and then initialize
     the data-plane communication (NCCL) between external (train processes)
@@ -155,8 +155,7 @@ def stateless_init_process_group(
     pg = StatelessProcessGroup.create(
         host=master_address, port=master_port, rank=rank, world_size=world_size
     )
-    with unpinned_nccl_env():
-        return PyNcclCommunicator(pg, device=device)
+    return PyNcclCommunicator(pg, device=device)
 
 
 def uid_init_process_group(
@@ -172,13 +171,12 @@ def uid_init_process_group(
     """
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
-    with unpinned_nccl_env():
-        return PyNcclCommunicator.from_unique_id_bytes(
-            nccl_unique_id_bytes,
-            rank=rank,
-            world_size=world_size,
-            device=device,
-        )
+    return PyNcclCommunicator.from_unique_id_bytes(
+        nccl_unique_id_bytes,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+    )
 
 
 def worker_init_process_group(
@@ -223,11 +221,12 @@ def worker_init_process_group(
 
 def trainer_init(
     init_info: NCCLRendezvous | dict,
-    rank: int = 0,
 ) -> "PyNcclCommunicator":
-    """Initialize NCCL process group for trainer-side weight transfer.
+    """
+    Initialize NCCL process group for trainer-side weight transfer.
 
-    Uses the current CUDA device (torch.accelerator.current_device_index()).
+    The trainer is always rank 0 in the process group. Uses the current
+    CUDA device (torch.accelerator.current_device_index()).
 
     Args:
         init_info: Any object carrying the `NCCLRendezvous` fields (a trainer or
@@ -235,13 +234,9 @@ def trainer_init(
             - master_address: str
             - master_port: int
             - world_size: int
-        rank: This trainer process's rank in the group. The broadcast backends
-            have a single trainer at rank 0; multi-rank trainers (m2n) occupy
-            ranks `[0, num_trainer_ranks)` and the workers start after them.
 
     Returns:
         PyNcclCommunicator for weight transfer.
-
     """
     if isinstance(init_info, dict):
         master_address = init_info["master_address"]
@@ -252,11 +247,12 @@ def trainer_init(
         master_port = init_info.master_port
         world_size = init_info.world_size
 
+    # Trainer is always rank 0
     device = torch.accelerator.current_device_index()
     return stateless_init_process_group(
         master_address,
         master_port,
-        rank,
+        0,
         world_size,
         device,
     )

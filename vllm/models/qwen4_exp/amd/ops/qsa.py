@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Triton kernels for the Qwen4Exp weight-free QSA path."""
 
 from __future__ import annotations
@@ -9,11 +10,25 @@ import math
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+from vllm.models.qwen4_exp.common.qsa_cache import QSA_ACTIVATION_DTYPES
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+logger = init_logger(__name__)
+
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+# Largest selection width `_C.top_k_per_row_decode` is safe for on gfx906.
+#
+# Measured 2026-09-28 (`/local/tmp/wht1/topk_case.py`, one process per width so a
+# sticky HIP error cannot masquerade as the next case's failure): widths 4, 512,
+# 2048, 4096, 8192 agree with the reference selection, while 12288 and 16384
+# raise `illegal memory access` -- a memory-safety failure, not a clean limit, so
+# the ceiling is "verified working", not "documented maximum". Widths above it
+# take `_reference_block_ranks`.
+_TOPK_KERNEL_MAX_WIDTH = 8192
 
 
 @triton.jit
@@ -110,6 +125,110 @@ def _qsa_mqa_paged_kernel(
         logits_ptr + row * stride_logits_row + columns,
         tl.where(valid, score, -float("inf")),
         mask=(row < num_rows) & (columns < num_columns),
+    )
+
+
+@triton.jit
+def _qsa_mqa_paged_tiled_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    logits_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_req,
+    stride_table_page,
+    stride_logits_row,
+    num_rows,
+    num_columns,
+    num_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    # Row-tiled indexer scoring. A tile of BLOCK_M query rows shares ONE load of
+    # the compressed keys (the kernel is L2-bandwidth bound on that load) and the
+    # per-head query.key reduction becomes an MFMA tl.dot. Correct only when all
+    # rows in the tile share one request (page table is per-request); the wrapper
+    # routes uniform-request (prefill) calls here and falls back otherwise.
+    rt = tl.program_id(0)
+    ct = tl.program_id(1)
+    row_ids = rt * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_ids = ct * BLOCK_N + tl.arange(0, BLOCK_N)
+    dims = tl.arange(0, BLOCK_D)
+    row_ok = row_ids < num_rows
+
+    request = tl.load(token_to_req_ptr + row_ids, mask=row_ok, other=-1)
+    safe_req = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    qpos = tl.load(query_positions_ptr + row_ids, mask=row_ok, other=0)
+    req_ok = row_ok & (request >= 0) & (request < num_requests)
+    seqlen = tl.load(sequence_lengths_ptr + safe_req, mask=req_ok, other=0)
+    visible = tl.minimum((qpos + 1) // COMPRESS_RATIO, seqlen // COMPRESS_RATIO)
+    if ct == 0:
+        tl.store(visible_blocks_ptr + row_ids, visible, mask=row_ok)
+
+    # Uniform request across the tile (guaranteed by the wrapper): one page table.
+    tile_req = tl.maximum(tl.max(tl.where(row_ok, safe_req, 0)), 0)
+    logical_page = col_ids // PAGE_SIZE
+    page_offset = col_ids % PAGE_SIZE
+    col_ok = (col_ids < num_columns) & (logical_page < PAGE_TABLE_WIDTH)
+    safe_lp = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+    physical_page = tl.load(
+        page_table_ptr + tile_req * stride_table_req + safe_lp * stride_table_page,
+        mask=col_ok,
+        other=-1,
+    )
+    col_ok &= (physical_page >= 0) & (physical_page < num_pages)
+    safe_pp = tl.maximum(physical_page, 0).to(tl.int64)
+
+    # keys transposed to [BLOCK_D, BLOCK_N] so tl.dot contracts over the head dim.
+    keys_t = tl.load(
+        k_cache_ptr
+        + safe_pp[None, :] * stride_cache_block
+        + page_offset[None, :] * stride_cache_token
+        + dims[:, None] * stride_cache_dim,
+        mask=(dims[:, None] < HEAD_DIM) & col_ok[None, :],
+        other=0.0,
+    )
+    scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for head in tl.static_range(0, NUM_HEADS):
+        qh = tl.load(
+            q_ptr
+            + row_ids[:, None] * stride_q_row
+            + head * stride_q_head
+            + dims[None, :] * stride_q_dim,
+            mask=row_ok[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        )
+        dot = tl.dot(qh, keys_t, out_dtype=tl.float32)
+        scores += tl.maximum(dot, 0.0)
+    scores /= score_divisor
+
+    valid = (
+        row_ok[:, None]
+        & col_ok[None, :]
+        & (col_ids[None, :] < visible[:, None])
+        & (request[:, None] >= 0)
+    )
+    tl.store(
+        logits_ptr + row_ids[:, None] * stride_logits_row + col_ids[None, :],
+        tl.where(valid, scores, -float("inf")),
+        mask=row_ok[:, None] & (col_ids[None, :] < num_columns),
     )
 
 
@@ -293,7 +412,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             other=0.0,
         )
         scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
+        # Scaling scores avoids re-quantizing a scaled query to 2-byte float.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
@@ -600,6 +719,7 @@ def qsa_mqa_paged(
     score_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
+
     _validate_mqa(q)
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA scoring requires a GPU and Triton")
@@ -632,6 +752,59 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
+    # Row-tiled path when every row belongs to the same request (uniform-request
+    # prefill): a tile of BLOCK_M rows shares one load of the compressed keys
+    # (this scoring is L2-bandwidth bound on that load) and the per-head
+    # query-key reduction becomes a single tl.dot. Worth it only where that dot
+    # is a hardware instruction -- fp16 always lowers to one (v_dot2 on gfx906,
+    # MFMA on CDNA), bf16 is emulated per-scalar on gfx906 (measured 0.42x there
+    # vs 1.39x in fp16) and native elsewhere. The uniformity check syncs the
+    # device, so it stays behind the row-count gate: decode (few rows, mixed
+    # requests) always takes the per-row kernel.
+    dot_is_native = q.dtype == torch.float16 or current_platform.supports_native_bf16
+    use_tiled = (
+        q.shape[0] >= 64
+        and dot_is_native
+        and bool((token_to_req == token_to_req[0]).all())
+    )
+    if use_tiled:
+        block_m = 16
+        _qsa_mqa_paged_tiled_kernel[
+            (triton.cdiv(q.shape[0], block_m), triton.cdiv(columns, block_n))
+        ](
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            visible_blocks,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(3),
+            page_table.stride(0),
+            page_table.stride(1),
+            logits.stride(0),
+            q.shape[0],
+            columns,
+            k_cache.shape[0],
+            page_table.shape[0],
+            float(score_divisor),
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=triton.next_power_of_2(q.shape[2]),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+        )
+        return logits, visible_blocks
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,
@@ -677,6 +850,7 @@ def expand_qsa_block_indices_cuda(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
+
     if not block_indices.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA index expansion requires a GPU and Triton")
     if token_topk % compress_ratio:
@@ -724,6 +898,80 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+def _reference_block_ranks(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    blocks: torch.Tensor,
+    block_topk: int,
+) -> None:
+    """Reference selection for widths the tuned top-k kernel does not cover.
+
+    Mirrors the ``torch`` backend of ``vllm/model_executor/layers/indexer_topk.py``:
+    mask the columns at or past each row's visible end, take the ``block_topk``
+    highest scores, then -1-fill every entry that falls outside the row's
+    visibility so the expand step skips it. Rows with fewer visible blocks than
+    the width come back -1-padded, and a width wider than the cache is clamped --
+    the same contract ``_C.top_k_per_row_decode`` honours.
+    """
+
+    rows, columns = logits.shape
+    ends = row_ends.reshape(-1)[:rows].to(torch.int64)
+    blocks.fill_(-1)
+    if columns == 0:
+        return
+
+    width = min(int(block_topk), columns)
+    column_ids = torch.arange(columns, device=logits.device)
+    masked = logits.masked_fill(
+        column_ids.unsqueeze(0) >= ends.unsqueeze(1), float("-inf")
+    )
+    selected = masked.topk(width, dim=-1).indices
+    # A column at or past the row's end is not selectable -- the kernel never scans it.
+    # Rows with fewer visible blocks than the width must therefore come back -1-padded
+    # rather than carrying indices for blocks the row cannot see. (Padding by position
+    # instead would leak them, which only shows up when width > visible blocks.)
+    blocks[:, :width].copy_(
+        torch.where(selected < ends.unsqueeze(1), selected, -1).to(blocks.dtype)
+    )
+
+
+def _select_qsa_block_ranks(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    blocks: torch.Tensor,
+    block_topk: int,
+) -> None:
+    """Fill ``blocks`` with each row's top ``block_topk`` block ranks.
+
+    The decode kernel serves any width up to ``_TOPK_KERNEL_MAX_WIDTH`` (and the
+    tuned widths above upstream's 512/2048 restriction are among them). Wider
+    selections -- e.g. a model whose indexer budget covers its whole context, so
+    the selection degenerates to "every block" -- take the reference path, which
+    is correct but untuned.
+    """
+
+    if block_topk <= _TOPK_KERNEL_MAX_WIDTH:
+        ops.top_k_per_row_decode(
+            logits,
+            1,
+            row_ends,
+            blocks,
+            blocks.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            block_topk,
+        )
+        return
+
+    logger.warning_once(
+        "QSA selection width %d is beyond the top-k kernel's verified ceiling "
+        "(%d); using the reference selection path (correct, but untuned).",
+        block_topk,
+        _TOPK_KERNEL_MAX_WIDTH,
+    )
+    _reference_block_ranks(logits, row_ends, blocks, block_topk)
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -736,6 +984,7 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
+
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -794,16 +1043,7 @@ def qsa_select_paged_tokens(
                 columns,
             )
         else:
-            ops.top_k_per_row_decode(
-                logits,
-                1,
-                visible_blocks,
-                blocks,
-                blocks.shape[0],
-                logits.stride(0),
-                logits.stride(1),
-                block_topk,
-            )
+            _select_qsa_block_ranks(logits, visible_blocks, blocks, block_topk)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
@@ -825,7 +1065,8 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged 2-byte-float K/V caches."""
+
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -842,7 +1083,8 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype in QSA_ACTIVATION_DTYPES
+    assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -967,6 +1209,7 @@ def qsa_store_cache_rows(
     rows: torch.Tensor,
 ) -> None:
     """Store fixed-width rows in a QSA cache without boolean indexing."""
+
     if not cache.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA cache stores require a GPU and Triton")
     if cache.ndim != 4 or cache.shape[2] != 1:
@@ -1012,6 +1255,7 @@ def qsa_compress_groups_with_ratio(
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool completed groups from the compressor-state ring and raw token rows."""
+
     if not raw_keys.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA compression requires a GPU and Triton")
     rows = token_to_req.numel()

@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import hashlib
+import json
+import os
 from collections.abc import Iterable
 
 import torch
@@ -52,6 +55,60 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# --- draft-vocab manifest (written by tools/build_draft_vocab.py) ------------
+# The work dir may carry cat1_manifest.json: which corpus the list came from,
+# and hashes binding the ids file to the sliced head rows (the row order *is*
+# the id mapping, so an equal-count swap of the two files would otherwise be
+# silent). Absent manifest = older work dir, no checks, unchanged behaviour.
+_MANIFEST_NAME = "cat1_manifest.json"
+
+
+def _ids_sha1(ids) -> str:
+    return hashlib.sha1(",".join(str(int(i)) for i in sorted(ids)).encode()).hexdigest()
+
+
+def _file_sha1(path: str) -> str | None:
+    if not os.path.exists(path):
+        return None
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _check_draft_vocab_manifest(model_dir: str, ids: torch.Tensor) -> dict | None:
+    """Verify the manifest against the loaded ids (and the head file, unless
+    MTP_DRAFT_VOCAB_STRICT=0). Returns the manifest so the caller can log its
+    provenance, or None when there is none."""
+    path = os.path.join(model_dir, _MANIFEST_NAME)
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        manifest = json.load(fh)
+    want = manifest.get("ids_sha1")
+    got = _ids_sha1(ids.tolist())
+    if want and got != want:
+        raise ValueError(
+            f"{path}: mtp_draft_vocab_ids.pt does not match the manifest "
+            f"(ids sha1 {got} != {want}) - the ids file and the sliced head are "
+            f"not a matched pair. Re-run build_draft_vocab.py slice."
+        )
+    head_file = manifest.get("head_file")
+    if (
+        head_file
+        and manifest.get("head_sha1")
+        and os.environ.get("MTP_DRAFT_VOCAB_STRICT", "1") != "0"
+    ):
+        got_h = _file_sha1(os.path.join(model_dir, head_file))
+        if got_h != manifest["head_sha1"]:
+            raise ValueError(
+                f"{path}: {head_file} does not match the manifest "
+                f"(sha1 {got_h} != {manifest['head_sha1']}) - the sliced "
+                f"draft head is not the one this ids list was built with."
+            )
+    return manifest
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -86,6 +143,56 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             self.vocab_size,
             config.hidden_size,
         )
+
+        # CAT-1 (ported from syv-ai/qwen38-27b-rtx3090, patches/
+        # qwen3_5-mtp-draft-vocab.patch, adapted for our bf16 unquantized
+        # lm_head): vocab-truncated draft head. If the model directory ships
+        # mtp_draft_vocab_ids.pt (built by tools/build_draft_vocab.py) the
+        # drafter scores only those rows (mtp.draft_lm_head.*) instead of the
+        # full 248k-row lm_head; logits for all other ids are -inf.
+        # Speculative decoding stays exact, only the acceptance rate can
+        # change. File absence = baseline; MTP_DRAFT_VOCAB=0 forces baseline.
+        self.draft_lm_head = None
+        self.draft_vocab_ids = None
+        _ids_path = os.path.join(model_config.model, "mtp_draft_vocab_ids.pt")
+        if (
+            os.path.exists(_ids_path)
+            and os.environ.get("MTP_DRAFT_VOCAB", "1") != "0"
+        ):
+            _ids = torch.load(_ids_path, map_location="cpu")
+            self.draft_vocab_ids = _ids
+            # Manifest (optional): provenance + ids<->head pairing check.
+            _manifest = _check_draft_vocab_manifest(model_config.model, _ids)
+            if _manifest is not None:
+                _prov = _manifest.get("provenance") or {}
+                _srcs = (
+                    ", ".join(
+                        os.path.basename(f.get("path", "?"))
+                        for f in _prov.get("corpus_files", [])[:3]
+                    )
+                    or "?"
+                )
+                logger.info(
+                    "MTP draft-vocab manifest: %d ids, sha1 %s, built %s, "
+                    "corpus %s (%.1fM tokens, holdout %s, control tokens %s)",
+                    _manifest.get("n_ids", int(_ids.numel())),
+                    str(_manifest.get("ids_sha1"))[:12],
+                    _prov.get("created", _manifest.get("created", "?")),
+                    _srcs,
+                    _prov.get("corpus_tokens", 0) / 1e6,
+                    _prov.get("holdout", "?"),
+                    _prov.get("control_tokens", "?"),
+                )
+            # Our lm_head is unquantized bf16 (AWQ ignore list), so the sliced
+            # rows are plain bf16 too — quant_config=None (upstream passed
+            # vllm_config.quant_config because their rows were int8-packed).
+            self.draft_lm_head = ParallelLMHead(
+                int(_ids.numel()),
+                config.hidden_size,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "draft_lm_head"),
+            )
+            logger.info("MTP drafter uses a %d-token draft head", int(_ids.numel()))
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -227,6 +334,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
+        cache_config = vllm_config.cache_config
+        if cache_config.mamba_cache_mode == "all":
+            raise NotImplementedError(
+                "Qwen3_5MTP currently does not support 'all' prefix caching, "
+                "please use '--mamba-cache-mode=align' instead"
+            )
+
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
@@ -248,6 +362,26 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # CAT-1 (syv port): processor for the truncated draft head.
+        _draft_ids = getattr(self.model, "draft_vocab_ids", None)
+        self.draft_logits_processor = (
+            LogitsProcessor(int(_draft_ids.numel()))
+            if _draft_ids is not None
+            and getattr(self.model, "draft_lm_head", None) is not None
+            else None
+        )
+        # CAT-1 guard: use_local_argmax_reduction scores drafts via
+        # get_top_tokens() -> self.lm_head and would silently bypass the
+        # shortlist (degraded acceptance, no error). Fail loudly instead.
+        if self.draft_logits_processor is not None:
+            _spec_cfg = getattr(vllm_config, "speculative_config", None)
+            if getattr(_spec_cfg, "use_local_argmax_reduction", False):
+                raise ValueError(
+                    "MTP draft-vocab shortlist is incompatible with "
+                    "use_local_argmax_reduction: the local-argmax fast path "
+                    "reads the full lm_head and would ignore the shortlist. "
+                    "Disable use_local_argmax_reduction."
+                )
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -279,7 +413,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
 
         return inputs_embeds
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -298,22 +432,58 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        # CAT-1 (syv port): score with the truncated draft head, then scatter
+        # into a full-vocab buffer (-inf everywhere else). Rejection sampling
+        # uses the target model, so this stays exact.
+        if self.draft_logits_processor is not None:
+            sub = self.draft_logits_processor(self.model.draft_lm_head, hidden_states)
+            if sub is None:
+                return None
+            ids = self.model.draft_vocab_ids
+            assert ids is not None  # set together with draft_lm_head in __init__
+            if ids.device != sub.device:
+                # One-shot lazy migration. Safe under cudagraphs: this branch
+                # can only fire on the first eager call (ids start on CPU),
+                # which happens during warmup before any graph capture; after
+                # it, the device matches and the branch is dead code in every
+                # captured replay.
+                ids = ids.to(sub.device)
+                self.model.draft_vocab_ids = ids
+            full = sub.new_full((sub.shape[0], self.config.vocab_size), float("-inf"))
+            full.index_copy_(1, ids, sub)
+            # Marker for the V2 bring-up check: V2's MTP path has its own top-k
+            # sharing, so a run that never logs this line is NOT using the
+            # shortlist (silent loss of CAT-1's read saving). Grep the server log
+            # for it when validating V2.
+            logger.info_once(
+                "MTP draft-vocab shortlist ACTIVE (%d ids; logits outside the "
+                "list are -inf)",
+                int(ids.numel()),
+            )
+            return full
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def is_unused_checkpoint_weight(self, name: str) -> bool:
-        return not name.startswith("mtp.") and not any(
-            key in name for key in ["embed_tokens", "lm_head"]
-        )
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without all-gathering full logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
             for name, weight in weights:
-                if self.is_unused_checkpoint_weight(name):
+                # CAT-1 (syv port): skip the truncated draft head when it is
+                # disabled (no mtp_draft_vocab_ids.pt / MTP_DRAFT_VOCAB=0).
+                if "draft_lm_head" in name and self.model.draft_lm_head is None:
                     continue
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
-                elif "embed_tokens" in name:
-                    name = name.replace("language_model.", "")
+                elif any(key in name for key in ["embed_tokens", "lm_head"]):
+                    if "embed_tokens" in name:
+                        name = name.replace("language_model.", "")
+                else:
+                    continue
                 yield name, weight
 
         loader = AutoWeightsLoader(self)

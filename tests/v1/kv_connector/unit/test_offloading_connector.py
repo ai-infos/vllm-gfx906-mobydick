@@ -76,7 +76,7 @@ _EVENT_DRAIN_TIMEOUT = 60
 
 
 class MockSubscriber:
-    """Helper class to receive and verify published events."""
+    """Helper class to receive and verify published events"""
 
     def __init__(
         self,
@@ -121,7 +121,7 @@ class MockSubscriber:
         return cpu_stored_events
 
     def close(self):
-        """Clean up resources."""
+        """Clean up resources"""
         self.sub.close()
 
 
@@ -261,7 +261,9 @@ def test_cpu_offloading(
     cpu_block_size: int | None,
     uses_hma: bool,
 ) -> None:
-    """Tests OffloadingConnector with CPUOffloadingSpec."""
+    """
+    Tests OffloadingConnector with CPUOffloadingSpec.
+    """
     # configure OffloadingConnector (spec_name=CPUOffloadingSpec by default)
     extra_config: dict = {"cpu_bytes_to_use": 500 << 20}
     if cpu_block_size is not None:
@@ -566,7 +568,10 @@ def test_fs_tiering_offloading(tmp_path) -> None:
         ("state-spaces/mamba-1.4b-hf", 16, 1),
     ],
 )
-def test_mamba_cpu_offload_boundary(model: str, block_size: int, tp_size: int):
+@pytest.mark.parametrize("mamba_cache_mode", ["align", "all"])
+def test_mamba_cpu_offload_boundary(
+    model: str, block_size: int, tp_size: int, mamba_cache_mode: str
+):
     kv_transfer_config = KVTransferConfig(
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
@@ -583,7 +588,7 @@ def test_mamba_cpu_offload_boundary(model: str, block_size: int, tp_size: int):
         kv_transfer_config=kv_transfer_config,
         language_model_only=True,
         enable_prefix_caching=True,
-        mamba_cache_mode="align",
+        mamba_cache_mode=mamba_cache_mode,
         # Use lossless state storage so this exact-equality regression isolates
         # offload boundary selection from low-precision Mamba checkpointing.
         mamba_cache_dtype="float32",

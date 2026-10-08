@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+import os
+
 import torch
 import torch.nn as nn
 
@@ -9,7 +12,6 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
@@ -41,47 +43,13 @@ def _skip_aiter_sampler_on_gfx1250() -> bool:
     return on_gfx1250()
 
 
-def _flashinfer_jit_unsupported_reason(capability: DeviceCapability) -> str | None:
-    """Return why FlashInfer JIT codegen cannot target the current GPU, or
-    None if it can.
-
-    FlashInfer swallows arch-detection errors when building its compilation
-    context (e.g. SM 12.x with a CUDA toolkit older than 12.9), leaving an
-    empty target-arch set that makes every JIT spec fail with a misleading
-    "requires sm75 or higher" error at first use — killing the engine during
-    startup profiling (https://github.com/vllm-project/vllm/issues/42393).
-    """
-    try:
-        from flashinfer.jit.core import check_cuda_arch
-    except ImportError:
-        return None
-    try:
-        check_cuda_arch()
-        return None
-    except RuntimeError as e:
-        reason = str(e)
-    try:
-        # Re-derive the real error that FlashInfer swallowed during arch
-        # detection, e.g. "SM 12.x requires CUDA >= 12.9".
-        from flashinfer.compilation_context import CompilationContext
-
-        CompilationContext._normalize_cuda_arch(capability.major, capability.minor)
-    except RuntimeError as e:
-        reason = str(e)
-    except Exception:
-        # FlashInfer internals changed; keep the original error message.
-        pass
-    return reason
-
-
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
 
     Returns False (with appropriate logging) when ``VLLM_USE_FLASHINFER_SAMPLER``
     is 0, when the platform isn't CUDA, when the GPU's compute capability is
-    unsupported, when the GPU has 16 or fewer SMs, or when FlashInfer cannot
-    JIT-compile for the current GPU/CUDA toolchain. Raises ``RuntimeError`` if
-    the user explicitly opted in via the env var but FlashInfer is unavailable.
+    unsupported. Raises ``RuntimeError`` if the user explicitly opted in
+    via the env var but FlashInfer is unavailable.
 
     Assumes flashinfer is installed, as guaranteed by ``requirements/cuda.txt``;
     otherwise importing the FlashInfer backend below raises ``ImportError``.
@@ -107,18 +75,6 @@ def flashinfer_sampler_supported() -> bool:
         unsupported_reason = (
             f"unsupported compute capability {capability.as_version_str()}"
         )
-    elif (
-        num_sms := current_platform.num_compute_units(
-            torch.accelerator.current_device_index()
-        )
-    ) <= 16:
-        # FlashInfer 0.7+ rejects multi-CTA top-k masking on <=16 SMs because
-        # its cross-CTA software barrier cannot guarantee forward progress.
-        unsupported_reason = (
-            f"top-k masking requires more than 16 SMs; device has {num_sms}"
-        )
-    else:
-        unsupported_reason = _flashinfer_jit_unsupported_reason(capability)
 
     if unsupported_reason is None:
         logger.info_once("Using FlashInfer for top-p & top-k sampling.", scope="global")
@@ -136,71 +92,9 @@ def flashinfer_sampler_supported() -> bool:
     return False
 
 
-def xpu_sampler_supported() -> bool:
-    """Decide whether the fused XPU top-k/top-p sampler kernel can be used.
-
-    Returns False (with appropriate logging) when the platform isn't XPU, when
-    ``VLLM_XPU_USE_SAMPLER_KERNEL`` is 0.
-
-    Note: callers must additionally ensure no request needs a per-request seed
-    or greedy sampling, since the kernel draws from the device's default
-    generator and always samples randomly.
-    """
-    if not current_platform.is_xpu():
-        return False
-    if not envs.VLLM_XPU_USE_SAMPLER_KERNEL:
-        logger.info_once(
-            "Fused XPU top-p/top-k sampling disabled via VLLM_XPU_USE_SAMPLER_KERNEL=0."
-        )
-        return False
-
-    logger.info_once("Using the fused XPU kernel for top-p & top-k sampling.")
-    return True
-
-
-def xpu_sample(
-    logits: torch.Tensor,
-    k: torch.Tensor | None,
-    p: torch.Tensor | None,
-    logprobs_mode: LogprobsMode = "raw_logprobs",
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Sample from the logits using the fused XPU top-k/top-p kernel.
-
-    Statistically equivalent to `random_sample`, but avoids sorting the vocab
-    and never materializes the probability tensor. The noise comes from the
-    device's default generator, so per-request generators aren't supported.
-
-    Returns the sampled token ids and, for processed logprobs modes, the
-    post-top-k/top-p logits (or logprobs); otherwise None.
-    """
-    logits = logits.to(dtype=torch.float32).contiguous()
-    sampled = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
-    logits_to_return = (
-        torch.empty_like(logits) if logprobs_mode in PROCESSED_LOGPROBS_MODES else None
-    )
-
-    generator = torch.xpu.default_generators[logits.device.index]
-    state = generator.get_state()
-    seed, offset = state.view(torch.int64).tolist()
-    seeds = torch.tensor([seed, offset], dtype=torch.int64, device="cpu")
-    # The XPU kernel expects k as int64 (Long), but the input batch
-    # stores top_k as int32. Cast here to avoid dtype mismatch.
-    if k is not None:
-        k = k.to(torch.int64)
-    torch.ops.vllm.xpu_topk_topp_sampler(
-        sampled, logits_to_return, logits, k, p, logprobs_mode, seeds
-    )
-    # The custom XPU sampler kernel consumes RNG values internally, so advance
-    # the default generator's offset to keep future draws deterministic.
-    # pytorch: offset must be multiple of 4
-    offset = (offset + logits.numel() + 3) // 4 * 4
-    state.view(torch.int64)[1] = offset
-    generator.set_state(state)
-    return sampled, logits_to_return
-
-
 class TopKTopPSampler(nn.Module):
-    """Module that performs optional top-k and top-p filtering followed by
+    """
+    Module that performs optional top-k and top-p filtering followed by
     weighted random sampling of logits.
 
     Implementations may update the logits tensor in-place.
@@ -234,14 +128,9 @@ class TopKTopPSampler(nn.Module):
             else:
                 self.forward = self.forward_cpu
         elif current_platform.is_xpu():
-            if xpu_sampler_supported() and not envs.VLLM_BATCH_INVARIANT:
+            if envs.VLLM_XPU_USE_SAMPLER_KERNEL:
                 self.forward = self.forward_xpu
             else:
-                if envs.VLLM_BATCH_INVARIANT:
-                    logger.info_once(
-                        "VLLM_BATCH_INVARIANT is enabled. Using the "
-                        "PyTorch-native sampler on XPU."
-                    )
                 self.forward = self.forward_native
         elif (
             logprobs_mode not in PROCESSED_LOGPROBS_MODES
@@ -267,7 +156,8 @@ class TopKTopPSampler(nn.Module):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """PyTorch-native implementation of top-k and top-p sampling.
+        """
+        PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
         """
@@ -319,11 +209,10 @@ class TopKTopPSampler(nn.Module):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """CPU Gumbel-max sampling with per-token SplitMix64 noise.
+        """
+        PyTorch-native implementation of top-k and top-p sampling for CPU.
 
-        Independent (seed, token) streams avoid the wrapping-window bias
-        (#59786). Falls back to native sampling when fp64 Gumbel noise
-        is requested.
+        The logits tensor may be updated in-place.
         """
         logits = apply_top_k_top_p(logits, k, p)
         logits_to_return = None
@@ -332,25 +221,16 @@ class TopKTopPSampler(nn.Module):
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
-        if self.use_fp64_gumbel:
-            probs = logits.softmax(dim=-1, dtype=torch.float32)
-            q = empty_exponential_noise_like(probs, self.use_fp64_gumbel)
-            q.exponential_()
-            for i, generator in generators.items():
-                q[i].exponential_(generator=generator)
-            return sample_with_exponential_noise(probs, q), logits_to_return
+        if not generators and not self.use_fp64_gumbel:
+            return compiled_random_sample(logits), logits_to_return
 
-        batch_size = logits.shape[0]
-        seeds = torch.randint(0, 2**31, (batch_size,), dtype=torch.long)
-        for i, gen in generators.items():
-            seeds[i] = torch.randint(
-                0, 2**31, (1,), generator=gen, dtype=torch.long
-            ).item()
-        logits_f32 = logits.to(dtype=torch.float32)
-        return (
-            torch.ops._C.fused_gumbel_argmax(logits_f32, seeds),
-            logits_to_return,
-        )
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        q = empty_exponential_noise_like(probs, self.use_fp64_gumbel)
+        q.exponential_()
+        for i, generator in generators.items():
+            q[i].exponential_(generator=generator)
+
+        return sample_with_exponential_noise(probs, q), logits_to_return
 
     def _init_aiter_ops(self) -> bool:
         if self._aiter_ops_import_failed:
@@ -444,7 +324,37 @@ class TopKTopPSampler(nn.Module):
                 "PyTorch-native implementation."
             )
             return self.forward_native(logits, generators, k, p)
-        return xpu_sample(logits, k, p, self.logprobs_mode)
+        random_sampled = torch.empty(
+            logits.shape[0], dtype=torch.int64, device=logits.device
+        )
+        logits_to_return = None
+        if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+            logits_to_return = torch.empty_like(logits)
+
+        assert len(generators) != logits.shape[0], (
+            "xpu kernel topk_topp_sampler does not support batch-wise generators."
+        )
+        generator = torch.xpu.default_generators[logits.device.index]
+
+        state = generator.get_state()
+        seed, offset = state.view(torch.int64)
+        seeds = torch.tensor(
+            [seed, offset], dtype=torch.int64, device=torch.device("cpu")
+        )
+        # The XPU kernel expects k as int64 (Long), but the input batch
+        # stores top_k as int32. Cast here to avoid dtype mismatch.
+        if k is not None:
+            k = k.to(torch.int64)
+        torch.ops.vllm.xpu_topk_topp_sampler(
+            random_sampled, logits_to_return, logits, k, p, self.logprobs_mode, seeds
+        )
+        # The custom XPU sampler kernel consumes RNG values internally, so advance
+        # the default generator's offset to keep future draws deterministic.
+        # pytorch: offset must be multiple of 4
+        offset = (offset + logits.numel() + 3) // 4 * 4
+        state.view(torch.int64)[1] = offset
+        generator.set_state(state)
+        return random_sampled, logits_to_return
 
 
 # Note: this is a workaround for
@@ -466,8 +376,114 @@ def apply_top_k_top_p(
     if HAS_TRITON:
         return apply_top_k_top_p_triton(logits, k, p)
 
+    # SYV-4 (gfx906): small-batch top-k/top-p without the full-vocab sort.
+    # Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
+    # fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
+    # SYV-4); implementation is ours for the gfx906 ROCm path. The pytorch
+    # path below sorts all ~248k logits per row (~0.35 ms at B=1); when every
+    # row's k is small and host-known, torch.topk(k) + a threshold mask is
+    # O(V log k) and bit-equivalent modulo fp rounding.
+    if (
+        _sort_free_small_k_enabled()
+        and _can_use_sort_free_small_k(logits, k)
+    ):
+        return apply_top_k_top_p_sort_free(logits, k, p)
+
+    # Use pytorch sort implementation for small batch sizes.
     is_cpu = current_platform.is_cpu()
     return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=is_cpu)
+
+
+def _sort_free_small_k_enabled() -> bool:
+    """Opt-out for the SYV-4 sort-free small-k path (default ON)."""
+    return os.environ.get("VLLM_GFX906_SORT_FREE_SMALL_K", "1") == "1"
+
+
+def _can_use_sort_free_small_k(
+    logits: torch.Tensor, k: torch.Tensor | None
+) -> bool:
+    """Preconditions for the sort-free path.
+
+    ``k`` is the per-row top-k from the input batch (GPU int32); rows whose
+    request does not use top-k are padded with ``vocab_size`` by
+    ``gpu_input_batch``. Such full-vocab rows cannot be handled here (top-p
+    over the whole vocabulary needs the sort), so any of them forces the
+    fallback. The max-k check is one small device reduction + sync — same
+    class of sync the reference path already performs.
+    """
+    if k is None or not k.is_cuda:
+        return False
+    if logits.shape[0] >= 8:
+        return False
+    # One device reduction + sync (the reference path performs the same class
+    # of sync). gpu_input_batch only ever stores values in [1, vocab_size],
+    # so max(k) >= vocab_size iff some row is a disabled/padded full-vocab row.
+    kmax = int(k.max())
+    return kmax < logits.shape[1] and kmax <= 64
+
+
+def apply_top_k_top_p_sort_free(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """SYV-4: top-k/top-p without sorting the full vocabulary.
+
+    Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
+    fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
+    SYV-4); implementation is ours for the gfx906 ROCm path.
+
+    Equivalent to ``apply_top_k_top_p_pytorch`` for batches where every row's
+    k is small (<= 64). The reference path sorts all ~248k logits per row
+    (~0.35 ms at B=1) and scatters back; here one ``torch.topk(k)`` gives the
+    descending candidates, from which both thresholds are derived:
+
+    - top-k: mask everything below the per-row k-th largest value (the
+      reference's ascending-sort gather picks the same value up to tie order,
+      and tied values are numerically equal);
+    - top-p: cumulative softmax mass over the row's own top-k candidates in
+      descending order; mask below the crossing value. This mirrors the
+      reference exactly — it masks the sub-k-threshold entries first (they
+      contribute 0 to the softmax), so its cumsum also runs over the top-k
+      survivors only.
+
+    Masked entries contribute exp(-inf) = 0 to the final softmax denominator,
+    so renormalized probabilities match the reference up to fp rounding.
+    At least one entry always survives (the crossing value itself is kept).
+
+    The logits tensor is updated in-place.
+    """
+    assert k is not None
+    kk = int(k.max())  # <= 64 by precondition; all rows partial here
+    vals, _ = logits.topk(kk, dim=1)  # [B, kk], descending per row
+
+    # Per-row top-k threshold: the k-th largest value.
+    k_thresh = vals.gather(1, (k - 1).unsqueeze(1)).squeeze(1)  # [B]
+    logits.masked_fill_(logits < k_thresh.unsqueeze(1), -float("inf"))
+
+    if p is not None:
+        # Per-row top-p over each row's own top-k candidates only. The reference
+        # softmaxes the full vocab with non-candidates masked to -inf, so its
+        # per-candidate probabilities equal this restricted softmax exactly.
+        cand = vals.masked_fill_(
+            torch.arange(kk, device=vals.device).unsqueeze(0) >= k.unsqueeze(1),
+            -float("inf"),
+        )
+        probs_desc = cand.softmax(dim=-1)          # [B, kk], descending order
+        cum = torch.cumsum(probs_desc, dim=-1)     # cum[j] = mass of top-(j+1)
+        # keep_count = smallest n with cum[n-1] >= p  ==  (# of j with cum[j] < p) + 1.
+        # `below` is monotone [1..1 0..0] (cum is non-decreasing), so its sum is
+        # exactly that count — no argmax/bool op needed (ROCm has no bool kernels).
+        below = (cum < p.unsqueeze(1)).to(torch.int32)
+        # keep_count = smallest n with cum[n-1] >= p, clamped to this row's own
+        # k: (a) at p=1.0 the final cum entry can round just under 1.0, pushing
+        # the count to kk+1; (b) when a row's top-k mass cannot reach its target
+        # p (e.g. top_k=3 with p=0.95), the reference keeps exactly that row's
+        # k candidates — without the per-row clamp the gather would land on a
+        # -inf slot and top-p would silently no-op for the row.
+        keep_count = torch.clamp(torch.minimum(below.sum(dim=1) + 1, k), min=1)
+        p_thresh = vals.gather(1, (keep_count - 1).unsqueeze(1)).squeeze(1)
+        logits.masked_fill_(logits < p_thresh.unsqueeze(1), -float("inf"))
+
+    return logits
 
 
 def apply_top_k_top_p_pytorch(
@@ -515,7 +531,8 @@ def apply_top_k_top_p_pytorch(
 
 
 def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Apply top-k mask to the logits.
+    """
+    Apply top-k mask to the logits.
 
     This implementation doesn't involve sorting the entire vocab.
     Note however that it involves a GPU->CPU sync which can be detrimental for

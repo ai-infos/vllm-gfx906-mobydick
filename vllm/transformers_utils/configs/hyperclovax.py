@@ -17,16 +17,17 @@
 # limitations under the License.
 """HyperCLOVA X model configuration."""
 
-from transformers.configuration_utils import PreTrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 
-class HyperCLOVAXConfig(PreTrainedConfig):
-    r"""This is the configuration class to store the configuration of a
+class HyperCLOVAXConfig(PretrainedConfig):
+    r"""
+    This is the configuration class to store the configuration of a
     [`HyperCLOVAXModel`]. It is used to instantiate a HyperCLOVAX model
     according to the specified arguments, defining the model architecture.
-    Configuration objects inherit from [`PreTrainedConfig`] and can be used
+    Configuration objects inherit from [`PretrainedConfig`] and can be used
     to control the model outputs. Read the documentation from
-    [`PreTrainedConfig`] for more information.
+    [`PretrainedConfig`] for more information.
 
     Args:
         vocab_size (`int`, *optional*, defaults to 32000):
@@ -165,7 +166,6 @@ class HyperCLOVAXConfig(PreTrainedConfig):
             `get_rope`. When provided, takes precedence over `rope_theta`
             and `rope_scaling`. If `None`, it is derived from `rope_theta`
             and `rope_scaling` automatically.
-
     """
 
     model_type = "hyperclovax"

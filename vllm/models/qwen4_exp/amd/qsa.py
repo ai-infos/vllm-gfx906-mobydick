@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """AMD ROCm QSA owner with Triton kernels."""
 
 from __future__ import annotations
@@ -8,7 +9,6 @@ from typing import ClassVar, cast
 
 import torch
 from torch import nn
-from transformers import Qwen4ExpTextConfig
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -24,6 +24,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.qwen4_exp import (
+    Qwen4ExpTextConfig,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -51,7 +54,11 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from ..common.qsa_cache import QSAForwardMetadata
+from ..common.qsa_cache import (
+    QSA_ACTIVATION_DTYPES,
+    QSA_KV_CACHE_DTYPES,
+    QSAForwardMetadata,
+)
 from . import model
 from .indexer_qsa import QSAIndexer
 
@@ -65,15 +72,15 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_dtypes: ClassVar[list[torch.dtype]] = list(QSA_ACTIVATION_DTYPES)
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = list(QSA_KV_CACHE_DTYPES)
 
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_TRITON"
 
     @staticmethod
-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # QSA consumes manager pages directly and does not use FA4 paged attention.
         return [MultipleOf(16)]
 
@@ -108,8 +115,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if self.kv_cache_dtype not in QSA_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires an FP16 or BF16 main KV cache"
+            )
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -146,8 +155,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+        if query.dtype not in QSA_ACTIVATION_DTYPES or key_cache.dtype != query.dtype:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires matching 2-byte float Q/K/V"
+            )
 
         from .ops.qsa import qsa_sparse_paged_attention
 
@@ -183,10 +194,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         model_config = vllm_config.model_config
         if cache_config is None:
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
-        if model_config.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if model_config.dtype not in QSA_ACTIVATION_DTYPES:
+            raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16 activations")
+        if cache_config.cache_dtype not in QSA_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires an FP16 or BF16 main KV cache"
+            )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -214,7 +227,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         elif tp_size % self.total_num_kv_heads:
             raise ValueError("TP size must be divisible by replicated QSA KV heads")
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = int(config.head_dim or self.hidden_size // self.total_num_heads)
+        self.head_dim = int(config.head_dim or self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -267,8 +280,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
+        if self.kv_cache_torch_dtype not in QSA_ACTIVATION_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires FP16 or BF16 cache storage"
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -428,6 +443,7 @@ def qwen4_exp_qsa_with_output(
     layer_name: LayerNameType,
 ) -> None:
     """Run the complete QSA state/update/attend transaction."""
+
     layer_name = _resolve_layer_name(layer_name)
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpQSAAttention):

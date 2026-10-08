@@ -12,7 +12,6 @@ Tests cover:
 
 import math
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -61,10 +60,7 @@ class MockModelConfig:
     encoder_config = None
     generation_config: str = "auto"
     media_io_kwargs: dict[str, dict[str, Any]] = field(default_factory=dict)
-    skip_tokenizer_init: bool = False
-    is_encoder_decoder: bool = False
-    is_multimodal_model: bool = False
-    supports_multimodal_inputs: bool = False
+    skip_tokenizer_init = False
     vocab_size = 151936
 
     def get_diff_sampling_param(self):
@@ -303,10 +299,8 @@ class TestGeneration:
 
         mock_logprobs = {1234: -0.5, 5678: -2.0, 100: -3.0}
         mock_output = _create_mock_request_output(mock_logprobs)
-        state = SimpleNamespace(sampling_params=None)
 
         async def mock_generate(*args, **kwargs):
-            state.sampling_params = args[1]
             yield mock_output
 
         mock_engine.generate = mock_generate
@@ -320,8 +314,6 @@ class TestGeneration:
         result = await serving.create_generative_scoring(request, None)
 
         assert isinstance(result, GenerativeScoringResponse)
-        assert state.sampling_params is not None
-        assert state.sampling_params.watermarking is False
         assert len(result.data) == 2
         for item_result in result.data:
             assert 0.0 <= item_result.score <= 1.0

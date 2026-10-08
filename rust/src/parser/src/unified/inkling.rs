@@ -557,7 +557,6 @@ mod tests {
                 },
             }),
             strict: None,
-            defer_loading: None,
         }]
     }
 

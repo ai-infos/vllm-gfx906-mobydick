@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -60,13 +60,11 @@ from vllm.model_executor.layers.quantization.utils.config_utils import (
     find_matching_patterns,
     get_layer_name_after_index,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
-    kInt4Static32,
     kInt8StaticChannelSym,
     kMxfp4Static,
     kMxfp8Dynamic,
@@ -103,15 +101,6 @@ _ONLINE_MOE_METHODS: dict[QuantKey, type] = {
     kMxfp4Static: Mxfp4OnlineMoEMethod,
     kInt8StaticChannelSym: Int8OnlineMoEMethod,
     kNvfp4Static: Nvfp4OnlineMoEMethod,
-}
-
-# Quantizers for full-precision fused shared-expert weights, keyed by the routed
-# experts' weight QuantKey. Each shard is quantized to the checkpoint layout on
-# arrival, so only block-local schemes are supported.
-ONLINE_SHARED_EXPERT_QUANTIZERS: dict[
-    QuantKey, Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
-] = {
-    kMxfp4Static: mxfp4_quantize,
 }
 
 
@@ -166,7 +155,6 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self.args = args
         self.ignored_layers: list[str] = args.ignore
         self.quantized_layers: dict[str, tuple[str, str, str | None]] = {}
-        self.online_quantization_time = 0.0
 
     @property
     def quantized_layer_summaries(self) -> list[str]:
@@ -227,29 +215,25 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self,
         spec: QuantSpec | None,
         table: dict[QuantKey, type],
-        layer_cls: type[torch.nn.Module],
+        layer: torch.nn.Module,
     ) -> type | None:
         """Resolve the online method class for a layer's quantization spec.
 
         Args:
             spec: Quantization specification to resolve.
             table: Mapping from weight quantization keys to method classes.
-            layer_cls: Type of the layer that will use the resolved method.
+            layer: Layer that will use the resolved method.
 
         Returns:
             The matching method class, or None when ``spec`` has no weight
             quantization.
-
         """
         if spec is None or spec.weight is None:
-            return None
-        # Load-time gfx942 requant, not online conversion. Mxfp4MoEMethod owns it.
-        if spec.weight == kInt4Static32:
             return None
         cls = table.get(spec.weight)
         if cls is None:
             raise ValueError(
-                f"online quantization for {layer_cls.__name__} with "
+                f"online quantization for {type(layer).__name__} with "
                 f"weight={spec.weight} is not supported; supported weight "
                 f"keys: {sorted(str(k) for k in table)}"
             )
@@ -264,34 +248,33 @@ class OnlineQuantizationConfig(QuantizationConfig):
         return cls
 
     def resolve_quant_method_cls(
-        self, layer_cls: type[torch.nn.Module], prefix: str
+        self, layer: torch.nn.Module, prefix: str
     ) -> tuple[OnlineQuantizationSource, str, str | None, QuantSpec, type] | None:
         """Resolve quantization metadata and method class without instantiating it.
 
         Args:
-            layer_cls: Type of layer for which to resolve online quantization.
+            layer: Layer for which to resolve online quantization.
             prefix: Fully qualified layer name.
 
         Returns:
             A tuple of source, quantization key string, target pattern, spec,
             and method class. Returns None when online quantization does not
             apply to the layer.
-
         """
         quant_spec: QuantSpec | None
         if self.args.targets is not None:
             resolved_pattern = self._resolve_targets_quant_method_metadata(
-                prefix, layer_cls
+                prefix, layer
             )
             if resolved_pattern is None:
                 return None
             source, quant_key_str, target_pattern, quant_spec, table = resolved_pattern
         else:
-            if issubclass(layer_cls, LinearBase):
+            if isinstance(layer, LinearBase):
                 source = OnlineQuantizationSource.linear
                 quant_spec = self.args.linear
                 table = _ONLINE_LINEAR_METHODS
-            elif issubclass(layer_cls, RoutedExperts):
+            elif isinstance(layer, RoutedExperts):
                 source = OnlineQuantizationSource.moe
                 quant_spec = self.args.moe
                 table = _ONLINE_MOE_METHODS
@@ -308,14 +291,14 @@ class OnlineQuantizationConfig(QuantizationConfig):
             quant_key_str = str(quant_spec)
             target_pattern = None
 
-        quant_method_cls = self._get_method_cls(quant_spec, table, layer_cls)
+        quant_method_cls = self._get_method_cls(quant_spec, table, layer)
         if quant_method_cls is None:
             return None
         assert quant_spec is not None
         return source, quant_key_str, target_pattern, quant_spec, quant_method_cls
 
     def _resolve_targets_quant_method_metadata(
-        self, prefix: str, layer_cls: type[torch.nn.Module]
+        self, prefix: str, layer: torch.nn.Module
     ) -> (
         tuple[OnlineQuantizationSource, str, str, QuantSpec, dict[QuantKey, type]]
         | None
@@ -324,13 +307,12 @@ class OnlineQuantizationConfig(QuantizationConfig):
 
         Args:
             prefix: Fully qualified layer name.
-            layer_cls: Type of layer matched against configured target patterns.
+            layer: Layer matched against configured target patterns.
 
         Returns:
             A tuple of source, quantization key string, target pattern, spec,
             and dispatch table. Returns None when no pattern applies or the
             layer is ignored.
-
         """
         assert self.args.targets is not None
         ignored = should_ignore_layer(
@@ -359,22 +341,22 @@ class OnlineQuantizationConfig(QuantizationConfig):
         target_pattern = matches[0]
         quant_key_str = self.args.targets[target_pattern]
         shorthand = _ONLINE_SHORTHANDS[quant_key_str]
-        if issubclass(layer_cls, LinearBase):
+        if isinstance(layer, LinearBase):
             quant_spec = shorthand.linear
             table = _ONLINE_LINEAR_METHODS
-        elif issubclass(layer_cls, RoutedExperts):
+        elif isinstance(layer, RoutedExperts):
             quant_spec = shorthand.moe
             table = _ONLINE_MOE_METHODS
         else:
             raise ValueError(
                 f"Layer {prefix} was matched by quantization_config.targets "
                 f"({target_pattern}), but online quantization is not supported for "
-                f"{layer_cls.__name__}."
+                f"{type(layer).__name__}."
             )
         if quant_spec is None:
             raise ValueError(
                 f"targets pattern {target_pattern} = {quant_key_str} does "
-                f"not define a QuantSpec for {layer_cls.__name__} layers "
+                f"not define a QuantSpec for {type(layer).__name__} layers "
                 f"(matched at {prefix})."
             )
         return (
@@ -389,7 +371,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
-        resolved = self.resolve_quant_method_cls(type(layer), prefix)
+        resolved = self.resolve_quant_method_cls(layer, prefix)
         if resolved is not None:
             source, quant_key_str, target_pattern, _, quant_method_cls = resolved
             self.quantized_layers[prefix] = (

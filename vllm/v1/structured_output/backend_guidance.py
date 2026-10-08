@@ -34,58 +34,17 @@ else:
 logger = init_logger(__name__)
 
 
-_SCHEMA_MAP_KEYWORDS = (
-    "properties",
-    "patternProperties",
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-    "dependencies",
-)
-
-_SUBSCHEMA_KEYWORDS = (
-    "additionalProperties",
-    "unevaluatedProperties",
-    "propertyNames",
-    "contains",
-    "additionalItems",
-    "unevaluatedItems",
-    "not",
-    "if",
-    "then",
-    "else",
-    "contentSchema",
-    "items",
-    "prefixItems",
-    "allOf",
-    "anyOf",
-    "oneOf",
-)
-
-
 def _walk_json_for_additional_properties(data: object):
     if isinstance(data, dict):
-        for key in _SCHEMA_MAP_KEYWORDS:
-            value = data.get(key)
-            if isinstance(value, dict):
-                for subschema in value.values():
-                    if isinstance(subschema, dict):
-                        _walk_json_for_additional_properties(subschema)
-
-        for key in _SUBSCHEMA_KEYWORDS:
-            value = data.get(key)
-            if isinstance(value, (dict, list)):
-                _walk_json_for_additional_properties(value)
-
+        for value in data.values():
+            _walk_json_for_additional_properties(value)
         if "additionalProperties" not in data and (
-            isinstance(data.get("properties"), dict)
-            or isinstance(data.get("patternProperties"), dict)
+            "properties" in data or "patternProperties" in data
         ):
             data["additionalProperties"] = False
     elif isinstance(data, list):
         for item in data:
-            if isinstance(item, dict):
-                _walk_json_for_additional_properties(item)
+            _walk_json_for_additional_properties(item)
 
 
 def has_guidance_unsupported_json_features(schema: dict[str, Any]) -> bool:
@@ -202,6 +161,7 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns True if the parser was advanced successfully.
         Returns False if the parser failed to advance.
         """
+
         if self.ll_tokenizer.eos_token in tokens:
             if self.ll_matcher.is_stopped() and not self.terminated:
                 self.rollback_lag = 1

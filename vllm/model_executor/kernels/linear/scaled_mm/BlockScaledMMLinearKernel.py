@@ -3,9 +3,10 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Self
+from typing import ClassVar
 
 import torch
+from typing_extensions import Self
 
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (

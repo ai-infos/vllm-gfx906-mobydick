@@ -8,14 +8,15 @@ import functools
 import json
 import os
 import sys
-import warnings
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from itertools import permutations
 from types import UnionType
 from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    ClassVar,
     Literal,
     TypeAlias,
     TypeVar,
@@ -23,7 +24,6 @@ from typing import (
     cast,
     get_args,
     get_origin,
-    is_typeddict,
 )
 
 import huggingface_hub
@@ -36,7 +36,6 @@ from typing_extensions import TypeIs
 import vllm.envs as envs
 from vllm.config import (
     AttentionConfig,
-    AuxOutputConfig,
     CacheConfig,
     CompilationConfig,
     ConfigType,
@@ -51,7 +50,6 @@ from vllm.config import (
     KVEventsConfig,
     KVTransferConfig,
     LoadConfig,
-    LoggingConfig,
     LoRAConfig,
     MambaConfig,
     ModelConfig,
@@ -80,14 +78,12 @@ from vllm.config.cache import (
 )
 from vllm.config.device import Device
 from vllm.config.kernel import (
-    PASSTHROUGH_ALL2ALL_BACKEND,
     IrOpPriorityConfig,
     LinearBackend,
     MoEBackend,
     SparseIndexerTopkBackend,
 )
 from vllm.config.load import SafetensorsLoadStrategy
-from vllm.config.logging import LogLevel
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
@@ -114,10 +110,10 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
-from vllm.config.utils import get_field
+from vllm.config.utils import get_field, get_from_deprecated_env_if_set
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.config.watermarking import WatermarkConfig
-from vllm.logger import configure_logging_if_needed, init_logger, suppress_logging
+from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
@@ -178,6 +174,40 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
     return _optional_type
 
 
+class _UnsetType:
+    """Sentinel marking that an argument was not provided by the user."""
+
+    _instance: ClassVar["_UnsetType | None"] = None
+
+    def __new__(cls) -> "_UnsetType":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __reduce__(self) -> tuple[type, tuple]:
+        return (_UnsetType, ())
+
+
+PREFIX_CACHE_RETENTION_INTERVAL_UNSET = _UnsetType()
+"""Default of ``EngineArgs.prefix_cache_retention_interval`` when neither the
+CLI flag nor a programmatic value was provided, so that the default can be
+resolved against the model and speculative-decoding configuration."""
+
+
+def _default_prefix_cache_retention_interval() -> int | None:
+    env_value = get_from_deprecated_env_if_set(
+        "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
+        "v0.29",
+        "prefix_cache_retention_interval",
+    )
+    if env_value is not None:
+        return int(env_value)
+    return cast("int | None", PREFIX_CACHE_RETENTION_INTERVAL_UNSET)
+
+
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
@@ -187,18 +217,6 @@ def union_dict_and_str(val: str) -> str | dict[str, str] | None:
 def is_type(type_hint: TypeHint, type: TypeHintT) -> TypeIs[TypeHintT]:
     """Check if the type hint is a specific type."""
     return type_hint is type or get_origin(type_hint) is type
-
-
-def is_dict_subclass(type_hint: TypeHint) -> bool:
-    """Check if the type hint is a subclass of `dict`.
-
-    `TypedDict`s are excluded because they do not support class checks.
-    """
-    return (
-        isinstance(type_hint, type)
-        and not is_typeddict(type_hint)
-        and issubclass(type_hint, dict)
-    )
 
 
 def contains_type(type_hints: set[TypeHint], type: TypeHintT) -> bool:
@@ -323,8 +341,6 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     for field in fields(cls):
         # Get the set of possible types for the field
         type_hints: set[TypeHint] = get_type_hints(field.type)
-        # Subclasses of dict (e.g. MultiModalDummyOptions) are CLI dicts
-        type_hints = {dict if is_dict_subclass(th) else th for th in type_hints}
 
         # If the field is a dataclass, we can use the model_validate_json
         generator = (th for th in type_hints if is_dataclass(th))
@@ -430,7 +446,7 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
         if type(None) in type_hints and not contains_type(type_hints, bool):
             kwargs[name]["type"] = optional_type(kwargs[name]["type"])
             if kwargs[name].get("choices"):
-                kwargs[name]["choices"].append(None)
+                kwargs[name]["choices"].append("None")
     return kwargs
 
 
@@ -447,28 +463,12 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return copy.deepcopy(_compute_kwargs(cls))
 
 
-_LOG_CONFIG_FILE_DEPRECATION_MESSAGE = (
-    "--log-config-file is deprecated and will be removed in v0.33.0. "
-    "Use --logging-config.pylogging_config_file instead."
-)
-
-
-class DeprecatedLogConfigFileAction(argparse.Action):
-    """Warn when the legacy ``--log-config-file`` option is used."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        warnings.warn(_LOG_CONFIG_FILE_DEPRECATION_MESSAGE, stacklevel=1)
-        setattr(namespace, self.dest, values)
-
-
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
 
     model: str = ModelConfig.model
-    # Public compatibility argument. Canonical runtime state lives in
-    # AuxOutputConfig.
-    enable_return_routed_experts: bool = False
+    enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
     return_sampling_mask: bool = ModelConfig.return_sampling_mask
     model_weights: str = ModelConfig.model_weights
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
@@ -574,8 +574,12 @@ class EngineArgs:
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
-    prefix_cache_retention_interval: int | None = get_field(
-        CacheConfig, "prefix_cache_retention_interval"
+    # Defaults to a sentinel (or the deprecated env var when set) so that an
+    # unset value can be told apart from an explicit one; resolved in
+    # create_engine_config (0, or dense checkpoints for Mamba models with
+    # EAGLE-style speculative decoding).
+    prefix_cache_retention_interval: int | None = dataclasses.field(
+        default_factory=_default_prefix_cache_retention_interval
     )
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
@@ -591,11 +595,7 @@ class EngineArgs:
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
-    long_prefill_token_threshold_adaptive: bool = (
-        SchedulerConfig.long_prefill_token_threshold_adaptive
-    )
     max_num_seqs: int | None = None
-    max_num_active_seqs: int | None = SchedulerConfig.max_num_active_seqs
     max_num_queued_reqs: int | None = None
     max_num_queued_tokens: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
@@ -677,7 +677,6 @@ class EngineArgs:
     specialize_active_lora: bool = LoRAConfig.specialize_active_lora
     enable_mixed_moe_lora_format: bool = LoRAConfig.enable_mixed_moe_lora_format
     enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
-    max_lora_cls_labels: int | None = LoRAConfig.max_lora_cls_labels
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -699,7 +698,6 @@ class EngineArgs:
     structured_outputs_config: StructuredOutputsConfig = get_field(
         VllmConfig, "structured_outputs_config"
     )
-    aux_output_config: AuxOutputConfig = get_field(VllmConfig, "aux_output_config")
     reasoning_parser: str = StructuredOutputsConfig.reasoning_parser
     reasoning_parser_plugin: str | None = None
 
@@ -723,9 +721,6 @@ class EngineArgs:
     kv_cache_metrics: bool = ObservabilityConfig.kv_cache_metrics
     kv_cache_metrics_sample: float = get_field(
         ObservabilityConfig, "kv_cache_metrics_sample"
-    )
-    custom_histogram_buckets: dict[str, list[float]] | None = (
-        ObservabilityConfig.custom_histogram_buckets
     )
     cudagraph_metrics: bool = ObservabilityConfig.cudagraph_metrics
     enable_layerwise_nvtx_tracing: bool = (
@@ -755,10 +750,6 @@ class EngineArgs:
 
     profiler_config: ProfilerConfig = get_field(VllmConfig, "profiler_config")
 
-    logging_config: LoggingConfig | None = None
-    log_level: LogLevel | None = None
-    log_config_file: str | None = None
-
     kv_transfer_config: KVTransferConfig | None = None
     kv_events_config: KVEventsConfig | None = None
 
@@ -770,10 +761,6 @@ class EngineArgs:
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
-    sleep_mode_offload_cudagraph: bool = ModelConfig.sleep_mode_offload_cudagraph
-    sleep_preserve_parameter_names: list[str] = get_field(
-        ModelConfig, "sleep_preserve_parameter_names"
-    )
     enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
     enable_nccl_comm_suspend: bool = ModelConfig.enable_nccl_comm_suspend
     override_generation_config: dict[str, Any] = get_field(
@@ -790,8 +777,8 @@ class EngineArgs:
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
-    enable_mamba_shared_prefix_checkpoint: bool = (
-        CacheConfig.enable_mamba_shared_prefix_checkpoint
+    enable_mamba_fine_grained_prefix_cache: bool = (
+        CacheConfig.enable_mamba_fine_grained_prefix_cache
     )
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
@@ -818,7 +805,6 @@ class EngineArgs:
     stream_interval: int = SchedulerConfig.stream_interval
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
-    swa_bounded_replay: bool = CacheConfig.swa_bounded_replay
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
 
@@ -839,9 +825,7 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: (
-        Literal["flashinfer", "triton", "cutedsl", "aiter_flydsl"] | None
-    ) = None
+    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
     kda_prefill_backend: (
         Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
     ) = None
@@ -855,10 +839,6 @@ class EngineArgs:
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.attention_config, dict):
             self.attention_config = AttentionConfig(**self.attention_config)
-        if isinstance(self.aux_output_config, dict):
-            self.aux_output_config = AuxOutputConfig(**self.aux_output_config)
-        if self.enable_return_routed_experts:
-            self.aux_output_config.enable_return_routed_experts = True
         if isinstance(self.engram_config, dict):
             self.engram_config = EngramConfig(**self.engram_config)
         if isinstance(self.mamba_config, dict):
@@ -925,9 +905,9 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
+
         # Model arguments
         model_kwargs = get_kwargs(ModelConfig)
-        aux_output_kwargs = get_kwargs(AuxOutputConfig)
         model_group = parser.add_argument_group(
             title="ModelConfig",
             description=ModelConfig.__doc__,
@@ -967,7 +947,7 @@ class EngineArgs:
         model_group.add_argument("--enforce-eager", **model_kwargs["enforce_eager"])
         model_group.add_argument(
             "--enable-return-routed-experts",
-            **aux_output_kwargs["enable_return_routed_experts"],
+            **model_kwargs["enable_return_routed_experts"],
         )
         model_group.add_argument(
             "--return-sampling-mask",
@@ -1009,14 +989,6 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--enable-sleep-mode", **model_kwargs["enable_sleep_mode"]
-        )
-        model_group.add_argument(
-            "--sleep-mode-offload-cudagraph",
-            **model_kwargs["sleep_mode_offload_cudagraph"],
-        )
-        model_group.add_argument(
-            "--sleep-preserve-parameter-names",
-            **model_kwargs["sleep_preserve_parameter_names"],
         )
         model_group.add_argument(
             "--enable-cumem-allocator", **model_kwargs["enable_cumem_allocator"]
@@ -1112,10 +1084,6 @@ class EngineArgs:
 
         # Parallel arguments
         parallel_kwargs = get_kwargs(ParallelConfig)
-        # Bound from --moe-backend in KernelConfig.set_platform_defaults().
-        parallel_kwargs["all2all_backend"]["choices"].remove(
-            PASSTHROUGH_ALL2ALL_BACKEND
-        )
         parallel_group = parser.add_argument_group(
             title="ParallelConfig",
             description=ParallelConfig.__doc__,
@@ -1338,10 +1306,7 @@ class EngineArgs:
         )
         cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
         cache_group.add_argument(
-            "--gpu-memory-utilization",
-            "--device-memory-utilization",
-            dest="gpu_memory_utilization",
-            **cache_kwargs["gpu_memory_utilization"],
+            "--gpu-memory-utilization", **cache_kwargs["gpu_memory_utilization"]
         )
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
@@ -1362,16 +1327,16 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--prefix-cache-retention-interval",
-            **cache_kwargs["prefix_cache_retention_interval"],
+            **{
+                **cache_kwargs["prefix_cache_retention_interval"],
+                "default": PREFIX_CACHE_RETENTION_INTERVAL_UNSET,
+            },
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
-        )
-        cache_group.add_argument(
-            "--swa-bounded-replay", **cache_kwargs["swa_bounded_replay"]
         )
         cache_group.add_argument(
             "--mamba-cache-dtype", **cache_kwargs["mamba_cache_dtype"]
@@ -1389,8 +1354,8 @@ class EngineArgs:
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
-            "--enable-mamba-shared-prefix-checkpoint",
-            **cache_kwargs["enable_mamba_shared_prefix_checkpoint"],
+            "--enable-mamba-fine-grained-prefix-cache",
+            **cache_kwargs["enable_mamba_fine_grained_prefix_cache"],
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -1587,38 +1552,6 @@ class EngineArgs:
             "--enable-moe-shared-loras",
             **lora_kwargs["enable_moe_shared_loras"],
         )
-        lora_group.add_argument(
-            "--max-lora-cls-labels",
-            **lora_kwargs["max_lora_cls_labels"],
-        )
-
-        # Logging arguments
-        logging_group = parser.add_argument_group(
-            title="LoggingConfig",
-            description=LoggingConfig.__doc__,
-        )
-        logging_config_kwargs = get_kwargs(VllmConfig)["logging_config"]
-        logging_config_kwargs["default"] = argparse.SUPPRESS
-        logging_group.add_argument("--logging-config", **logging_config_kwargs)
-        logging_group.add_argument(
-            "--log-level",
-            choices=get_args(LogLevel),
-            default=argparse.SUPPRESS,
-            help=(
-                "Shortcut for --logging-config.log_level. "
-                "Overrides that field if both are specified."
-            ),
-        )
-        logging_group.add_argument(
-            "--log-config-file",
-            dest="log_config_file",
-            default=argparse.SUPPRESS,
-            metavar="PYLOGGING_CONFIG_FILE",
-            action=DeprecatedLogConfigFileAction,
-            help=_LOG_CONFIG_FILE_DEPRECATION_MESSAGE,
-        )
-        # Retain the warning in v0.31.0 and v0.32.0. Remove this option and its
-        # compatibility mapping in create_logging_config() in v0.33.0.
 
         # Observability arguments
         observability_kwargs = get_kwargs(ObservabilityConfig)
@@ -1633,6 +1566,13 @@ class EngineArgs:
         observability_group.add_argument(
             "--otlp-traces-endpoint", **observability_kwargs["otlp_traces_endpoint"]
         )
+        # TODO: generalise this special case
+        choices = observability_kwargs["collect_detailed_traces"]["choices"]
+        metavar = f"{{{','.join(choices)}}}"
+        observability_kwargs["collect_detailed_traces"]["metavar"] = metavar
+        observability_kwargs["collect_detailed_traces"]["choices"] += [
+            ",".join(p) for p in permutations(get_args(DetailedTraceModules), r=2)
+        ]
         observability_group.add_argument(
             "--collect-detailed-traces",
             **observability_kwargs["collect_detailed_traces"],
@@ -1647,10 +1587,6 @@ class EngineArgs:
         observability_group.add_argument(
             "--kv-cache-metrics-sample",
             **observability_kwargs["kv_cache_metrics_sample"],
-        )
-        observability_group.add_argument(
-            "--custom-histogram-buckets",
-            **observability_kwargs["custom_histogram_buckets"],
         )
         observability_group.add_argument(
             "--cudagraph-metrics",
@@ -1705,10 +1641,6 @@ class EngineArgs:
             },
         )
         scheduler_group.add_argument(
-            "--max-num-active-seqs",
-            **scheduler_kwargs["max_num_active_seqs"],
-        )
-        scheduler_group.add_argument(
             "--max-num-queued-reqs", **scheduler_kwargs["max_num_queued_reqs"]
         )
         scheduler_group.add_argument(
@@ -1718,10 +1650,6 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
-        )
-        scheduler_group.add_argument(
-            "--long-prefill-token-threshold-adaptive",
-            **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
         )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
@@ -1848,9 +1776,6 @@ class EngineArgs:
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
-        vllm_group.add_argument(
-            "--aux-output-config", **vllm_kwargs["aux_output_config"]
-        )
         vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
         vllm_group.add_argument(
             "--optimization-level", **vllm_kwargs["optimization_level"]
@@ -1892,7 +1817,7 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl", "aiter_flydsl"],
+            choices=["flashinfer", "triton", "cutedsl"],
             default=None,
             help="Select GDN prefill backend.",
         )
@@ -1958,6 +1883,7 @@ class EngineArgs:
             quantization_config=self.quantization_config,
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
+            enable_return_routed_experts=self.enable_return_routed_experts,
             return_sampling_mask=self.return_sampling_mask,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
@@ -1991,8 +1917,6 @@ class EngineArgs:
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
-            sleep_mode_offload_cudagraph=self.sleep_mode_offload_cudagraph,
-            sleep_preserve_parameter_names=self.sleep_preserve_parameter_names,
             enable_cumem_allocator=self.enable_cumem_allocator,
             enable_nccl_comm_suspend=self.enable_nccl_comm_suspend,
             model_impl=self.model_impl,
@@ -2113,7 +2037,7 @@ class EngineArgs:
                 for x in cvd.split(",")
             ]
             for i in int_ids:
-                if not 0 <= i < len(cvd_ids):
+                if i >= len(cvd_ids):
                     raise ValueError(
                         f"--device-ids index {i} is out of range for "
                         f"{current_platform.device_control_env_var}"
@@ -2138,25 +2062,6 @@ class EngineArgs:
             cfg = json.loads(cfg)
         return WatermarkConfig(**cfg)
 
-    def create_structured_outputs_config(self) -> StructuredOutputsConfig:
-        """Merge frontend parser flags into the structured outputs config.
-
-        Mutates `self.structured_outputs_config` in place and returns it
-        (not a copy). Model-specific defaults (e.g. gpt_oss ->
-        "openai_gptoss") are applied later by `verify_and_update_config`
-        only when the resolved value is still empty, so explicit CLI flags
-        take precedence.
-        """
-        if self.reasoning_parser:
-            self.structured_outputs_config.reasoning_parser = self.reasoning_parser
-
-        if self.reasoning_parser_plugin:
-            self.structured_outputs_config.reasoning_parser_plugin = (
-                self.reasoning_parser_plugin
-            )
-
-        return self.structured_outputs_config
-
     def create_observability_config(self) -> ObservabilityConfig:
         return ObservabilityConfig(
             show_hidden_metrics_for_version=self.show_hidden_metrics_for_version,
@@ -2165,7 +2070,6 @@ class EngineArgs:
             per_request_spec_decode_metrics=self.per_request_spec_decode_metrics,
             kv_cache_metrics=self.kv_cache_metrics,
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
-            custom_histogram_buckets=self.custom_histogram_buckets,
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
@@ -2175,33 +2079,21 @@ class EngineArgs:
             jit_monitor_verbose=self.jit_monitor_verbose,
         )
 
-    def create_logging_config(self) -> LoggingConfig:
-        config = self.logging_config or LoggingConfig()
-        if self.log_level is not None:
-            config = dataclasses.replace(config, log_level=self.log_level)
-        if self.log_config_file is not None:
-            config = dataclasses.replace(
-                config, pylogging_config_file=self.log_config_file
-            )
-        return config
-
     def create_engine_config(
         self,
         usage_context: UsageContext | None = None,
         headless: bool = False,
     ) -> VllmConfig:
-        """Create the VllmConfig.
+        """
+        Create the VllmConfig.
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
-        logging_config = self.create_logging_config()
-        configure_logging_if_needed(logging_config)
-
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 
-        current_platform.validate_environ(self.fail_on_environ_validation)
+        envs.validate_environ(self.fail_on_environ_validation)
 
         # Check if the model is a speculator and override model/tokenizer/config
         # BEFORE creating ModelConfig, so the config is created with the target model
@@ -2245,6 +2137,17 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        retention_interval_unset = (
+            self.prefix_cache_retention_interval
+            is PREFIX_CACHE_RETENTION_INTERVAL_UNSET
+        )
+        # When unset, apply the CacheConfig default (0) for now; it is
+        # resolved further below once speculative_config is known. The
+        # deprecated VLLM_PREFIX_CACHE_RETENTION_INTERVAL env var, when set,
+        # was already applied by the field's default factory.
+        retention_interval = (
+            0 if retention_interval_unset else self.prefix_cache_retention_interval
+        )
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -2255,17 +2158,16 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
-            prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            prefix_cache_retention_interval=retention_interval,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
-            swa_bounded_replay=self.swa_bounded_replay,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             prefix_match_unit=self.prefix_match_unit,
             mamba_cache_mode=self.mamba_cache_mode,
-            enable_mamba_shared_prefix_checkpoint=(
-                self.enable_mamba_shared_prefix_checkpoint
+            enable_mamba_fine_grained_prefix_cache=(
+                self.enable_mamba_fine_grained_prefix_cache
             ),
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
@@ -2273,23 +2175,15 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        # TurboQuant and UltraQuant both keep boundary attention layers at the
-        # native dtype, and compute those layers the same way.
-        uses_packed_kv_backend = (
-            resolved_cache_dtype.startswith("turboquant_")
-            or resolved_cache_dtype == "ultraquant_4bit"
-        )
-        if uses_packed_kv_backend:
+        if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
             boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
-            # Sorted so the order does not depend on set iteration: the list is
-            # a CacheConfig hash factor. Entries can also be attention type
-            # names (e.g. "sliding_window"), so sort them as strings.
+            existing = set(cache_config.kv_cache_dtype_skip_layers)
             cache_config.kv_cache_dtype_skip_layers = sorted(
-                set(cache_config.kv_cache_dtype_skip_layers) | set(boundary)
+                existing | set(boundary), key=int
             )
 
         ray_runtime_env = None
@@ -2365,22 +2259,12 @@ class EngineArgs:
                 self.node_rank * local_world_size
             ) // world_size_within_dp
             if self.data_parallel_size > 1 and self.data_parallel_external_lb:
-                if self.data_parallel_rank is None:
-                    if self.nnodes % self.data_parallel_size != 0:
-                        raise ValueError(
-                            "Invalid data-parallel launch options: "
-                            "`--node-rank` cannot unambiguously identify external "
-                            "data-parallel ranks when `--nnodes` is not divisible "
-                            "by `--data-parallel-size`. Set a unique "
-                            "`--data-parallel-rank` for each external-LB process."
-                        )
-                    self.data_parallel_rank = inferred_data_parallel_rank
-                    logger.info(
-                        "Inferred data_parallel_rank %d from node_rank %d "
-                        "for external lb",
-                        self.data_parallel_rank,
-                        self.node_rank,
-                    )
+                self.data_parallel_rank = inferred_data_parallel_rank
+                logger.info(
+                    "Inferred data_parallel_rank %d from node_rank %d for external lb",
+                    self.data_parallel_rank,
+                    self.node_rank,
+                )
             elif self.data_parallel_size_local is None:
                 # Infer data parallel size local for internal dplb:
                 self.data_parallel_size_local = max(
@@ -2579,6 +2463,22 @@ class EngineArgs:
         diffusion_config = self.create_diffusion_config()
         watermark_config = self.create_watermark_config()
 
+        if (
+            retention_interval_unset
+            and model_config.is_hybrid
+            and speculative_config is not None
+            and speculative_config.use_eagle()
+        ):
+            # The default sparse retention (0) keeps only the latest replay
+            # boundary, which EAGLE's tail-block drop makes unreachable for
+            # Mamba state checkpoints, so prefix caching never hits. Default
+            # to dense checkpoints instead.
+            cache_config.prefix_cache_retention_interval = None
+            logger.info_once(
+                "Hybrid model with EAGLE speculative decoding: defaulting "
+                "prefix_cache_retention_interval to dense checkpointing."
+            )
+
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
             model_config,
@@ -2600,7 +2500,6 @@ class EngineArgs:
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_scheduled_tokens=self.max_num_scheduled_tokens,
             max_num_seqs=self.max_num_seqs,
-            max_num_active_seqs=self.max_num_active_seqs,
             max_num_queued_reqs=self.max_num_queued_reqs,
             max_num_queued_tokens=self.max_num_queued_tokens,
             max_model_len=model_config.max_model_len,
@@ -2611,9 +2510,6 @@ class EngineArgs:
             policy=self.scheduling_policy,
             scheduler_cls=self.scheduler_cls,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
-            long_prefill_token_threshold_adaptive=(
-                self.long_prefill_token_threshold_adaptive
-            ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
@@ -2640,7 +2536,6 @@ class EngineArgs:
                 specialize_active_lora=self.specialize_active_lora,
                 enable_mixed_moe_lora_format=self.enable_mixed_moe_lora_format,
                 enable_moe_shared_loras=self.enable_moe_shared_loras,
-                max_lora_cls_labels=self.max_lora_cls_labels,
                 max_cpu_loras=self.max_cpu_loras
                 if self.max_cpu_loras and self.max_cpu_loras > 0
                 else None,
@@ -2691,18 +2586,14 @@ class EngineArgs:
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
-        # UltraQuant subclasses that impl, so it inherits the same limit.
-        if uses_packed_kv_backend and (
+        if resolved_cache_dtype.startswith("turboquant_") and (
             attention_config.flash_attn_version is None
             or attention_config.flash_attn_version >= 3
         ):
             logger.warning(
-                "%s is not yet compatible with FlashAttention >= 3. "
+                "TurboQuant is not yet compatible with FlashAttention >= 3. "
                 "Overriding flash_attn_version to 2. To silence this "
-                "warning, pass --attention-config.flash_attn_version=2",
-                "TurboQuant"
-                if resolved_cache_dtype.startswith("turboquant_")
-                else "UltraQuant",
+                "warning, pass --attention-config.flash_attn_version=2"
             )
             attention_config.flash_attn_version = 2
 
@@ -2761,7 +2652,13 @@ class EngineArgs:
         load_config = self.create_load_config()
 
         # Pass reasoning_parser into StructuredOutputsConfig
-        self.create_structured_outputs_config()
+        if self.reasoning_parser:
+            self.structured_outputs_config.reasoning_parser = self.reasoning_parser
+
+        if self.reasoning_parser_plugin:
+            self.structured_outputs_config.reasoning_parser_plugin = (
+                self.reasoning_parser_plugin
+            )
 
         observability_config = self.create_observability_config()
 
@@ -2825,7 +2722,6 @@ class EngineArgs:
             load_config=load_config,
             offload_config=offload_config,
             attention_config=attention_config,
-            aux_output_config=self.aux_output_config,
             engram_config=self.engram_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,
@@ -2835,7 +2731,6 @@ class EngineArgs:
             diffusion_config=diffusion_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,
-            logging_config=logging_config,
             compilation_config=compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the MoE fused topk kernel.
+"""Tests for the MoE fused topk kernel
 
 Run `pytest tests/kernels/moe/test_fused_topk.py`.
 """
@@ -11,7 +11,9 @@ import torch
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    fused_topk,
+)
 from vllm.platforms import current_platform
 
 

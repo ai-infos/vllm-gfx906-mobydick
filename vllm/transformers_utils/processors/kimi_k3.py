@@ -35,8 +35,6 @@ class KimiK3Processor(ProcessorMixin):
         text: str | list[str] | None = None,
         images: object | list[object] | None = None,
         return_tensors: str | TensorType | None = None,
-        do_rescale: bool = True,
-        do_normalize: bool = True,
         **kwargs,
     ) -> BatchFeature:
         if images is not None:
@@ -46,8 +44,6 @@ class KimiK3Processor(ProcessorMixin):
             mm_inputs = self.image_processor.preprocess(
                 medias,
                 return_tensors=return_tensors,
-                do_rescale=do_rescale,
-                do_normalize=do_normalize,
             )
         else:
             mm_inputs = {}

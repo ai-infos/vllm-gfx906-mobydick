@@ -59,7 +59,10 @@ if __name__ == "__main__":
 
     # Copy sources from project directory to output directory.
     # The directory might already exist to hold object files so we ignore that.
-    shutil.copytree(args.project_dir, args.output_dir, dirs_exist_ok=True)
+    # In-source builds pass the same directory twice; copying a tree onto
+    # itself raises SameFileError, so skip the no-op.
+    if os.path.abspath(args.project_dir) != os.path.abspath(args.output_dir):
+        shutil.copytree(args.project_dir, args.output_dir, dirs_exist_ok=True)
 
     hipify_result = hipify(
         project_directory=args.project_dir,

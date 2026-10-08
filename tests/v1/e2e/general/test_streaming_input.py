@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end tests for the streaming input feature in AsyncLLM.
+"""
+End-to-end tests for the streaming input feature in AsyncLLM.
 
 These tests verify that:
 1. Streaming inputs work correctly with bunched inputs (queued)
@@ -491,7 +492,7 @@ async def test_streaming_input_per_chunk_sampling_params(engine: AsyncLLM):
 async def test_streaming_input_empty_generator(engine: AsyncLLM):
     """Test behavior when the input generator yields nothing.
 
-    An empty generator should finish without producing output.
+    An empty generator should still produce a finished output.
     """
     request_id = "test_empty_generator"
     sampling_params = get_sampling_params(max_tokens=10)
@@ -505,7 +506,9 @@ async def test_streaming_input_empty_generator(engine: AsyncLLM):
     async for output in engine.generate(empty_generator(), sampling_params, request_id):
         outputs.append(output)
 
-    assert outputs == []
+    # Should still get a finished marker
+    assert len(outputs) >= 1, "Should receive at least one output"
+    assert outputs[-1].finished, "Should have a finished output"
 
 
 @pytest.mark.asyncio(loop_scope="module")

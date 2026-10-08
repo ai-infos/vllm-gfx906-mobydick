@@ -358,7 +358,8 @@ class InternVLVideoProcessor(BaseVideoProcessor):
 
 
 class InternVLProcessor(ProcessorMixin):
-    """This model doesn't define its own HF processor,
+    """
+    This model doesn't define its own HF processor,
     so we implement our own one here.
 
     The code to insert image tokens is based on:

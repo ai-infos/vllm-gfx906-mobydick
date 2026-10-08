@@ -172,7 +172,6 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
             0 = SwiGLU_Gu (SiLU(g)*u)
             1 = SwiGLU_Ug (SiLU(u)*g)
             2 = SiLU
-
         """
         if activation == MoEActivation.SWIGLUSTEP:
             return 0
@@ -198,7 +197,6 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
-        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the monolithic 4-bit INT MoE forward pass.
 
@@ -216,11 +214,9 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
             e_score_correction_bias: Bias for expert scores
             routed_scaling_factor: Scaling factor for routing
             topk_group: Group size for topk
-            routing_replay_out: Unused; this kernel does not capture routing
 
         Returns:
             Output tensor after MoE computation
-
         """
         from vllm.model_executor.layers.fused_moe.router.cpu_router import (
             select_experts,

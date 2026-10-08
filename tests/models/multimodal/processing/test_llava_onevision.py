@@ -122,7 +122,8 @@ def _test_image_prompt_replacements(
     num_imgs: int,
     image_sizes: list[ImageSize],
 ) -> None:
-    """Ensure LlavaOnevisionMultiModalProcessor
+    """
+    Ensure LlavaOnevisionMultiModalProcessor
     handles prompt replacement properly for input images.
     """
     failed_size_excs = list[tuple[ImageSize, Exception]]()

@@ -46,6 +46,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
 
 class MoeWNA16Config(QuantizationConfig):
     """Config class for MOE WNA16 (W8A16/W4A16) quantization."""
@@ -104,6 +111,8 @@ class MoeWNA16Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if on_gfx906():
+            return [torch.half, torch.float32]
         return [torch.bfloat16, torch.half]
 
     @classmethod
@@ -216,6 +225,17 @@ class MoeWNA16Config(QuantizationConfig):
             linear_config.packed_modules_mapping = self.packed_modules_mapping
             return linear_config.get_quant_method(layer, prefix)
         elif isinstance(layer, RoutedExperts):
+            if self.linear_quant_method == "gptq":
+                from vllm.model_executor.layers.quantization.auto_gptq import (
+                    AutoGPTQConfig,
+                )
+                from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+                    get_dynamic_override,
+                )
+
+                config = AutoGPTQConfig.from_config(self.full_config)
+                if get_dynamic_override(config, layer_name=prefix) is False:
+                    return UnquantizedFusedMoEMethod(layer.moe_config)
             return MoeWNA16Method(self, layer.moe_config)
         return None
 
@@ -229,7 +249,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
     Args:
         quant_config: The MOE WNA16 (W8A16/W4A16) quantization config.
-
     """
 
     def __init__(self, quant_config: MoeWNA16Config, moe: "FusedMoEConfig") -> None:
@@ -389,7 +408,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
         if self.wna16_backend == WNA16MoEBackend.HUMMING:
-            from vllm.model_executor.layers.quantization.utils.humming import (
+            from vllm.model_executor.layers.quantization.utils.humming_utils import (
                 get_humming_moe_quant_config,
             )
 
@@ -531,7 +550,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
-            routing_sink=layer.routing_sink,
         )
 
     @staticmethod
@@ -636,14 +654,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 tensor = loaded_weight.view(
                     layer.moe_config.tp_size, -1, loaded_weight.size(1)
                 )[tp_rank]
-                # qzeros are packed along the intermediate dim by
-                # bit8_pack_factor, so the w1/w3 boundary is in packed units
-                # (equals shard_size // 2 only for 4-bit).
-                shard_zp_size = shard_size // layer.quant_config.bit8_pack_factor
                 if shard_id == "w1":
-                    param.data[expert_id, :shard_zp_size] = tensor
+                    param.data[expert_id, : shard_size // 2] = tensor
                 else:
-                    param.data[expert_id, shard_zp_size:] = tensor
+                    param.data[expert_id, shard_size // 2 :] = tensor
                 return True if return_success else None
             elif "w2_qzeros" in weight_name:
                 param.data[expert_id] = loaded_weight.view(

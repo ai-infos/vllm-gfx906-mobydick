@@ -119,14 +119,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if envs.VLLM_BATCH_INVARIANT and residual is not None:
-            assert self.variance_size_override is None, (
-                "Batch invariance is not supported for variance_size_override"
-            )
-            weight = self.weight.data if self.pass_weight_add else None
-            return ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
-                x, residual, weight, self.variance_epsilon
-            )
         return self.forward_cuda(x, residual)
 
     def extra_repr(self) -> str:
@@ -155,6 +147,27 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self._one_plus_w: tuple[tuple, torch.Tensor] | None = None
+
+    def _one_plus_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """(1 + weight) in ``dtype``, cached.
+
+        Inference weights are frozen after loading (vLLM loads weights
+        before the first forward, which is where the cache is created);
+        the entry is keyed on data_ptr/dtype/device/_version so
+        parameter replacement and in-place ops on the parameter itself
+        invalidate it. The first call is always the eager cudagraph
+        warmup (vLLM warms up before any capture), so the cached
+        allocation comes from the normal pool, never a graph pool.
+        """
+        w = self.weight
+        key = (w.data_ptr(), dtype, w.device, w._version)
+        entry = self._one_plus_w
+        if entry is not None and entry[0] == key:
+            return entry[1]
+        one_plus = w.to(dtype) + 1.0
+        self._one_plus_w = (key, one_plus)
+        return one_plus
 
     def forward_native(
         self,
@@ -162,7 +175,7 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        weight = self.weight.float() + 1.0
+        weight = self._one_plus_weight(torch.float32)
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
@@ -172,22 +185,22 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, residual)
+        # The fused vllm_c kernels require weight.dtype == x.dtype, which the
+        # native path's float32 (1 + w) breaks. Gemma's (1 + w) factorization
+        # is a plain scaled RMS norm with w' = 1 + w in the input dtype, so
+        # dispatch with that instead of the fp32 decomposition.
+        weight = self._one_plus_weight(x.dtype)
+        if residual is None:
+            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x, residual, weight, self.variance_epsilon
+        )
 
     def forward_xpu(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if envs.VLLM_BATCH_INVARIANT:
-            if residual is None:
-                return self.forward_cuda(x, residual)
-            return ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
-                x,
-                residual,
-                self.weight.float() + 1.0,
-                self.variance_epsilon,
-            )
         import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_gemma_rms_norm
 
         # Fall back to the native path if the fused gemma kernels are not
@@ -209,79 +222,6 @@ class GemmaRMSNorm(CustomOp):
             out, x, self.weight.data, self.variance_epsilon
         )
         return out
-
-
-@CustomOp.register("layer_norm")
-class LayerNorm(CustomOp):
-    """Standard (mean-centered) LayerNorm.
-
-    Drop-in for a bare `nn.LayerNorm` that dispatches to a fused XPU kernel
-    when one is available, and to the native implementation otherwise.
-
-    Normalization runs in the wider of the input and parameter dtypes and the
-    result is cast back to the input dtype, so `dtype=torch.float32` gives an
-    fp32 reduction for a lower-precision input.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-5,
-        elementwise_affine: bool = True,
-        bias: bool = True,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__()
-        self.normalized_shape = (hidden_size,)
-        self.eps = eps
-        weight_dtype = dtype or torch.get_default_dtype()
-        self.weight: nn.Parameter | None = None
-        self.bias: nn.Parameter | None = None
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=weight_dtype))
-
-    def _compute_dtype(self, x: torch.Tensor) -> torch.dtype:
-        if self.weight is None:
-            return x.dtype
-        return torch.promote_types(x.dtype, self.weight.dtype)
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        compute_dtype = self._compute_dtype(x)
-        if compute_dtype != x.dtype:
-            return F.layer_norm(
-                x.to(compute_dtype),
-                self.normalized_shape,
-                self.weight,
-                self.bias,
-                self.eps,
-            ).type_as(x)
-        return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_layer_norm
-
-        if (
-            self.weight is None
-            or self.bias is None
-            or not hasattr(torch.ops._C, "layer_norm")
-            # The kernel reduces in the input dtype, so a widened reduction
-            # takes the native path.
-            or self._compute_dtype(x) != x.dtype
-        ):
-            return self.forward_native(x)
-        # empty_like preserves x's strides, but the kernel requires a
-        # contiguous out (unlike x, which it can handle non-contiguous).
-        out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
-        torch.ops.vllm.xpu_layer_norm(out, x, self.weight, self.bias, self.eps)
-        return out
-
-    def extra_repr(self) -> str:
-        return f"hidden_size={self.normalized_shape[0]}, eps={self.eps}"
 
 
 # --8<-- [start:rms_norm_gated]
@@ -321,7 +261,6 @@ class RMSNormGated(CustomOp):
             device: Device to create parameters on
             dtype: Data type for parameters
             activation: Activation function name for gating
-
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -423,3 +362,21 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.forward_cuda(x, z)
+
+
+class LayerNorm(nn.Module):
+    """
+    Layer Normalization.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor):
+        return F.layer_norm(
+            x.float(), (self.dim,), self.weight, self.bias, self.eps
+        ).type_as(x)

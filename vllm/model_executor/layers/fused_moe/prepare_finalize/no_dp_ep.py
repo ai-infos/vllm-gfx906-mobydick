@@ -9,6 +9,14 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 
 def _quantize_input(
@@ -19,6 +27,11 @@ def _quantize_input(
     # Defer input quant to moe kernel for backends (e.g. AITER, FI)
     # which use a single kernel call for quant + experts.
     if defer_input_quant:
+        return a1, None
+
+    # On gfx906, skip FP8 activation quantization - the
+    # bitwise dequant path expects FP16 inputs.
+    if on_gfx906() and quant_config.use_fp8_w8a8:
         return a1, None
 
     input_sf = (
@@ -38,11 +51,6 @@ def _quantize_input(
 
 
 class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
-    def supports_deferred_moe_finalize(self) -> bool:
-        # finalize() here is the top-k weight-and-reduce and nothing else,
-        # which is exactly the work a deferring consumer takes over.
-        return True
-
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard

@@ -29,7 +29,7 @@ from transformers import (
 )
 
 from vllm.config import VllmConfig
-from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -52,7 +52,6 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
     cached_encode,
 )
-from vllm.multimodal.processing.processor import HFMultiModalInputs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -71,12 +70,13 @@ from .utils import AutoWeightsLoader, maybe_prefix
 
 
 class Idefics3ImagePixelInputs(TensorSchema):
-    """Dimensions:
-    - bn: Batch size * number of images
-    - bnp: Batch size * number of images * number of patches
-    - c: Number of channels (3)
-    - h: Height
-    - w: Width
+    """
+    Dimensions:
+        - bn: Batch size * number of images
+        - bnp: Batch size * number of images * number of patches
+        - c: Number of channels (3)
+        - h: Height
+        - w: Width
     """
 
     type: Literal["pixel_values"]
@@ -86,10 +86,11 @@ class Idefics3ImagePixelInputs(TensorSchema):
 
 
 class Idefics3ImageEmbeddingInputs(TensorSchema):
-    """Dimensions:
-    - bn: Batch size * number of images
-    - f: Image feature size
-    - h: Hidden size (must match the hidden size of language model backbone)
+    """
+    Dimensions:
+        - bn: Batch size * number of images
+        - f: Image feature size
+        - h: Hidden size (must match the hidden size of language model backbone)
     """
 
     type: Literal["image_embeds"]
@@ -137,7 +138,7 @@ class Idefics3ProcessingInfo(BaseProcessingInfo):
             mm_kwargs=mm_kwargs,
         )
 
-        return max(num_patches, 1)
+        return num_patches
 
     def _get_image_token(self, processor: Idefics3Processor) -> tuple[str, str, str]:
         image_token = processor.image_token
@@ -221,49 +222,51 @@ class Idefics3DummyInputsBuilder(BaseDummyInputsBuilder[Idefics3ProcessingInfo])
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: MultiModalDummyOptions,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
+        num_images = mm_counts.get("image", 0)
         hf_processor = self.info.get_hf_processor()
         image_processor: Idefics3ImageProcessor = hf_processor.image_processor
         longest_edge = image_processor.max_image_size["longest_edge"]
+
+        image_overrides = mm_options.get("image")
 
         return {
             "image": self._get_dummy_images(
                 width=longest_edge,
                 height=longest_edge,
-                num_images=mm_counts.get("image", 0),
-                overrides=mm_options.get("image"),
+                num_images=num_images,
+                overrides=image_overrides,
             )
         }
 
 
 class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo]):
-    def _get_hf_mm_inputs(
+    def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
-    ) -> HFMultiModalInputs:
-        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        valid_mm_items = mm_items.select(
+            {k for k, c in mm_items.get_all_counts().items() if c > 0}
+        )
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+
+        if not mm_data:
+            return BatchFeature(dict(passthrough_data))
 
         image_processor = self.info.get_hf_processor().image_processor
         if getattr(image_processor, "backend", "pil") == "pil":
-            hf_inputs = hf_inputs._replace(
-                hf_kwargs={
-                    "input_data_format": "channels_last",
-                    **hf_inputs.hf_kwargs,
-                }
-            )
+            hf_processor_mm_kwargs = {
+                "input_data_format": "channels_last",
+                **hf_processor_mm_kwargs,
+            }
 
-        return hf_inputs
-
-    def _postprocess_hf_mm_data(
-        self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-        processed_data: BatchFeature,
-    ) -> BatchFeature:
-        if not mm_data:
-            return processed_data
+        processed_data = self.info.ctx.call_hf_processor(
+            self.info.get_hf_processor(**hf_processor_mm_kwargs),
+            mm_data,
+            hf_processor_mm_kwargs,
+        )
 
         images = mm_data.get("images", [])
         mm_items = self.info.parse_mm_data({"image": images}, validate=False)
@@ -287,6 +290,8 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
         # Remove the extra batch dimension
         processed_data["pixel_values"].squeeze_(0)
         processed_data["pixel_attention_mask"].squeeze_(0)
+
+        processed_data.update(passthrough_data)
 
         return processed_data
 
@@ -824,7 +829,9 @@ class Idefics3ForConditionalGeneration(
         return loader.load_weights(weights)
 
     def get_mm_mapping(self) -> MultiModelKeys:
-        """Get the module prefix in multimodal models."""
+        """
+        Get the module prefix in multimodal models
+        """
         return MultiModelKeys.from_string_field(
             language_model="model.text_model",
             connector="model.connector",

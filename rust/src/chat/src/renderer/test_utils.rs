@@ -8,11 +8,10 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::EffortValue;
 use crate::event::{AssistantContentBlock, AssistantToolCall};
 use crate::request::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatTool, ChatToolChoice,
-    GenerationPromptMode, ResolvedToolContext,
+    GenerationPromptMode, ReasoningEffort, ResolvedToolContext,
 };
 
 /// Options for constructing a [`ChatRequest`] from a fixture file.
@@ -48,7 +47,7 @@ pub(crate) struct FixtureRequest {
     tools: Vec<FixtureTool>,
     messages: Vec<FixtureMessage>,
     add_generation_prompt: Option<bool>,
-    reasoning_effort: Option<EffortValue>,
+    reasoning_effort: Option<ReasoningEffort>,
     /// Standard response format passed to model-specific renderers.
     #[serde(default)]
     response_format: Option<Value>,
@@ -280,7 +279,6 @@ fn to_chat_tools(tools: &[FixtureTool]) -> Vec<ChatTool> {
             description: tool.function.description.clone(),
             parameters: tool.function.parameters.clone(),
             strict: tool.function.strict,
-            defer_loading: None,
         })
         .collect()
 }

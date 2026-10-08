@@ -22,8 +22,6 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
-        "qwen4_exp",
-        "qwen4_exp_text",
     }
 )
 

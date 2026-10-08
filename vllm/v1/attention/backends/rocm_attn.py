@@ -53,8 +53,10 @@ class RocmAttentionMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
+    seq_lens_cpu_upper_bound: torch.Tensor | None
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -145,8 +147,10 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
@@ -176,7 +180,7 @@ class RocmAttentionBackend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # ROCM paged attention native C++ kernel only supports block sizes 16 and 32
         # due to shared memory (LDS) constraints on AMD GPUs.
         # See csrc/rocm/attention.cu CALL_CUSTOM_LAUNCHER_BLK macro.
@@ -193,8 +197,7 @@ class RocmAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
-        # Not implemented
-        return False
+        return True
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -345,7 +348,6 @@ class RocmAttentionImpl(AttentionImpl):
             output: shape = [num_encoder_tokens, num_heads, head_size]
             attn_metadata: Encoder attention metadata
             layer: The attention layer
-
         """
         # For encoder attention, process FP8 quantization if needed
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -392,21 +394,14 @@ class RocmAttentionImpl(AttentionImpl):
         """Forward pass with FlashAttention.
 
         Args:
-            layer: The attention layer, providing the q/k/v quantization scales.
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: logical [num_blocks, 2, block_size, num_kv_heads *
                 head_size] under LHBNC (physically K/V-group-first)
             attn_metadata: Metadata for attention.
-            output: Tensor that the attention result is written into.
-            output_scale: Scale for fused output quantization.
-            output_block_scale: Block scale for fused output quantization;
-                not supported by this backend.
-
         Returns:
             shape = [num_tokens, num_heads * head_size]
-
         """
         if output_block_scale is not None:
             raise NotImplementedError(
@@ -475,19 +470,20 @@ class RocmAttentionImpl(AttentionImpl):
             value_cache=value_cache,
             block_table=block_table,
             query_start_loc=cu_seqlens_q,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
             seq_lens=seqused_k,
+            seq_lens_cpu=attn_metadata.seq_lens_cpu_upper_bound,
             max_seq_len=max_seqlen_k,
             max_query_len=max_seqlen_q,
             k_scale=layer._k_scale,
             v_scale=layer._v_scale,
             alibi_slopes=self.alibi_slopes,
-            # self.sliding_window[0] is the FlashAttention-style left span (W - 1).
-            # chunked_prefill_paged_decode expects the full window length W.
-            sliding_window=1 + self.sliding_window[0],
+            sliding_window=self.sliding_window[0],
             sm_scale=self.scale,
             output_scale=output_scale,
             sinks=self.sinks,
             causal=attn_metadata.causal,
+            attn_type=self.attn_type,
         )
 
         return output

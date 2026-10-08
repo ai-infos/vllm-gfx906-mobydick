@@ -34,6 +34,13 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
 
 @triton.jit
 def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
@@ -217,7 +224,7 @@ def kernel_unified_attention(
     SLIDING_WINDOW: tl.constexpr,  # int
     USE_CAUSAL: tl.constexpr,  # bool
     USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
-    per_seq_causal_ptr,  # [num_seqs] int32, or None
+    per_seq_causal_ptr,  # [num_seqs] bool, or None
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
@@ -243,6 +250,7 @@ def kernel_unified_attention(
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
     # per-segment partials, finalized by ``reduce_segments``.
     IS_3D: tl.constexpr,
+    IS_GFX906: tl.constexpr = False,
     # Parameters below default to None so Triton can skip materialising them
     # on call sites where the corresponding constexpr branch is dead.
     # Credit: @quinnlp identified this as a perf regression source in
@@ -347,7 +355,8 @@ def kernel_unified_attention(
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    query_head_mask = offs_m < BLOCK_Q * num_queries_per_kv
+    query_mask_1 = ((query_offset_1 < num_query_heads) & query_head_mask).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     if USE_TD_QO:
@@ -371,6 +380,8 @@ def kernel_unified_attention(
             mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
             other=0.0,
         )
+    if IS_GFX906 and Q.dtype == tl.float32:
+        Q = Q.to(tl.float16)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -586,15 +597,7 @@ def kernel_unified_attention(
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
         else:
-            # Keep softmax weights representable when the P @ V dot uses FP8
-            # tensor cores. Undo the power-of-two scale after the dot.
-            if V.dtype == tl.float8e4nv:
-                p_scale = 256.0
-            elif V.dtype.is_fp8():
-                p_scale = 128.0
-            else:
-                p_scale = 1.0
-            acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
+            acc += tl.dot(P.to(V.dtype), V)
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
@@ -807,7 +810,7 @@ def _get_tile_size(
 
     # Default behavior
     if is_prefill:
-        return 32
+        return 16 if on_gfx906() else 32
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
 
@@ -1051,13 +1054,21 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    max_seqlen_q_3d = (
+        softmax_segm_output.shape[0] // seq_threshold_3D
+        if seq_threshold_3D is not None
+        and seq_threshold_3D > 0
+        and softmax_segm_output is not None
+        else 1
+    )
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or max_seqlen_q > max_seqlen_q_3d
+        or q.shape[0] > softmax_segm_output.shape[0]
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
@@ -1099,6 +1110,8 @@ def unified_attention(
         launch_kwargs["num_warps"] = launch_num_warps
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
+    if on_gfx906():
+        launch_kwargs.update(num_warps=4, num_stages=1, waves_per_eu=1)
 
     kernel_unified_attention[grid](
         output_ptr=out,
@@ -1169,6 +1182,7 @@ def unified_attention(
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
+        IS_GFX906=on_gfx906(),
         KV_QUANT_MODE=kv_quant_mode,
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,

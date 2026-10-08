@@ -175,6 +175,9 @@ torch::stable::Tensor awq_dequantize(torch::stable::Tensor _kernel,
 // DSV3 fused A GEMM: conditionally compiled so declaration and impl
 // registration are in the source file (dsv3_fused_a_gemm.cu)
 
+// AllSpark ops: declarations are in the source files
+// (allspark_repack.cu and allspark_qgemm_w8a16.cu)
+
 #endif
 
 // CPU tensor -> CUDA UVA view (shared CUDA/ROCm)
@@ -256,20 +259,12 @@ void fused_qk_norm_rope(torch::stable::Tensor& qkv, int64_t num_heads_q,
                         torch::stable::Tensor& position_ids,
                         int64_t forced_token_heads_per_warp);
 
-void fused_deepseek_v4_kv_rope_insert(
-    torch::stable::Tensor const& kv, torch::stable::Tensor& k_cache,
-    torch::stable::Tensor const& slot_mapping,
-    torch::stable::Tensor const& position_ids,
-    torch::stable::Tensor const& cos_sin_cache, int64_t cache_block_size,
-    std::optional<torch::stable::Tensor> fp8_scale, bool kv_mxfp8);
-
 torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
     torch::stable::Tensor const& position_ids,
     torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
-    double eps, int64_t cache_block_size, bool apply_q_norm, bool kv_mxfp8,
-    bool apply_q_rope, bool is_q_interleaved);
+    double eps, int64_t cache_block_size, bool apply_q_norm, bool kv_mxfp8);
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
     torch::stable::Tensor& q, torch::stable::Tensor const& kv,
@@ -381,9 +376,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> q_out,
     std::optional<torch::stable::Tensor> index_q_out,
     const std::string& kv_cache_dtype, bool skip_index_branch,
-    std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale,
-    std::optional<torch::stable::Tensor> kv_k_scale,
-    std::optional<torch::stable::Tensor> kv_v_scale);
+    std::optional<torch::stable::Tensor> q_fp8_out, double q_fp8_scale);
 
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
 void fused_kda_decode(
@@ -529,10 +522,6 @@ void mnnvl_lamport_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
                                   torch::stable::Tensor& out,
                                   fptr_t local_buffer, fptr_t epoch_buffer,
                                   int64_t stage_sz_bytes);
-void mnnvl_multimem_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
-                                   torch::stable::Tensor& out,
-                                   fptr_t local_buffer, fptr_t multicast_buffer,
-                                   int64_t stage_sz_bytes, int64_t block_limit);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
@@ -633,6 +622,9 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
 
 void gptq_shuffle(torch::stable::Tensor q_weight, int64_t bit);
 
+// gfx906 AWQ path (fork): repack AWQ qweight into GPTQ layout for gptq_gemm.
+void gptq_shuffle_awq_qweight(torch::stable::Tensor q_weight, int64_t bit);
+
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
@@ -682,7 +674,7 @@ void hisparse_resolve_residency(
     torch::stable::Tensor& device_global_indices,
     torch::stable::Tensor& lru_slots,
     std::optional<torch::stable::Tensor> const& request_state_indices,
-    int64_t region_stride, int64_t max_union_rows,
+    int64_t region_stride,
     std::optional<torch::stable::Tensor> const& miss_mask,
     std::optional<torch::stable::Tensor> const& stats,
     std::optional<torch::stable::Tensor> const& attention_indices,
@@ -787,6 +779,10 @@ void indexer_k_quant_and_cache(
     int64_t quant_block_size,             // quantization block size
     const std::string& scale_fmt);
 
+void indexer_k_cache_fp16(
+    torch::stable::Tensor& k, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& slot_mapping);
+
 // Concatenate query nope and rope for MLA/DSA attention
 void concat_mla_q(
     torch::stable::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]
@@ -804,6 +800,10 @@ void cp_gather_indexer_k_quant_cache(
     const torch::stable::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::stable::Tensor& cu_seq_lens);  // [batch_size + 1]
 
+void cp_gather_indexer_k_cache_fp16(
+    const torch::stable::Tensor& kv_cache, torch::stable::Tensor& dst_k,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& cu_seq_lens);
 // Fused vocab-parallel embedding lookup (see
 // vocab_parallel_embedding_kernels.cu).
 void vocab_parallel_embedding(

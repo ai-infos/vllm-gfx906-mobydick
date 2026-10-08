@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ECConnectorBase Class for Distributed Encoder Cache &
+"""
+ECConnectorBase Class for Distributed Encoder Cache &
 P2P Encoder cache communication in V1
 
 The class provides the following primitives:
@@ -35,12 +36,6 @@ from vllm.v1.outputs import ECConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.distributed.ec_transfer.ec_connector.metrics import (
-        ECConnectorPromMetrics,
-        ECConnectorStats,
-        PromMetric,
-        PromMetricT,
-    )
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -55,7 +50,8 @@ class ECConnectorRole(enum.Enum):
 
 
 class ECConnectorMetadata(ABC):  # noqa: B024
-    """Abstract Metadata used to communicate between the
+    """
+    Abstract Metadata used to communicate between the
     Scheduler ECConnector and Worker ECConnector.
     """
 
@@ -63,7 +59,8 @@ class ECConnectorMetadata(ABC):  # noqa: B024
 
 
 class ECConnectorWorkerMetadata(ABC):
-    """Abstract Metadata used to communicate back
+    """
+    Abstract Metadata used to communicate back
     Worker ECConnector -> Scheduler ECConnector.
 
     Each worker can output its own metadata.
@@ -76,7 +73,9 @@ class ECConnectorWorkerMetadata(ABC):
     def aggregate(
         self, other: "ECConnectorWorkerMetadata"
     ) -> "ECConnectorWorkerMetadata":
-        """Aggregate metadata with another `ECConnectorWorkerMetadata` object."""
+        """
+        Aggregate metadata with another `ECConnectorWorkerMetadata` object.
+        """
         pass
 
 
@@ -104,7 +103,8 @@ class ECConnectorBase(ABC):
         return self._is_consumer
 
     def shutdown(self) -> None:
-        """Shutdown the connector. This is called when the process
+        """
+        Shutdown the connector. This is called when the process
         is shutting down to ensure that all the async operations are
         completed and the connector is cleaned up properly.
         """
@@ -123,7 +123,6 @@ class ECConnectorBase(ABC):
 
         Args:
             connector_metadata (dict): the connector metadata.
-
         """
         self._connector_metadata = connector_metadata
 
@@ -142,8 +141,8 @@ class ECConnectorBase(ABC):
 
         Returns:
             ConnectorMetadata: the connector metadata.
-
         """
+
         # Should only be called while set to valid metadata.
         assert self._connector_metadata is not None
         return self._connector_metadata
@@ -152,11 +151,10 @@ class ECConnectorBase(ABC):
         self,
         ec_caches: dict[str, torch.Tensor],
     ):
-        """Initialize with the EC caches.
-
+        """
+        Initialize with the EC caches.
         Args:
             ec_caches: dictionary of encoder cache
-
         """
         # TODO: Implement this later for P2P feature
         return
@@ -165,7 +163,8 @@ class ECConnectorBase(ABC):
     def start_load_caches(
         self, encoder_cache: dict[str, torch.Tensor], **kwargs
     ) -> None:
-        """Start loading the cache from the connector into vLLM's encoder cache.
+        """
+        Start loading the cache from the connector into vLLM's encoder cache.
 
         This method loads the encoder cache based on metadata provided by the scheduler.
         It is called before `_gather_mm_embeddings` for the EC Connector. For EC,
@@ -175,7 +174,6 @@ class ECConnectorBase(ABC):
             encoder_cache (dict[str, torch.Tensor]): A dictionary mapping multimodal
                 data hashes (`mm_hash`) to encoder cache tensors.
             kwargs (dict): Additional keyword arguments for the connector.
-
         """
         pass
 
@@ -183,7 +181,8 @@ class ECConnectorBase(ABC):
     def save_caches(
         self, encoder_cache: dict[str, torch.Tensor], mm_hash: str, **kwargs
     ) -> None:
-        """Save the encoder cache to the connector.
+        """
+        Save the encoder cache to the connector.
 
         This method saves the encoder cache from the worker's local storage
         to shared storage or another external connector.
@@ -193,14 +192,14 @@ class ECConnectorBase(ABC):
                 data hashes (`mm_hash`) to encoder cache tensors.
             mm_hash (str): The hash of the multimodal data whose cache is being saved.
             kwargs (dict): Additional keyword arguments for the connector.
-
         """
         pass
 
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Notifies worker-side connector ids of requests that have
+        """
+        Notifies worker-side connector ids of requests that have
         finished generating tokens on the worker.
         The scheduler process (via the Executors) will use this output
         to track which workers are done.
@@ -211,27 +210,16 @@ class ECConnectorBase(ABC):
             tuple of (sending/saving ids, recving/loading ids).
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
-
         """
         return None, None
 
     def build_connector_worker_meta(self) -> ECConnectorWorkerMetadata | None:
-        """Build the ECConnector worker metadata for this engine step.
+        """
+        Build the ECConnector worker metadata for this engine step.
 
         Returns:
             ECConnectorWorkerMetadata: the worker metadata.
             None if no worker metadata is available.
-
-        """
-        return None
-
-    def get_ec_connector_stats(self) -> "ECConnectorStats | None":
-        """Get the EC connector stats collected during the last interval.
-
-        Callable on either a worker-side or scheduler-side connector
-        instance: the worker-side instance reports stats gathered during
-        cache save/load, while the scheduler-side instance reports stats
-        gathered during scheduling decisions.
         """
         return None
 
@@ -244,7 +232,8 @@ class ECConnectorBase(ABC):
         self,
         identifier: str,
     ) -> bool:
-        """Check if a single encoder cache exists.
+        """
+        Check if a single encoder cache exists
 
         Args:
             identifier (str): the identifier of the media.
@@ -252,14 +241,14 @@ class ECConnectorBase(ABC):
         Returns:
             A bool where value is True if cache exist for
             the media
-
         """
         pass
 
     def ensure_cache_available(
         self, request: "Request", num_computed_tokens: int
     ) -> bool:
-        """Ensure encoder cache items are available for the given request.
+        """
+        Ensure encoder cache items are available for the given request.
         May initiate asynchronous transfers for items not yet local.
 
         Args:
@@ -269,7 +258,6 @@ class ECConnectorBase(ABC):
         Returns:
             True if all items are ready or no transfer is needed.
             False if any items are still in transit (request should be deferred).
-
         """
         return True
 
@@ -294,12 +282,11 @@ class ECConnectorBase(ABC):
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request", index: int):
-        """Update ECConnector state to decide allocate cache for requests.
+        """
+        Update ECConnector state to decide allocate cache for requests
 
         Args:
             request (Request): the request object.
-            index (int): index of the encoder cache entry being allocated.
-
         """
         pass
 
@@ -307,37 +294,37 @@ class ECConnectorBase(ABC):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> ECConnectorMetadata:
-        """Build the connector metadata for this step.
+        """
+        Build the connector metadata for this step.
 
         This function should NOT modify fields in the scheduler_output.
         Also, calling this function will reset the state of the connector.
 
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
-
         """
         pass
 
     def update_connector_output(self, connector_output: ECConnectorOutput):
-        """Update ECConnector state from worker-side connectors output.
+        """
+        Update ECConnector state from worker-side connectors output.
 
         Args:
             connector_output (ECConnectorOutput): the worker-side
                 connectors output.
-
         """
         return
 
     def request_finished(
         self, request: "Request"
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Called when a request has finished, before its encoder cache is freed.
+        """
+        Called when a request has finished, before its encoder cache is freed.
 
         Returns:
             True if the request is being saved/sent asynchronously and cached
             should not be freed until the request_id is returned from
             get_finished().
-
         """
         return False, None
 
@@ -352,27 +339,3 @@ class ECConnectorBase(ABC):
         leave this as False.
         """
         return False
-
-    @classmethod
-    def build_ec_connector_stats(
-        cls, data: dict[str, Any] | None = None
-    ) -> "ECConnectorStats | None":
-        """ECConnectorStats resolution method. This method allows dynamically
-        registered connectors to return their own ECConnectorStats object,
-        which can implement custom aggregation logic on the data dict.
-        """
-        return None
-
-    @classmethod
-    def build_prom_metrics(
-        cls,
-        vllm_config: "VllmConfig",
-        metric_types: dict[type["PromMetric"], type["PromMetricT"]],
-        labelnames: list[str],
-        per_engine_labelvalues: dict[int, list[object]],
-    ) -> "ECConnectorPromMetrics | None":
-        """Create an ECConnectorPromMetrics subclass which should register
-        per-connector Prometheus metrics and implement observe() to
-        expose connector transfer stats via Prometheus.
-        """
-        return None

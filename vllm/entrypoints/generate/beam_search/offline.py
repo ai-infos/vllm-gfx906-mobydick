@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 
 from vllm import RequestOutput, TextPrompt, TokensPrompt
-from vllm.entrypoints.common.offline import OfflineInferenceMixin
+from vllm.entrypoints.offline_utils import OfflineInferenceMixin
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
@@ -53,7 +53,7 @@ def _bitmask_to_token_ids(bitmask_row: torch.Tensor, vocab_size: int) -> list[in
 
 
 class BeamSearchOfflineMixin(OfflineInferenceMixin):
-    """Offline inference for beam search."""
+    """Offline inference for beam search"""
 
     def beam_search(
         self,
@@ -63,7 +63,8 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
     ) -> list[BeamSearchOutput]:
-        """Generate sequences using beam search.
+        """
+        Generate sequences using beam search.
 
         Args:
             prompts: A list of prompts. Each prompt can be a string or a list
@@ -73,7 +74,6 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             use_tqdm: Whether to use tqdm to display the progress bar.
             concurrency_limit: The maximum number of concurrent requests.
                 If None, the number of concurrent requests is unlimited.
-
         """
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
@@ -82,7 +82,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
         temperature = params.temperature
         ignore_eos = params.ignore_eos
         length_penalty = params.length_penalty
-        self.llm_engine.input_processor.resolve_watermarking(params)
+        self.llm_engine.vllm_config._check_watermarking_unsupported(beam_search=True)
 
         tokenizer = self.renderer.get_tokenizer()
         eos_token_id = tokenizer.eos_token_id
@@ -120,7 +120,6 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             logprobs=2 * beam_width,
             max_tokens=1,
             temperature=temperature,
-            watermarking=False,
             detokenize=False,
             skip_clone=True,  # Internal beam search, safe to skip clone
         )
@@ -458,7 +457,6 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                 logprobs=base_params.logprobs,
                 max_tokens=1,
                 temperature=base_params.temperature,
-                watermarking=base_params.watermarking,
                 detokenize=False,
                 allowed_token_ids=(
                     allowed_ids

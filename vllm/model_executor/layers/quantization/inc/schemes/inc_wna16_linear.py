@@ -15,7 +15,15 @@ from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
 )
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 from .inc_scheme import INCLinearScheme
 
@@ -51,8 +59,13 @@ class INCWNA16LinearScheme(INCLinearScheme):
             (8, True): scalar_types.uint8b128,
         }
         use_marlin = (
-            self.layer_config.backend == "auto" or "marlin" in self.layer_config.backend
-        ) and (self.layer_config.bits, self.layer_config.sym) in gptq_type_map
+            not on_gfx906()
+            and (
+                self.layer_config.backend == "auto"
+                or "marlin" in self.layer_config.backend
+            )
+            and (self.layer_config.bits, self.layer_config.sym) in gptq_type_map
+        )
         if use_marlin:
             use_marlin = check_marlin_supported(
                 gptq_type_map[(self.layer_config.bits, self.layer_config.sym)],
@@ -61,6 +74,24 @@ class INCWNA16LinearScheme(INCLinearScheme):
             )
 
         if use_marlin:
+            from vllm.model_executor.layers.quantization.auto_gptq import (
+                AutoGPTQLinearMethod,
+            )
+
+            return AutoGPTQLinearMethod(
+                AutoGPTQConfig(
+                    weight_bits=self.layer_config.bits,
+                    group_size=self.layer_config.group_size,
+                    desc_act=False,
+                    is_sym=self.layer_config.sym,
+                    lm_head_quantized=False,
+                    dynamic={},
+                    full_config={},
+                )
+            )
+
+        if on_gfx906():
+            # gfx906 has no Marlin: use the gptq_gemm (WNA16) path instead.
             from vllm.model_executor.layers.quantization.auto_gptq import (
                 AutoGPTQLinearMethod,
             )
@@ -94,8 +125,13 @@ class INCWNA16LinearScheme(INCLinearScheme):
             8: scalar_types.uint8,
         }
         use_marlin = (
-            self.layer_config.backend == "auto" or "marlin" in self.layer_config.backend
-        ) and self.layer_config.bits in awq_type_map
+            not on_gfx906()
+            and (
+                self.layer_config.backend == "auto"
+                or "marlin" in self.layer_config.backend
+            )
+            and self.layer_config.bits in awq_type_map
+        )
         if use_marlin:
             use_marlin = check_marlin_supported(
                 awq_type_map[self.layer_config.bits],

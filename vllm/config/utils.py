@@ -64,9 +64,7 @@ def config(
         cls: The class to decorate
         config: The pydantic ConfigDict to use. If provided, it will be merged with
             the default config.
-        **kwargs: Additional arguments to pass to pydantic.dataclass.
-
-    """
+        **kwargs: Additional arguments to pass to pydantic.dataclass."""
     # Extra fields are forbidden by default
     merged_config = ConfigDict(extra="forbid")
     if config is not None:
@@ -136,9 +134,10 @@ def getattr_iter(
     default_factory: Callable[[], Any] | None = None,
     warn: bool = False,
 ) -> Any:
-    """A helper function that retrieves an attribute from an object which may
+    """
+    A helper function that retrieves an attribute from an object which may
     have multiple possible names. This is useful when fetching attributes from
-    arbitrary `transformers.PreTrainedConfig` instances.
+    arbitrary `transformers.PretrainedConfig` instances.
 
     In the case where the first name in `names` is the preferred name, and
     any other names are deprecated aliases, setting `warn=True` will log a
@@ -158,20 +157,19 @@ def getattr_iter(
     return default_factory() if default_factory is not None else default
 
 
-def _get_own_attr_docs(cls: type[Any], out: dict[str, str]) -> None:
-    """Get any docstrings placed after attribute assignments in a class body.
+def get_attr_docs(cls: type[Any]) -> dict[str, str]:
+    """
+    Get any docstrings placed after attribute assignments in a class body.
 
     https://davidism.com/mit-license/
     """
-    try:
-        source = inspect.getsource(cls)
-    except (OSError, TypeError):
-        # ``object`` and classes without retrievable source (e.g. builtins).
-        return
 
-    cls_node = ast.parse(textwrap.dedent(source)).body[0]
+    cls_node = ast.parse(textwrap.dedent(inspect.getsource(cls))).body[0]
+
     if not isinstance(cls_node, ast.ClassDef):
-        return
+        raise TypeError("Given object was not a class.")
+
+    out = {}
 
     # Consider each pair of nodes.
     for a, b in pairwise(cls_node.body):
@@ -196,20 +194,6 @@ def _get_own_attr_docs(cls: type[Any], out: dict[str, str]) -> None:
                 continue
 
             out[target.id] = doc
-
-
-def get_attr_docs(cls: type[Any]) -> dict[str, str]:
-    """Get any docstrings placed after attribute assignments in a class body or
-    its bases."""
-    if not isinstance(cls, type):
-        raise TypeError("Given object was not a class.")
-
-    out: dict[str, str] = {}
-
-    # Walk the MRO from the most-base class to ``cls`` so that a docstring
-    # redefined on a subclass overrides the one inherited from a base class.
-    for base in reversed(cls.__mro__):
-        _get_own_attr_docs(base, out)
 
     return out
 
@@ -331,7 +315,7 @@ def normalize_value(x):
         except Exception:
             return str(x)
 
-    # PreTrainedConfig (must be before dataclass branch as these are now dataclasses)
+    # PretrainedConfig (must be before dataclass branch as these are now dataclasses)
     if hasattr(x, "to_json_string") and callable(x.to_json_string):
         try:
             return x.to_json_string()
@@ -401,7 +385,8 @@ def hash_factors(items: dict[str, object]) -> str:
 
 @dataclass
 class Range:
-    """A range of numbers.
+    """
+    A range of numbers.
     Inclusive of start, inclusive of end.
     """
 
@@ -460,7 +445,8 @@ def get_from_deprecated_env_if_set(
     removal_version: str,
     field_name: str | None = None,
 ) -> str | None:
-    """Get value from deprecated environment variable with warning.
+    """
+    Get value from deprecated environment variable with warning.
 
     Args:
         env_name: Name of the deprecated environment variable
@@ -469,7 +455,6 @@ def get_from_deprecated_env_if_set(
 
     Returns:
         The environment variable value if set, None otherwise
-
     """
     if envs.is_set(env_name):
         value = os.environ.get(env_name)
@@ -492,7 +477,8 @@ def set_from_deprecated_env_if_set(
     to_bool: bool = False,
     to_int: bool = False,
 ) -> None:
-    """Set object field from deprecated environment variable with warning.
+    """
+    Set object field from deprecated environment variable with warning.
 
     Args:
         config: Config object to set the field on
@@ -503,7 +489,6 @@ def set_from_deprecated_env_if_set(
         to_int: Whether to convert the environment variable value to integer
     Returns:
         None
-
     """
     if to_bool and to_int:
         raise ValueError("Cannot convert to both boolean and integer.")

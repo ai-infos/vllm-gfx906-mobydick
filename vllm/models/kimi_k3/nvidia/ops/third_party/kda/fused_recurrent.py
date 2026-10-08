@@ -483,7 +483,9 @@ def fused_recurrent_kda(
     )
 
 
-@triton.jit(do_not_specialize=["stride_beta_token", "stride_state_indices"])
+@triton.jit(
+    do_not_specialize=["stride_beta_token", "stride_state_indices"]
+)
 def fused_recurrent_kda_packed_decode_kernel(
     mixed_qkv,
     raw_g,

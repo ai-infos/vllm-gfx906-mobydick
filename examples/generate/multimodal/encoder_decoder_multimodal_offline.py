@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""This example shows how to use vLLM for running offline inference with
+"""
+This example shows how to use vLLM for running offline inference with
 the explicit/implicit prompt format on enc-dec LMMs for text generation.
 """
 
@@ -55,7 +56,8 @@ def run_whisper():
 
 
 def run_fireredasr2():
-    """FireRedASR2 – Automatic Speech Recognition model.
+    """
+    FireRedASR2 – Automatic Speech Recognition model.
 
     This model uses a Conformer encoder + Qwen2 LLM decoder architecture
     for speech-to-text transcription.  Audio is passed via the implicit

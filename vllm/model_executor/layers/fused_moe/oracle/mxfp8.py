@@ -8,7 +8,6 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
     backend_to_kernel_cls,
 )
-from vllm.model_executor.layers.quantization.utils.humming import prioritize_humming
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kMxfp8Static,
@@ -112,8 +111,8 @@ def select_mxfp8_moe_backend(
 
     Returns:
         A tuple of (fp8_backend, experts_cls).
-
     """
+
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         backend = _BACKEND_NAME_MAP.get(runner_backend)
@@ -130,8 +129,7 @@ def select_mxfp8_moe_backend(
         return backend, _select_kernel_cls(backend, config)
 
     # Auto-select: pick the first supported backend.
-    backends = prioritize_humming(list(_SUPPORTED_BACKENDS))
-    for backend in backends:
+    for backend in _SUPPORTED_BACKENDS:
         try:
             experts_cls = _select_kernel_cls(backend, config)
         except ValueError:

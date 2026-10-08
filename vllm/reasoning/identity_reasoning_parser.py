@@ -15,7 +15,8 @@ if TYPE_CHECKING:
 
 
 class IdentityReasoningParser(ReasoningParser):
-    """Identity reasoning parser.
+    """
+    Identity reasoning parser.
 
     This parser does not attempt to parse or strip out reasoning tokens.
     It treats the entire model output as content and ignores reasoning.

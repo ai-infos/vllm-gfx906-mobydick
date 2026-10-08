@@ -16,13 +16,11 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
-    GateLinear,
-)
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -37,7 +35,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .commandr import LayerNorm
-from .interfaces import EagleModelMixin, SupportsEagle3, SupportsPP, SupportsQuant
+from .interfaces import SupportsPP, SupportsQuant
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -277,10 +275,12 @@ class Cohere2Moe(nn.Module):
         else:
             self.custom_routing_function = None
 
-        self.gate = GateLinear(
+        self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
+            bias=False,
             params_dtype=params_dtype,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
@@ -385,7 +385,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Cohere2MoeModel(nn.Module, EagleModelMixin):
+class Cohere2MoeModel(nn.Module):
     """Transformer decoder for Cohere2Moe."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -439,7 +439,7 @@ class Cohere2MoeModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -450,28 +450,17 @@ class Cohere2MoeModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-
-        aux_hidden_states = []
-        if self.start_layer in self.aux_hidden_state_layers:
-            aux_hidden_states.append(hidden_states)
-        for layer_idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
-            if layer_idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
         return hidden_states
 
 
-class Cohere2MoeForCausalLM(nn.Module, SupportsPP, SupportsQuant, SupportsEagle3):
+class Cohere2MoeForCausalLM(nn.Module, SupportsPP, SupportsQuant):
     is_text_generation_model = True
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -531,7 +520,7 @@ class Cohere2MoeForCausalLM(nn.Module, SupportsPP, SupportsQuant, SupportsEagle3
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(

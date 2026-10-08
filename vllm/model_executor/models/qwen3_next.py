@@ -18,10 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
-    GateLinear,
-)
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
     resolve_layer_fused_shared_expert,
@@ -183,9 +180,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
-        self.gate = GateLinear(
+        self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
+            bias=False,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
@@ -232,7 +231,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             n_shared_experts=1 if self.shared_expert is None else None,
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
-            shared_expert_prefix=f"{prefix}.shared_expert",
             shared_expert_gate=self.shared_expert_gate
             if self.shared_expert is None
             else None,
@@ -380,7 +378,7 @@ class Qwen3NextAttention(nn.Module):
         self.use_fused_qk_norm_rope_gate = (
             self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
-            and (current_platform.is_cuda() or current_platform.is_xpu())
+            and current_platform.is_cuda()
             and supports_dtype
             and (text_only or supports_mrope)
         )
@@ -758,9 +756,6 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
 
 class QwenNextMixtureOfExperts(MixtureOfExperts):
-    model: Qwen3NextModel
-    num_local_physical_experts: int
-
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -829,8 +824,14 @@ class Qwen3NextForCausalLM(
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
 
         scheduler_config = vllm_config.scheduler_config
+        if cache_config.mamba_cache_mode == "all":
+            raise NotImplementedError(
+                "Qwen3Next currently does not support 'all' prefix caching, "
+                "please use '--mamba-cache-mode=align' instead"
+            )
         self.quant_config = vllm_config.quant_config
 
         super().__init__()

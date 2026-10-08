@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for manual fusion via maybe_fused_act_quant.
+"""
+Tests for manual fusion via maybe_fused_act_quant.
 
 Tests all fusion paths in _FUSED_ACT_QUANT:
 - kFp8StaticTensorSym: all platforms
@@ -84,7 +85,7 @@ def test_manual_fusion_fp8_static_with_linear(
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
-    force_kernel: type[FP8ScaledMMLinearKernel],
+    force_kernel: FP8ScaledMMLinearKernel,
 ):
     """Test manual fusion with real FP8 linear layer (kFp8StaticTensorSym).
 

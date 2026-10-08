@@ -684,7 +684,6 @@ class Granite4VisionForConditionalGeneration(
 
         Packing on dim=-1 means the framework's token-level slicing for
         chunked prefill preserves all levels intact.
-
         """
         select_strategy = self._vision_feature_select_strategy
 

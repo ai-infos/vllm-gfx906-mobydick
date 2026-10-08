@@ -4,7 +4,7 @@
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.config.lora import LoRAConfig
 from vllm.distributed import tensor_model_parallel_all_gather
@@ -83,7 +83,8 @@ def _mcp_apply(x, bias, layer: "ColumnParallelLinearWithLoRA"):
 
 
 class ColumnParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
-    """LoRA on top of ColumnParallelLinear layer.
+    """
+    LoRA on top of ColumnParallelLinear layer.
     LoRA B is sliced for tensor parallelism.
     There are two types for the `base_layer`:
     1. ColumnParallelLinear, e.g.`dense_h_to_4h` in `FalconForCausalLM`.
@@ -139,7 +140,6 @@ class ColumnParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
         Returns:
             - output
             - bias
-
         """
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
 
@@ -164,7 +164,7 @@ class ColumnParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
     ) -> bool:
         if type(source_layer) is maybe_get_oot_by_class(ColumnParallelLinear):
             return True
@@ -208,9 +208,10 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self,
         max_loras: int,
         lora_config: LoRAConfig,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
     ) -> None:
-        """The main reason for overriding this function is to enhance  code
+        """
+        The main reason for overriding this function is to enhance  code
         maintainability.
         """
         self.lora_config = lora_config
@@ -267,7 +268,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_a: list[torch.Tensor | None],
         lora_b: list[torch.Tensor | None],
     ) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
-        """Expand packed adapter groups when they don't match n_slices.
+        """
+        Expand packed adapter groups when they don't match n_slices.
         E.g. in_proj_qkv (covers Q+K+V) + in_proj_z.
 
         A None group member means that member was not adapted; the slice(s)
@@ -366,7 +368,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
         decorate: bool = True,
     ) -> bool:
         merged_cls = maybe_get_oot_by_class(MergedColumnParallelLinear)
@@ -386,7 +388,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    """ColumnParallelLinear layer that is specifically designed for
+    """
+    ColumnParallelLinear layer that is specifically designed for
     qkv_proj. Certain models, such as chatglm3 and baichuan-7b,
     only contains a single LoRA within their qkv_proj layer.
 
@@ -442,7 +445,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
     ) -> bool:
         return (
             type(source_layer) is maybe_get_oot_by_class(QKVParallelLinear)
@@ -488,9 +491,10 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         self,
         max_loras: int,
         lora_config: LoRAConfig,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
     ) -> None:
-        """The main reason for overloading this function is to handle inconsistent
+        """
+        The main reason for overloading this function is to handle inconsistent
         weight dimensions in qkv lora.
         """
         super().create_lora_weights(max_loras, lora_config, model_config)
@@ -502,7 +506,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
         decorate: bool = True,
     ) -> bool:
         return (
@@ -517,7 +521,8 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
 
 class ColumnParallelLinearWithShardedLoRA(ColumnParallelLinearWithLoRA):
-    """Differs from ColumnParallelLinearWithLoRA by slicing LoRA A also.
+    """
+    Differs from ColumnParallelLinearWithLoRA by slicing LoRA A also.
 
     Based on S-LoRA, slicing happens along the rank dim.
     """
@@ -543,7 +548,7 @@ class ColumnParallelLinearWithShardedLoRA(ColumnParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
         decorate: bool = True,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
@@ -557,7 +562,8 @@ class ColumnParallelLinearWithShardedLoRA(ColumnParallelLinearWithLoRA):
 
 
 class MergedColumnParallelLinearWithShardedLoRA(MergedColumnParallelLinearWithLoRA):
-    """Differs from MergedColumnParallelLinearWithLoRA by slicing the
+    """
+    Differs from MergedColumnParallelLinearWithLoRA by slicing the
     LoRA A's also.
 
     Based on S-LoRA, slicing happens along the rank dim.
@@ -585,7 +591,7 @@ class MergedColumnParallelLinearWithShardedLoRA(MergedColumnParallelLinearWithLo
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
         decorate: bool = True,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
@@ -599,7 +605,8 @@ class MergedColumnParallelLinearWithShardedLoRA(MergedColumnParallelLinearWithLo
 
 
 class QKVParallelLinearWithShardedLoRA(QKVParallelLinearWithLoRA):
-    """Differs from QKVParallelLinearWithLoRA by slicing the
+    """
+    Differs from QKVParallelLinearWithLoRA by slicing the
     LoRA A's also.
 
     Based on S-LoRA, slicing happens along the rank dim.
@@ -621,7 +628,7 @@ class QKVParallelLinearWithShardedLoRA(QKVParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
         return super().can_replace_layer(
@@ -634,7 +641,8 @@ class QKVParallelLinearWithShardedLoRA(QKVParallelLinearWithLoRA):
 
 
 class MergedQKVParallelLinearWithShardedLoRA(MergedQKVParallelLinearWithLoRA):
-    """Differs from MergedQKVParallelLinearWithLoRA by slicing the
+    """
+    Differs from MergedQKVParallelLinearWithLoRA by slicing the
     LoRA A's also.
 
     Based on S-LoRA, slicing happens along the rank dim.
@@ -669,7 +677,7 @@ class MergedQKVParallelLinearWithShardedLoRA(MergedQKVParallelLinearWithLoRA):
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
         decorate: bool = True,
     ) -> bool:
         # specifying kwargs so they can be easily accessed in decorator
@@ -698,7 +706,7 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
         source_layer: nn.Module,
         lora_config: LoRAConfig,
         packed_modules_list: list,
-        model_config: PreTrainedConfig | None = None,
+        model_config: PretrainedConfig | None = None,
         decorate: bool = True,
     ) -> bool:
         # Support MergedColumnParallelLinear with 3 or more slices

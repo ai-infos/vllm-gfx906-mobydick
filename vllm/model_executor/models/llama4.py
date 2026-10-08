@@ -38,12 +38,12 @@ from vllm.model_executor.layers.attention import (
 )
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
-    GateLinear,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -98,9 +98,11 @@ class Llama4MoE(nn.Module):
         self.ep_size = self.ep_group.size()
 
         intermediate_size_moe = config.intermediate_size
-        self.router = GateLinear(
+        self.router = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
+            bias=False,
+            quant_config=None,
             prefix=f"{prefix}.router",
         )
 
@@ -404,7 +406,8 @@ class Llama4Model(LlamaModel):
         expert_params_mapping: list[tuple[str, str, int, str]],
         fused: bool = True,
     ) -> bool:
-        """Load MoE expert weights.
+        """
+        Load MoE expert weights.
 
         Args:
             name: The name of the weight to load.
@@ -424,8 +427,8 @@ class Llama4Model(LlamaModel):
         Returns:
             True if loaded_weight is one of MoE weights and the MoE expert
             weights are loaded successfully, False otherwise.
-
         """
+
         # Whether the MoE expert weights are loaded successfully.
         expert_param_loaded = False
 

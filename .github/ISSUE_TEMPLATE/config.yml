@@ -1,5 +1,5 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: Questions
-    url: https://discuss.vllm.ai
-    about: Ask questions and discuss with other vLLM community members
+  - name: gfx906 docs on this fork
+    url: https://github.com/KIntegrated/vllm-gfx906-mobydick/blob/main/docs/gfx906/README.md
+    about: Build/serve recipes, the benchmark record, and the kernel notes.

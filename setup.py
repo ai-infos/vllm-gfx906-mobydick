@@ -22,18 +22,6 @@ from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
-# Select vLLM release tags, excluding crate tags such as "proto-v0.3.0".
-VLLM_GIT_DESCRIBE_COMMAND = [
-    "git",
-    "describe",
-    "--dirty",
-    "--tags",
-    "--long",
-    "--abbrev=40",
-    "--match",
-    "v[0-9]*",
-]
-
 
 def load_module_from_path(module_name, path):
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -87,8 +75,6 @@ def get_missing_precompiled_rust_extension_modules() -> list[str]:
 
 
 def has_precompiled_rust_extensions() -> bool:
-    if not rust_build.rust_py_extension_module_names():
-        return False
     return not get_missing_precompiled_rust_extension_modules()
 
 
@@ -200,8 +186,17 @@ def bundle_tcmalloc(build_lib: str) -> None:
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+    def __init__(
+        self, name: str, cmake_lists_dir: str = ".", py_limited_api=None, **kwa
+    ) -> None:
+        # Most vLLM C extensions use the Python stable ABI (.abi3). The
+        # gfx906 custom FA extension ships a plain pybind11 module that only
+        # builds with the full ABI, so callers may pass py_limited_api=False.
+        if py_limited_api is None:
+            py_limited_api = not is_freethreaded()
+        super().__init__(
+            name, sources=[], py_limited_api=py_limited_api, **kwa
+        )
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -268,8 +263,8 @@ class cmake_build_ext(build_ext):
         cfg = envs.CMAKE_BUILD_TYPE or default_cfg
 
         cmake_args = [
-            f"-DCMAKE_BUILD_TYPE={cfg}",
-            f"-DVLLM_TARGET_DEVICE={VLLM_TARGET_DEVICE}",
+            "-DCMAKE_BUILD_TYPE={}".format(cfg),
+            "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
         ]
 
         verbose = envs.VERBOSE
@@ -293,7 +288,7 @@ class cmake_build_ext(build_ext):
 
         # Pass the python executable to cmake so it can find an exact
         # match.
-        cmake_args += [f"-DVLLM_PYTHON_EXECUTABLE={sys.executable}"]
+        cmake_args += ["-DVLLM_PYTHON_EXECUTABLE={}".format(sys.executable)]
 
         # Pass the python path to cmake so it can reuse the build dependencies
         # on subsequent calls to python.
@@ -305,7 +300,7 @@ class cmake_build_ext(build_ext):
         # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
         fc_base_dir = os.path.join(ROOT_DIR, ".deps")
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
-        cmake_args += [f"-DFETCHCONTENT_BASE_DIR={fc_base_dir}"]
+        cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
 
         #
         # Setup parallelism and build tool
@@ -313,13 +308,13 @@ class cmake_build_ext(build_ext):
         num_jobs, nvcc_threads = self.compute_num_jobs()
 
         if nvcc_threads:
-            cmake_args += [f"-DNVCC_THREADS={nvcc_threads}"]
+            cmake_args += ["-DNVCC_THREADS={}".format(nvcc_threads)]
 
         if is_ninja_available():
             build_tool = ["-G", "Ninja"]
             cmake_args += [
                 "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
-                f"-DCMAKE_JOB_POOLS:STRING=compile={num_jobs}",
+                "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
             ]
         else:
             # Default build tool to whatever cmake picks.
@@ -526,7 +521,8 @@ class precompiled_wheel_utils:
         *,
         rocm: bool = False,
     ) -> tuple[list[dict], str]:
-        """Fetches metadata for a specific variant of the precompiled wheel.
+        """
+        Fetches metadata for a specific variant of the precompiled wheel.
 
         For non-ROCm, fetches vllm metadata.
 
@@ -604,6 +600,7 @@ class precompiled_wheel_utils:
     @staticmethod
     def detect_system_cuda_variant() -> str:
         """Auto-detect CUDA variant from torch, nvidia-smi, or env default."""
+
         # Map CUDA major version to hosted wheel variants on wheels.vllm.ai
         supported = {12: "cu129", 13: "cu130"}
 
@@ -898,7 +895,8 @@ class precompiled_wheel_utils:
 
     @staticmethod
     def determine_wheel_url() -> tuple[str, str | None]:
-        """Try to determine the precompiled wheel URL or path to use.
+        """
+        Try to determine the precompiled wheel URL or path to use.
         The order of preference is:
         1. user-specified wheel location (can be either local or remote, via
            VLLM_PRECOMPILED_WHEEL_LOCATION)
@@ -1192,6 +1190,19 @@ def _is_hip() -> bool:
     ) and torch.version.hip is not None
 
 
+def _targets_gfx906() -> bool:
+    """True when the ROCm build targets gfx906 (MI50/MI60/Vega20), for which the
+    vendored custom FlashAttention (CUSTOM backend) extension is built.
+    """
+    if not _is_hip():
+        return False
+    rocm_arch = os.environ.get("PYTORCH_ROCM_ARCH", "").replace(";", " ").split()
+    # If the arch list is empty, CMake selects the archs from the detected
+    # devices; gfx906 is the only arch this fork cares about on this hardware,
+    # so build the extension in that case too.
+    return not rocm_arch or "gfx906" in rocm_arch
+
+
 def _is_tpu() -> bool:
     return VLLM_TARGET_DEVICE == "tpu"
 
@@ -1263,50 +1274,40 @@ def get_vllm_version() -> str:
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(
-            write_to="vllm/_version.py",
-            git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
-        )
+        return get_version(write_to="vllm/_version.py")
 
-    version = get_version(
-        write_to="vllm/_version.py",
-        git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
-    )
+    version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
-    if not envs.VLLM_SKIP_VERSION_SUFFIX:
-        if _no_device():
-            if envs.VLLM_TARGET_DEVICE == "empty":
-                version += f"{sep}empty"
-        elif _is_cuda():
-            if (
-                USE_PRECOMPILED_EXTENSIONS
-                and not envs.VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX
-            ):
-                version += f"{sep}precompiled"
-            else:
-                cuda_version = str(get_nvcc_cuda_version())
-                if cuda_version != envs.VLLM_MAIN_CUDA_VERSION:
-                    cuda_version_str = cuda_version.replace(".", "")[:3]
-                    # skip this for source tarball, required for pypi
-                    if "sdist" not in sys.argv:
-                        version += f"{sep}cu{cuda_version_str}"
-        elif _is_hip():
-            # Get the Rocm Version
-            rocm_version = get_rocm_version() or torch.version.hip
-            if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
-                version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
-        elif _is_tpu():
-            version += f"{sep}tpu"
-        elif _is_cpu():
-            # Check the local VLLM_TARGET_DEVICE (may be set by auto-detect above),
-            # not envs.VLLM_TARGET_DEVICE, so CPU-only hosts still get `+cpu`.
-            if VLLM_TARGET_DEVICE == "cpu":
-                version += f"{sep}cpu"
-        elif _is_xpu():
-            version += f"{sep}xpu"
+    if _no_device():
+        if envs.VLLM_TARGET_DEVICE == "empty":
+            version += f"{sep}empty"
+    elif _is_cuda():
+        if USE_PRECOMPILED_EXTENSIONS and not envs.VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX:
+            version += f"{sep}precompiled"
         else:
-            raise RuntimeError("Unknown runtime environment")
+            cuda_version = str(get_nvcc_cuda_version())
+            if cuda_version != envs.VLLM_MAIN_CUDA_VERSION:
+                cuda_version_str = cuda_version.replace(".", "")[:3]
+                # skip this for source tarball, required for pypi
+                if "sdist" not in sys.argv:
+                    version += f"{sep}cu{cuda_version_str}"
+    elif _is_hip():
+        # Get the Rocm Version
+        rocm_version = get_rocm_version() or torch.version.hip
+        if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
+            version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+    elif _is_tpu():
+        version += f"{sep}tpu"
+    elif _is_cpu():
+        # Check the local VLLM_TARGET_DEVICE (may be set by auto-detect above),
+        # not envs.VLLM_TARGET_DEVICE, so CPU-only hosts still get `+cpu`.
+        if VLLM_TARGET_DEVICE == "cpu":
+            version += f"{sep}cpu"
+    elif _is_xpu():
+        version += f"{sep}xpu"
+    else:
+        raise RuntimeError("Unknown runtime environment")
 
     return version
 
@@ -1341,10 +1342,10 @@ def get_requirements() -> list[str]:
                 # vllm-flash-attn is built only for CUDA 12.x.
                 # Skip for other versions.
                 continue
-            if "flashinfer-cubin" in req or "flashinfer-jit-cache" in req:
-                # Not on PyPI (only https://flashinfer.ai/whl), so they
-                # cannot be wheel dependencies; flashinfer handles the
-                # absence of pre-compiled cubins/jit-cache at runtime.
+            if "flashinfer-cubin" in req:
+                # Not on PyPI since 0.6.14 (only https://flashinfer.ai/whl), so
+                # it cannot be a wheel dependency; flashinfer falls back to
+                # fetching cubins at runtime when the package is absent.
                 continue
             if "nvidia-cutlass-dsl[cu13]" in req and cuda_major == "12":
                 # [cu13] extra is the default; strip it on CUDA 12 builds.
@@ -1374,12 +1375,21 @@ if _is_cuda() or _is_hip():
     # copying the relevant .py files from the source repository.
     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
-if not _is_xpu():
+if not _is_xpu() and sys.version_info >= (3, 11):
     ext_modules.append(CMakeExtension(name="vllm.spinloop"))
     ext_modules.append(CMakeExtension(name="vllm.fs_io_C"))
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
+
+if _targets_gfx906():
+    # Vendored custom FlashAttention (CUSTOM attention backend) for gfx906.
+    # The CMake target (_gfx906_fa_C) is only defined when gfx906 is among the
+    # build arches, so this is gated on the same condition in setup.py.
+    # py_limited_api=False: the gfx906_fa.cpp is a plain pybind11 module that
+    # does not build against the Python stable ABI.
+    ext_modules.append(CMakeExtension(
+        name="vllm._gfx906_fa_C", py_limited_api=False))
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
@@ -1531,7 +1541,7 @@ setup(
     install_requires=get_requirements(),
     extras_require={
         # AMD Zen CPU optimizations via zentorch
-        "zen": ["zentorch==2.13.0.1"],
+        "zen": ["zentorch==2.13.0.0"],
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],
         "tensorizer": ["tensorizer==2.10.1"],
         "fastsafetensors": ["fastsafetensors >= 0.3.3"],

@@ -24,7 +24,6 @@ from vllm.model_executor.models.transformers.fx_utils import (
     upstream_linear,
 )
 from vllm.model_executor.models.transformers.utils import (
-    Style,
     log_replacement,
     replace_linear_class,
 )
@@ -129,26 +128,30 @@ class MLAFuser(StackedFuser):
     merged_name: ClassVar[str] = "fused_qkv_a_proj"
     merged_cls_name: ClassVar[str] = "MergedColumnParallelLinear"
 
+    @property
+    def has_q_lora(self) -> bool:
+        return self.q_a_proj_name is not None
+
     def info(self, name: str) -> str:
         info_str = (
             f"Fused: {name} ({self.source_cls}) -> MLAAttention (attention interface)"
         )
-        if self.q_a_proj_name is not None:
+        if self.has_q_lora:
             info_str += "; " + super().info(name).removeprefix("Fused: ")
         return info_str
 
     @property
     def shards(self) -> list[tuple[str, ShardId]]:
         """`q_a_proj` and `kv_a_proj_with_mqa` stack into one down-projection."""
-        if self.q_a_proj_name is None:
-            return []
-        return [(self.q_a_proj_name, 0), (self.kv_a_proj_name, 1)]
+        if self.has_q_lora:
+            return [(self.q_a_proj_name, 0), (self.kv_a_proj_name, 1)]
+        return []
 
     @property
     def packed_modules_mapping(self) -> dict[str, list[str]]:
-        if self.q_a_proj_name is None:
-            return {}
-        return super().packed_modules_mapping
+        if self.has_q_lora:
+            return super().packed_modules_mapping
+        return {}
 
     @classmethod
     def match(cls, graph: fx.Graph, module: nn.Module) -> "MLAFuser | None":
@@ -231,10 +234,10 @@ class MLAFuser(StackedFuser):
         Bypass the KV expansion method so the compressed latent reaches the `vllm_mla`
         attention interface unexpanded."""
         funcdef, fn = recover_forward(type(module))
-        if (q_a_proj_name := self.q_a_proj_name) is not None:
+        if self.has_q_lora:
             # q_a_proj is usually inside the `else` of `if self.q_lora_rank is None`.
             # The fused call is inserted at the top-level statement preceding both.
-            names = [q_a_proj_name, self.kv_a_proj_name]
+            names = [self.q_a_proj_name, self.kv_a_proj_name]
             calls = self._unguarded_calls(funcdef, names)
             if ast.dump(calls[0].args[0]) != ast.dump(calls[1].args[0]):
                 raise ValueError("down-projections read different inputs")
@@ -255,7 +258,7 @@ class MLAFuser(StackedFuser):
     def update_attrs(self, module: nn.Module, prefix: str, vllm_config: "VllmConfig"):
         quant_config = vllm_config.quant_config
 
-        def replace_linear_by_name(name: str, style: Style):
+        def replace_linear_by_name(name: str, style: str):
             linear = module.get_submodule(name)
             replacement = replace_linear_class(
                 linear, style, quant_config, prefix=maybe_prefix(prefix, name)
@@ -263,10 +266,8 @@ class MLAFuser(StackedFuser):
             setattr(module, name, replacement)
             log_replacement(maybe_prefix(prefix, name), linear, replacement)
 
-        if (q_a_proj_name := self.q_a_proj_name) is not None:
-            # `match` sets the q-LoRA names together, or none of them
-            assert self.q_b_proj_name is not None
-            q_a = module.get_submodule(q_a_proj_name)
+        if self.has_q_lora:
+            q_a = module.get_submodule(self.q_a_proj_name)
             kv_a = module.get_submodule(self.kv_a_proj_name)
             merged = MergedColumnParallelLinear(
                 input_size=q_a.in_features,
@@ -279,7 +280,7 @@ class MLAFuser(StackedFuser):
             )
             logger.debug(
                 "%s: %s, %s: %s -> %s: %s",
-                q_a_proj_name,
+                self.q_a_proj_name,
                 q_a,
                 self.kv_a_proj_name,
                 kv_a,
@@ -288,11 +289,10 @@ class MLAFuser(StackedFuser):
             )
             setattr(module, self.merged_name, merged)
             # The rewritten forward calls the merged projection instead.
-            delattr(module, q_a_proj_name)
+            delattr(module, self.q_a_proj_name)
             delattr(module, self.kv_a_proj_name)
             replace_linear_by_name(self.q_b_proj_name, "colwise")
         else:
-            assert self.q_proj_name is not None
             replace_linear_by_name(self.kv_a_proj_name, "replicate")
             replace_linear_by_name(self.q_proj_name, "colwise")
 

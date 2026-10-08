@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Harmony ↔ Responses API conversion utilities.
+"""
+Harmony ↔ Responses API conversion utilities.
 
 Handles two directions:
   1. Response Input → Harmony Messages  (input parsing)

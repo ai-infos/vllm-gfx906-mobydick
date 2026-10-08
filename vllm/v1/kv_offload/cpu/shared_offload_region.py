@@ -69,7 +69,8 @@ def _get_populate_write_fn(
 
 
 class SharedOffloadRegion:
-    """Single mmap-backed memory region shared across all workers for a
+    """
+    Single mmap-backed memory region shared across all workers for a
     vLLM instance.  Workers coordinate via the filesystem: the first worker
     to open the file with O_EXCL becomes the creator and calls ftruncate;
     the rest open the existing file and wait until it reaches the expected
@@ -134,10 +135,7 @@ class SharedOffloadRegion:
                 self._creator = True
                 if creator_memory_check is not None:
                     creator_memory_check(self.total_size_bytes)
-                check_shm_free_space(
-                    self.total_size_bytes,
-                    allocation_name="CPU KV offload shared region in /dev/shm",
-                )
+                check_shm_free_space(self.total_size_bytes)
                 os.ftruncate(self.fd, self.total_size_bytes)
                 logger.info(
                     "Created mmap file %s (%.2f GB)",
@@ -263,7 +261,6 @@ class SharedOffloadRegion:
 
         Args:
             tensor_page_size: Bytes per chunk for this tensor.
-
         """
         assert self.rank is not None
         new_offset = self._worker_offset + tensor_page_size
@@ -313,7 +310,6 @@ class SharedOffloadRegion:
 
         Args:
             tensor_page_size: Canonical bytes per chunk for this tensor.
-
         """
         new_offset = self._canonical_offset + tensor_page_size
         assert new_offset <= self._row_stride

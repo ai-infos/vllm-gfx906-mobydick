@@ -32,15 +32,25 @@ python examples/features/tensorize_vllm_model.py \
    --suffix v1
 ```
 
-This saves the model tensors at `s3://my-bucket/vllm/facebook/opt-125m/v1`.
+This saves the model tensors at `s3://my-bucket/vllm/facebook/opt-125m/v1`. If you intend on applying a LoRA adapter to your tensorized model, you can pass the HF id of the LoRA adapter in the above command, and the artifacts will be saved there too:
+
+```bash
+python examples/features/tensorize_vllm_model.py \
+   --model facebook/opt-125m \
+   --lora-path <lora_id> \
+   serialize \
+   --serialized-directory s3://my-bucket \
+   --suffix v1
+```
 
 ## Serving the model using Tensorizer
 
-Once the model is serialized where you want it, you can load the model using `vllm serve` or the `LLM` entrypoint. You can pass the directory where you saved the model to the `model` argument for `LLM()` and `vllm serve`. For example, to serve the tensorized model saved previously, you'd do:
+Once the model is serialized where you want it, you can load the model using `vllm serve` or the `LLM` entrypoint. You can pass the directory where you saved the model to the `model` argument for `LLM()` and `vllm serve`. For example, to serve the tensorized model saved previously with the LoRA adapter, you'd do:
 
 ```bash
 vllm serve s3://my-bucket/vllm/facebook/opt-125m/v1 \
-    --load-format tensorizer
+    --load-format tensorizer \
+    --enable-lora 
 ```
 
 Or, with `LLM()`:
@@ -50,6 +60,7 @@ from vllm import LLM
 llm = LLM(
     "s3://my-bucket/vllm/facebook/opt-125m/v1", 
     load_format="tensorizer",
+    enable_lora=True,
 )
 ```
 
@@ -62,6 +73,7 @@ As an example, CPU concurrency can be limited when serializing with `tensorizer`
 ```bash
 python examples/features/tensorize_vllm_model.py \
    --model facebook/opt-125m \
+   --lora-path <lora_id> \
    serialize \
    --serialized-directory s3://my-bucket \
    --serialization-kwargs '{"limit_cpu_concurrency": 2}' \
@@ -73,6 +85,7 @@ As an example when customizing the loading process via `TensorDeserializer`, you
 ```bash
 vllm serve s3://my-bucket/vllm/facebook/opt-125m/v1 \
     --load-format tensorizer \
+    --enable-lora \
     --model-loader-extra-config '{"deserialization_kwargs": {"num_readers": 2}}'
 ```
 
@@ -83,6 +96,7 @@ from vllm import LLM
 llm = LLM(
     "s3://my-bucket/vllm/facebook/opt-125m/v1", 
     load_format="tensorizer",
+    enable_lora=True,
     model_loader_extra_config={"deserialization_kwargs": {"num_readers": 2}},
 )
 ```

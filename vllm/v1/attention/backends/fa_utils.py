@@ -44,6 +44,9 @@ elif current_platform.is_rocm():
 
     compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
     try:
+        # On gfx906 (MI50), rock-flash-attn with CK backend is not supported;
+        # FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE is mandatory for some backends
+        # (e.g. MLA). gfx1250 uses aiter's Triton MHA where available.
         if on_gfx1250():
             from aiter.ops.triton.mha import (  # type: ignore[no-redef]
                 flash_attn_varlen_func,
@@ -303,11 +306,10 @@ def flash_attn_supports_kv_cache_dtype(
         kv_cache_block_size=kv_cache_block_size,
         supports_fa4_hd256=supports_fa4_hd256,
     )
-    is_sm90 = current_platform.is_device_capability_family(90)
-    sm90_fp8_kv_supported = fa_version == 3 or (
-        fa_version == 4 and head_size in (None, 512)
+    return (fa_version == 3 and current_platform.is_device_capability_family(90)) or (
+        fa_version == 4 and current_platform.is_device_capability_family(100)
     )
-    return (sm90_fp8_kv_supported and is_sm90) or (
+    return (fa_version == 3 and current_platform.is_device_capability_family(90)) or (
         fa_version == 4 and current_platform.is_device_capability_family(100)
     )
 
@@ -361,7 +363,6 @@ def is_flash_attn_varlen_func_available() -> bool:
 
     Returns:
         bool: True if a working flash_attn_varlen_func implementation is available.
-
     """
     if current_platform.is_cuda() or current_platform.is_xpu():
         # CUDA and XPU always have flash_attn_varlen_func available

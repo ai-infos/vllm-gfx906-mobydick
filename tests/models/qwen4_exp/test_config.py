@@ -7,12 +7,16 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
+)
+from vllm.models.qwen4_exp.config import (
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
+    qsa_uses_tuned_topk_width,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -34,10 +38,7 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
         "linear_num_value_heads": 2,
         "linear_key_head_dim": 8,
         "linear_value_head_dim": 8,
-        "num_experts": 4,
-        "num_experts_per_tok": 2,
-        # `Qwen4ExpTextConfig` requires an EOS token whenever PLE is enabled.
-        "eos_token_id": 1,
+        "num_experts": 0,
         "hc_count": 2,
         "hc_lowrank": 4,
         "ple_layer_ids": [1],
@@ -246,3 +247,64 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+_QSA_KWARGS = {
+    "indexer_n_heads": 4,
+    "indexer_kv_heads": 1,
+    "indexer_head_dim": 128,
+    "indexer_budget": 2048,
+    "indexer_compress_ratio": 1,
+}
+
+
+@pytest.mark.parametrize(
+    ("budget", "ratio"),
+    [(512, 1), (1024, 1), (2048, 1), (4096, 1), (262144, 4)],
+)
+def test_qsa_selection_width_is_a_runtime_property(budget: int, ratio: int) -> None:
+    """Widths outside the tuned set are legal configurations.
+
+    Regression for the first model family that needs one: an indexer budget of
+    262144 tokens at compress_ratio 4 selects 65536 blocks, i.e. every block the
+    262144-token context can hold. Upstream rejected any width other than
+    512/2048, which is a property of its tuned top-k kernels, not of the config.
+    """
+
+    config = _text_config(
+        **{**_QSA_KWARGS, "indexer_budget": budget, "indexer_compress_ratio": ratio}
+    )
+
+    expected = budget // ratio
+    assert config.qsa_block_topk == expected
+    assert config.qsa_uses_tuned_topk == (expected in (512, 1024, 2048))
+    assert qsa_uses_tuned_topk_width(expected) == config.qsa_uses_tuned_topk
+
+
+def test_qsa_selection_width_absent_without_indexer_config() -> None:
+    config = _text_config()
+
+    assert config.qsa_block_topk is None
+    assert config.qsa_uses_tuned_topk is False
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"indexer_budget": 1000, "indexer_compress_ratio": 3}, "divisible"),
+        ({"indexer_kv_heads": 2}, "indexer_kv_heads=1"),
+        ({"indexer_budget": 0}, "must be positive"),
+        ({"indexer_compress_ratio": -4}, "must be positive"),
+        ({"indexer_head_dim": 4, "partial_rotary_factor": 1.0}, "rotary"),
+    ],
+)
+def test_qsa_still_rejects_broken_geometry(
+    overrides: dict[str, int], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _text_config(**{**_QSA_KWARGS, **overrides})
+
+
+def test_qsa_rejects_partial_indexer_config() -> None:
+    with pytest.raises(ValueError, match="missing required fields"):
+        _text_config(indexer_n_heads=4, indexer_kv_heads=1, indexer_head_dim=128)

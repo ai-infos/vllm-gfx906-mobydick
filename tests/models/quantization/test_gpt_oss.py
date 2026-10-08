@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end accuracy test for GPT-OSS model quantization.
+"""
+End-to-end accuracy test for GPT-OSS model quantization.
 
 Config:
     Task:   gsm8k_platinum
@@ -169,7 +170,8 @@ def test_aiter_mxfp4_moe_ignores_padded_rows(
     monkeypatch: pytest.MonkeyPatch,
     dist_init,
 ) -> None:
-    """Garbage in cudagraph padding rows must not reach the unpadded outputs.
+    """
+    Garbage in cudagraph padding rows must not reach the unpadded outputs.
 
     A cudagraph replay of a size-`TOKENS_PADDED` graph driven by
     `TOKENS_UNPADDED` real tokens leaves the trailing padding row containing

@@ -39,8 +39,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     int block_size, Tensor! sorted_token_ids,"
       "                     Tensor! experts_ids,"
       "                     Tensor! num_tokens_post_pad,"
-      "                     Tensor? maybe_expert_map,"
-      "                     Tensor(a!)? scatter_idx=None) -> ()");
+      "                     Tensor? maybe_expert_map) -> ()");
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.
@@ -66,7 +65,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     Tensor !adapter_enabled,"
       "                     Tensor !lora_ids,"
       "                     Tensor? maybe_expert_map) -> () ");
-#ifndef USE_ROCM
   m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
       "Tensor b_scales, Tensor? b_qzeros, "
@@ -75,6 +73,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "int top_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, "
       "int bit) -> Tensor");
 
+#ifndef USE_ROCM
   m.def(
       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
       "Tensor! b_q_weight, Tensor? b_bias_or_none,"
@@ -105,13 +104,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "expert_first_token_offset, Tensor! inv_permuted_idx, Tensor! "
       "permuted_idx, Tensor! sort_workspace, Tensor! permuted_experts_id, "
       "Tensor! sorted_row_idx, Tensor! topk_ids_for_sort)->()");
-
-  m.def(
-      "moe_prepare_scatter(Tensor topk_ids, Tensor token_expert_indices, "
-      "Tensor? expert_map, int n_expert, int n_local_expert, "
-      "Tensor! expert_first_token_offset, Tensor! scatter_idx, "
-      "Tensor! sort_workspace, Tensor! sorted_experts, Tensor! sorted_rows, "
-      "Tensor! topk_ids_for_sort)->()");
 
   m.def(
       "moe_unpermute(Tensor permuted_hidden_states, Tensor topk_weights,"
@@ -146,8 +138,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("batched_moe_align_block_size",
          TORCH_BOX(&batched_moe_align_block_size));
   m.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
-#ifndef USE_ROCM
   m.impl("moe_wna16_gemm", TORCH_BOX(&moe_wna16_gemm));
+#ifndef USE_ROCM
   m.impl("shuffle_rows", TORCH_BOX(&shuffle_rows));
   m.impl("grouped_topk", TORCH_BOX(&grouped_topk));
 #endif

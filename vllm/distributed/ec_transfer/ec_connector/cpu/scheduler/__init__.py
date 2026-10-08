@@ -229,7 +229,6 @@ class ECCPUScheduler:
         Returns:
             True if no item needs to wait for a remote encoding. False if any
             item is pending or the request must be aborted.
-
         """
         if not request.ec_transfer_params:
             return True
@@ -260,7 +259,6 @@ class ECCPUScheduler:
         Raises:
             _RemoteUnavailable: The remote source is invalid, the read failed,
                 or the item's total wait budget expired.
-
         """
         pos = feature.mm_position
         mm_hash = feature.identifier
@@ -336,7 +334,6 @@ class ECCPUScheduler:
             item's remote announcement so subsequent steps do not retry it.
             False if only placeholder metadata (or no input) is available,
             recording the request for take_unavailable_requests() to drain.
-
         """
         mm_hash = feature.identifier
         self._deferred_since.pop((request.request_id, mm_hash), None)

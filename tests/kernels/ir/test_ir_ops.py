@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Meta-tests for vLLM IR op infrastructure.
+"""
+Meta-tests for vLLM IR op infrastructure.
 
 Ensures all registered ops have input generators defined.
 Per-op correctness tests live alongside their op definitions

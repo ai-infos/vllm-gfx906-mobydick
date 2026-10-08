@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -47,27 +47,29 @@ from .utils import (
     maybe_prefix,
 )
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
+
 
 class SharedHead(nn.Module):
     def __init__(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
-        *,
-        defer_lm_head: bool = False,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if defer_lm_head:
-            self.head = None
-        else:
-            self.head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "head"),
-            )
+        self.head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "head"),
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.norm(hidden_states)
@@ -247,6 +249,10 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
+        self.is_fp4_ckpt = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_fp4"
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )
@@ -309,12 +315,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
         ]
 
-        # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
-        indexer_fused_mapping = [
-            ("wk_weights_proj", "wk", 0),
-            ("wk_weights_proj", "weights_proj", 1),
-        ]
-        stacked_params_mapping.extend(indexer_fused_mapping)
+        # gfx906 DeepSeek uses AWQ/GPTQ and cannot use the fused FP8/BF16 indexer.
+        if not on_gfx906():
+            # Fused indexer wk + weights_proj (shard 0 = wk, shard 1 = weights_proj)
+            indexer_fused_mapping = [
+                ("wk_weights_proj", "wk", 0),
+                ("wk_weights_proj", "weights_proj", 1),
+            ]
+            stacked_params_mapping.extend(indexer_fused_mapping)
 
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
@@ -534,7 +542,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         return loaded_params
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """Rewrite the weight name to match the format of the original model.
+        """
+        Rewrite the weight name to match the format of the original model.
         Add .mtp_block for modules in transformer layer block for spec layer
         and rename shared layer weights to be top level.
         """

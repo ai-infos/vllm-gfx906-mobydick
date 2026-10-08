@@ -4,7 +4,7 @@ import os
 from dataclasses import fields
 from typing import Any
 
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.transformers_utils.configs.speculators.algos import (
     SUPPORTED_SPECULATORS_TYPES,
@@ -12,13 +12,13 @@ from vllm.transformers_utils.configs.speculators.algos import (
 from vllm.transformers_utils.utils import without_trust_remote_code
 
 
-class SpeculatorsConfig(PreTrainedConfig):
+class SpeculatorsConfig(PretrainedConfig):
     model_type = "speculators"
 
     def __init__(self, **kwargs):
         # super().__init__ performs some validation before setting all kwargs as
         # attributes, so we set them first to be safe
-        pre_trained_config_fields = {f.name for f in fields(PreTrainedConfig)}
+        pre_trained_config_fields = {f.name for f in fields(PretrainedConfig)}
         super_kwargs = dict()
         for key, value in kwargs.items():
             if key == "model_type":
@@ -47,7 +47,9 @@ class SpeculatorsConfig(PreTrainedConfig):
     def extract_transformers_pre_trained_config(
         cls, config_dict: dict[str, Any]
     ) -> dict[str, Any]:
-        """Extract the Transformers `PreTrainedConfig` from a speculators config."""
+        """
+        Extract standard Transformers PreTrainedConfig config from speculators config.
+        """
         speculators_model_type = config_dict.get("speculators_model_type")
         if speculators_model_type not in SUPPORTED_SPECULATORS_TYPES:
             raise ValueError(
@@ -97,7 +99,8 @@ class SpeculatorsConfig(PreTrainedConfig):
     def build_vllm_speculative_config(
         cls, config_dict: dict[str, Any]
     ) -> dict[str, Any]:
-        """Build vLLM-compatible speculative configuration from speculators format.
+        """
+        Build vLLM-compatible speculative configuration from speculators format.
 
         This method extracts and transforms speculative configuration from the
         speculators format into the structure expected by vLLM.
@@ -107,7 +110,6 @@ class SpeculatorsConfig(PreTrainedConfig):
 
         Returns:
             Dictionary with vLLM-compatible speculative configuration
-
         """
         # Extract speculators configuration
         spec_config = config_dict["speculators_config"]

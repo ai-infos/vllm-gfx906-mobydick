@@ -12,7 +12,7 @@ from typing import Annotated, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -49,12 +49,13 @@ from .utils import (
 
 
 class SkyworkR1VImagePixelInputs(TensorSchema):
-    """Dimensions:
-    - bnp: Batch size * number of images * (1 + num_patches)
-    - c: Number of channels (3)
-    - h: Height
-    - w: Width
-    - bn: Batch size * number of images
+    """
+    Dimensions:
+        - bnp: Batch size * number of images * (1 + num_patches)
+        - c: Number of channels (3)
+        - h: Height
+        - w: Width
+        - bn: Batch size * number of images
     """
 
     type: Literal["pixel_values"] = "pixel_values"
@@ -71,11 +72,12 @@ class SkyworkR1VImagePixelInputs(TensorSchema):
 
 
 class SkyworkR1VImageEmbeddingInputs(TensorSchema):
-    """Dimensions:
-    - ni: Number of images
-    - ifs: Image feature size
-    - hs: Hidden size (must match the hidden size of language model
-      backbone)
+    """
+    Dimensions:
+        - ni: Number of images
+        - ifs: Image feature size
+        - hs: Hidden size (must match the hidden size of language model
+          backbone)
     """
 
     type: Literal["image_embeds"] = "image_embeds"
@@ -200,7 +202,7 @@ class SkyworkR1VChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         )
 
     def _patch_quant_config(
-        self, config: PreTrainedConfig, quant_config: QuantizationConfig | None
+        self, config: PretrainedConfig, quant_config: QuantizationConfig | None
     ):
         # the awq models from OpenGVLab missing `modules_to_not_convert`
         # patch the quant_config to add `modules_to_not_convert` back
@@ -214,7 +216,7 @@ class SkyworkR1VChatModel(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _init_vision_model(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
@@ -236,7 +238,7 @@ class SkyworkR1VChatModel(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _init_mlp1(
         self,
-        config: PreTrainedConfig,
+        config: PretrainedConfig,
         quant_config: QuantizationConfig | None,
         prefix: str = "",
     ) -> nn.Module:

@@ -235,20 +235,13 @@ def _chunk_scan_fwd_kernel(
         seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1
     )
 
-    if HAS_INITSTATES and (seq_idx != seq_idx_prev):
-        prev_states_ptr = (
-            initstates_ptr
-            + seq_idx * stride_init_states_batch
-            + pid_h * stride_init_states_head
-        )
-        prev_states_hdim = stride_init_states_hdim
-        prev_states_dstate = stride_init_states_dstate
-    else:
-        prev_states_ptr = (
-            states_ptr + (pid_c - 1) * stride_states_chunk + pid_h * stride_states_head
-        )
-        prev_states_hdim = stride_states_hdim
-        prev_states_dstate = stride_states_dstate
+    # NOTE: the previous-state source is selected by loading inside each
+    # branch and yielding the *tile*, never the base pointer. Yielding two
+    # different base pointers (initstates_ptr vs states_ptr) from a runtime
+    # scf.if trips the fat-pointer narrowing assertion in TritonAMDGPU's
+    # CanonicalizePointers pass (triton-gfx906 3.6.x), which aborts the
+    # compile worker for the HAS_INITSTATES variant of this kernel.
+    is_fresh_seq = seq_idx != seq_idx_prev
 
     chunk_size_limit = chunk_seqlen_end - chunk_seqlen_start
 
@@ -279,32 +272,57 @@ def _chunk_scan_fwd_kernel(
             other=0.0,
         )
 
-        if not HAS_INITSTATES and (seq_idx != seq_idx_prev):
-            # if no init states AND starting a new sequence, we need zeros
-            prev_states = tl.zeros(
-                (BLOCK_SIZE_DSTATE, BLOCK_SIZE_N), dtype=C_ptr.dtype.element_ty
-            )
-        else:
-            # otherwise read the previous state
+        if HAS_INITSTATES and is_fresh_seq:
+            # fresh sequence with provided initial states
             prev_states_ptrs = (
-                prev_states_ptr
-                + offs_n[None, :] * prev_states_hdim
-                + offs_k_dstate[:, None] * prev_states_dstate
+                initstates_ptr
+                + seq_idx * stride_init_states_batch
+                + pid_h * stride_init_states_head
+                + offs_n[None, :] * stride_init_states_hdim
+                + offs_k_dstate[:, None] * stride_init_states_dstate
             )
             prev_states = tl.load(
                 prev_states_ptrs,
                 mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
                 other=0.0,
+            ).to(C_ptr.dtype.element_ty)
+        elif (not HAS_INITSTATES) and is_fresh_seq:
+            # if no init states AND starting a new sequence, we need zeros
+            prev_states = tl.zeros(
+                (BLOCK_SIZE_DSTATE, BLOCK_SIZE_N), dtype=C_ptr.dtype.element_ty
             )
-            prev_states = prev_states.to(C_ptr.dtype.element_ty)
+        else:
+            # otherwise read the previous chunk's state
+            prev_states_ptrs = (
+                states_ptr
+                + (pid_c - 1) * stride_states_chunk
+                + pid_h * stride_states_head
+                + offs_n[None, :] * stride_states_hdim
+                + offs_k_dstate[:, None] * stride_states_dstate
+            )
+            prev_states = tl.load(
+                prev_states_ptrs,
+                mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                other=0.0,
+            ).to(C_ptr.dtype.element_ty)
 
         acc = tl.dot(C, prev_states) * scale_m[:, None]
 
     else:
-        prev_states_ptrs = (
-            prev_states_ptr
-            + offs_n[None, :] * prev_states_hdim
-            + offs_k_dstate[:, None] * prev_states_dstate
+        # Branch-local previous-state loads (see the note above the
+        # BLOCK_SIZE_DSTATE <= 128 path: base pointers must not be yielded
+        # from a runtime scf.if). Each branch computes its own addresses
+        # from its own base; the states base is only dereferenced on
+        # same-sequence continuations, where pid_c >= 1 is guaranteed.
+        states_base = (
+            states_ptr
+            + (pid_c - 1) * stride_states_chunk
+            + pid_h * stride_states_head
+        )
+        init_base = (
+            initstates_ptr
+            + seq_idx * stride_init_states_batch
+            + pid_h * stride_init_states_head
         )
         for k in range(0, dstate, BLOCK_SIZE_K):
             C = tl.load(
@@ -313,21 +331,30 @@ def _chunk_scan_fwd_kernel(
                 & (offs_k_dstate[None, :] < dstate - k),
                 other=0.0,
             )
-            if not HAS_INITSTATES and (seq_idx != seq_idx_prev):
+            if HAS_INITSTATES and is_fresh_seq:
+                prev_states = tl.load(
+                    init_base
+                    + offs_n[None, :] * stride_init_states_hdim
+                    + (k + offs_k_dstate[:, None]) * stride_init_states_dstate,
+                    mask=(offs_k_dstate[:, None] < dstate - k)
+                    & (offs_n[None, :] < hdim),
+                    other=0.0,
+                ).to(C_ptr.dtype.element_ty)
+            elif (not HAS_INITSTATES) and is_fresh_seq:
                 prev_states = tl.zeros(
                     (BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=C_ptr.dtype.element_ty
                 )
             else:
                 prev_states = tl.load(
-                    prev_states_ptrs,
+                    states_base
+                    + offs_n[None, :] * stride_states_hdim
+                    + (k + offs_k_dstate[:, None]) * stride_states_dstate,
                     mask=(offs_k_dstate[:, None] < dstate - k)
                     & (offs_n[None, :] < hdim),
                     other=0.0,
-                )
-                prev_states = prev_states.to(C_ptr.dtype.element_ty)
+                ).to(C_ptr.dtype.element_ty)
             acc += tl.dot(C, prev_states)
             C_ptrs += BLOCK_SIZE_K
-            prev_states_ptrs += BLOCK_SIZE_K
         acc *= scale_m[:, None]
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)

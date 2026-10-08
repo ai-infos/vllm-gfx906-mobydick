@@ -37,7 +37,8 @@ def create_chat_embeddings(
     add_special_tokens: bool = False,
     padding: str | NotGiven = NOT_GIVEN,
 ) -> CreateEmbeddingResponse:
-    """Convenience function for accessing vLLM's Chat Embeddings API,
+    """
+    Convenience function for accessing vLLM's Chat Embeddings API,
     which is an extension of OpenAI's existing Embeddings API.
     """
     return client.post(
@@ -55,11 +56,13 @@ def create_chat_embeddings(
 
 
 def run_clip(client: OpenAI, model: str):
-    """Start the server using:
+    """
+    Start the server using:
 
     vllm serve openai/clip-vit-base-patch32 \
         --runner pooling
     """
+
     response = create_chat_embeddings(
         client,
         messages=[
@@ -94,7 +97,8 @@ def run_clip(client: OpenAI, model: str):
 
 
 def run_dse_qwen2_vl(client: OpenAI, model: str):
-    """Start the server using:
+    """
+    Start the server using:
 
     vllm serve MrLight/dse-qwen2-2b-mrl-v1 \
         --runner pooling \
@@ -155,12 +159,14 @@ def run_dse_qwen2_vl(client: OpenAI, model: str):
 
 
 def run_qwen3_vl(client: OpenAI, model: str):
-    """Start the server using:
+    """
+    Start the server using:
 
     vllm serve Qwen/Qwen3-VL-Embedding-2B \
         --runner pooling \
         --max-model-len 8192
     """
+
     default_instruction = "Represent the user's input."
 
     print("Text embedding output:")
@@ -260,12 +266,14 @@ def run_qwen3_vl(client: OpenAI, model: str):
 
 
 def run_siglip(client: OpenAI, model: str):
-    """Start the server using:
+    """
+    Start the server using:
 
     vllm serve google/siglip-base-patch16-224 \
         --runner pooling \
         --chat-template template_basic.jinja
     """
+
     response = create_chat_embeddings(
         client,
         messages=[
@@ -303,7 +311,8 @@ def run_siglip(client: OpenAI, model: str):
 
 
 def run_vlm2vec(client: OpenAI, model: str):
-    """Start the server using:
+    """
+    Start the server using:
 
     vllm serve TIGER-Lab/VLM2Vec-Full \
         --runner pooling \
@@ -311,6 +320,7 @@ def run_vlm2vec(client: OpenAI, model: str):
         --max-model-len 4096 \
         --chat-template examples/pooling/embed/template/vlm2vec_phi3v.jinja
     """
+
     response = create_chat_embeddings(
         client,
         messages=[

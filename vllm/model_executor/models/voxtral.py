@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import cast
 
@@ -16,10 +16,10 @@ from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from mistral_common.protocol.transcription.request import TranscriptionRequest
 from mistral_common.tokens.tokenizers.audio import Audio
-from transformers import WhisperConfig
+from transformers import BatchFeature, WhisperConfig
 
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
-from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.inputs import MultiModalDataDict, PromptType, TokensPrompt
 from vllm.logger import init_logger
@@ -36,6 +36,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
+    MultiModalKwargsOptionalItems,
     NestedTensors,
 )
 from vllm.multimodal.parse import (
@@ -47,8 +48,7 @@ from vllm.multimodal.processing import BaseDummyInputsBuilder
 from vllm.multimodal.processing.processor import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    HFMultiModalInputs,
-    MultiModalProcessingResult,
+    MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
     ProcessorInputs,
     PromptReplacement,
@@ -61,6 +61,7 @@ from vllm.transformers_utils.processors.voxtral import (
     MistralCommonFeatureExtractor,
     MistralCommonVoxtralProcessor,
 )
+from vllm.utils.collection_utils import is_list_of
 
 from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsTranscription
 from .utils import init_vllm_registered_model, maybe_prefix
@@ -137,35 +138,35 @@ class VoxtralDummyInputsBuilder(BaseDummyInputsBuilder[VoxtralProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: MultiModalDummyOptions,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
+        num_audios = mm_counts.get("audio", 0)
+
         target_length = self.info.get_max_audio_array_len()
+
+        audio_overrides = mm_options.get("audio")
 
         return {
             "audio": self._get_dummy_audios(
                 length=target_length,
-                num_audios=mm_counts.get("audio", 0),
-                overrides=mm_options.get("audio"),
+                num_audios=num_audios,
+                overrides=audio_overrides,
             )
         }
 
-
-class VoxtralMultiModalProcessor(BaseMultiModalProcessor[VoxtralProcessingInfo]):
-    def get_dummy_inputs(
+    def get_dummy_processor_inputs(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: MultiModalDummyOptions,
-        # For test_common.py only
+        mm_options: Mapping[str, BaseDummyOptions],
         mm_data: MultiModalDataDict | None = None,
     ) -> ProcessorInputs:
-        builder = self.dummy_inputs
         tokenizer = self.info.get_tokenizer()
         feature_extractor = self.info.get_feature_extractor()
 
-        dummy_text = builder.get_dummy_text(mm_counts)
+        dummy_text = self.get_dummy_text(mm_counts)
         dummy_mm_data = (
-            builder.get_dummy_mm_data(seq_len, mm_counts, mm_options)
+            self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
             if mm_data is None
             else mm_data
         )
@@ -201,24 +202,28 @@ class VoxtralMultiModalProcessor(BaseMultiModalProcessor[VoxtralProcessingInfo])
 
         return ProcessorInputs(prompt=dummy_tokens, mm_data_items=dummy_mm_items)
 
+
+class VoxtralMultiModalProcessor(BaseMultiModalProcessor[VoxtralProcessingInfo]):
     # The tokens are already inserted by the chat template,
     # so we just double check that they exist
     def _maybe_apply_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
-        mm_res: MultiModalProcessingResult,
+        prompt_ids: list[int],
+        mm_kwargs: MultiModalKwargsOptionalItems,
+        mm_prompt_updates: MultiModalPromptUpdates,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         mm_item_counts = mm_items.get_all_counts()
-        self._validate_mm_kwargs(mm_res.kwargs, mm_item_counts)
-        self._validate_mm_updates(mm_res.prompt_updates, mm_item_counts)
+        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
+        self._validate_mm_updates(mm_prompt_updates, mm_item_counts)
 
         mm_placeholders = self._find_mm_placeholders(
-            mm_res.prompt_ids,
-            mm_res.prompt_updates,
+            prompt_ids,
+            mm_prompt_updates,
         )
         self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
 
-        return mm_res.prompt_ids, mm_placeholders
+        return prompt_ids, mm_placeholders
 
     def _get_mm_fields_config(
         self,
@@ -236,20 +241,38 @@ class VoxtralMultiModalProcessor(BaseMultiModalProcessor[VoxtralProcessingInfo])
         # skip validation here
         pass
 
-    def _get_hf_mm_text(self, mm_counts: Mapping[str, int]) -> str:
+    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
         return self.dummy_inputs.get_dummy_text(mm_counts)
 
-    def _get_hf_mm_inputs(
+    def _preprocess_hf_mm_data(
         self,
-        mm_items: MultiModalDataItems,
-        hf_kwargs: Mapping[str, object],
-    ) -> HFMultiModalInputs:
-        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        mm_data = dict(mm_data)
+        audios = mm_data.pop("audios", [])
+
+        if audios:
+            # MistralCommonVoxtralProcessor accepts "audio"
+            mm_data["audio"] = audios
 
         # Avoid padding issue
-        return hf_inputs._replace(
-            hf_kwargs=dict(hf_inputs.hf_kwargs, return_tensors=None)
-        )
+        hf_processor_mm_kwargs = dict(**hf_processor_mm_kwargs, return_tensors=None)
+
+        return mm_data, hf_processor_mm_kwargs
+
+    def _postprocess_hf_mm_data(
+        self,
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
+    ) -> BatchFeature:
+        # Missing batch dimension
+        input_ids = processed_data.get("input_ids")
+        if is_list_of(input_ids, int):
+            processed_data["input_ids"] = [input_ids]
+
+        return processed_data
 
     def _get_prompt_updates(
         self,
@@ -317,7 +340,7 @@ class VoxtralForConditionalGeneration(
 
         # update quant config to so that ignored module and target module names
         # match the vLLM model names
-        if vllm_config.quant_config is not None:
+        if hasattr(vllm_config, "quant_config"):
             vllm_config.quant_config = self.maybe_update_quant_config(
                 vllm_config.quant_config
             )
@@ -479,7 +502,8 @@ class VoxtralForConditionalGeneration(
         stt_config: SpeechToTextConfig,
         model_config: ModelConfig,
     ) -> int | None:
-        """Map from audio duration to number of audio tokens produced by the ASR
+        """
+        Map from audio duration to number of audio tokens produced by the ASR
         model, without running a forward pass.
         This is used for estimating the amount of processing for this audio.
         """
@@ -562,7 +586,8 @@ class VoxtralForConditionalGeneration(
     def maybe_update_quant_config(
         self, quant_config: QuantizationConfig
     ) -> QuantizationConfig:
-        """Update quant config to so that ignored module and target module names
+        """
+        Update quant config to so that ignored module and target module names
         match the vLLM model names.
         Right now this is specific for compressed-tensors format and
         load_format mistral.
@@ -724,7 +749,6 @@ class VoxtralEncoderModel(nn.Module):
         self.config = cast(WhisperConfig, vllm_config.model_config.hf_config)
         self.dtype: torch.dtype = vllm_config.model_config.dtype
         self.is_causal = getattr(self.config, "is_causal", False)
-        WhisperEncoderCls: Callable[..., WhisperEncoder | WhisperCausalEncoder]
         if self.is_causal:
             WhisperEncoderCls = WhisperCausalEncoder
         else:
@@ -831,7 +855,7 @@ class VoxtralEncoderModel(nn.Module):
         return results
 
     def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
-        stacked_params_mapping: list[tuple[str, str, str | int]] = [
+        stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),

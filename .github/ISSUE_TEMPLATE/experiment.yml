@@ -1,0 +1,45 @@
+name: 🔬 Experiment / measurement
+description: A measurement that produces a number or a gate result (may need the tester's box).
+title: "[Experiment]: "
+labels: ["roadmap", "kind: experiment"]
+body:
+  - type: input
+    id: roadmap_id
+    attributes:
+      label: Roadmap ID
+      placeholder: e.g. TP-1, QSA-FN-15
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis
+      description: Falsifiable one-liner — "If X, then Y".
+    validations:
+      required: true
+  - type: textarea
+    id: arms
+    attributes:
+      label: Arms and config
+      description: Each arm, the exact serving config, reps per arm, and the order/interleaving.
+    validations:
+      required: true
+  - type: textarea
+    id: gate
+    attributes:
+      label: Deciding datum
+      description: The single number the verdict is read from.
+    validations:
+      required: true
+  - type: dropdown
+    id: box
+    attributes:
+      label: Where it can run
+      options:
+        - This box (2× MI50)
+        - Tester's box (needs a >32 GB checkpoint)
+        - Either
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: References

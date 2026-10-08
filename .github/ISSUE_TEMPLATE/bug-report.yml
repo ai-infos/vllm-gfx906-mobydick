@@ -1,0 +1,36 @@
+name: 🐛 Bug report
+description: Something on the gfx906 fork is broken (crash, wrong output, regression).
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: Observed behaviour, full error/traceback, and whether it reproduces.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: The exact `vllm serve …` / Python command and the smallest model+config that triggers it.
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Commit, ROCm/torch/triton versions, GPU state (VRAM baseline, wedges), model checkpoint.
+    validations:
+      required: true
+  - type: input
+    id: degraded
+    attributes:
+      label: Host-state check
+      description: Canary result / how many wedges this boot. (Weirdly slow spec-decode with normal greedy decode ⇒ suspect the host.)
+  - type: textarea
+    id: refs
+    attributes:
+      label: References
+      description: Dev log / degradation entry / prior issue.

@@ -322,14 +322,14 @@ class MMEncoderAttention(CustomOp):
         num_kv_heads: int | None = None,
         prefix: str = "",
     ) -> None:
-        """Args:
-        num_heads: number of attention heads per partition.
-        head_size: hidden_size per attention head.
-        scale: scale factor.
-        num_kv_heads: number of kv heads.
-        prefix: This has no effect, it is only here to make it easier to
-                swap between Attention and MultiHeadAttention
-
+        """
+        Args:
+            num_heads: number of attention heads per partition.
+            head_size: hidden_size per attention head.
+            scale: scale factor.
+            num_kv_heads: number of kv heads.
+            prefix: This has no effect, it is only here to make it easier to
+                    swap between Attention and MultiHeadAttention
         """
         super().__init__()
 
@@ -517,7 +517,8 @@ class MMEncoderAttention(CustomOp):
         q_len: int,
         kv_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reshape query, key, value to 4D tensors:
+        """
+        Reshape query, key, value to 4D tensors:
         (batch_size, seq_len, num_heads, head_size)
         """
         query = query.view(bsz, q_len, self.num_heads, self.head_size)
@@ -587,6 +588,34 @@ class MMEncoderAttention(CustomOp):
             scale=self.scale,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+        )
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        return output
+
+    def _forward_gfx906_fa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """gfx906 custom Q8 FA (VIT-1).
+
+        Bidirectional, cache-free, ragged ViT attention through the dense
+        non-paged `gfx906_fa.forward` entry; the kernel head dim is padded
+        (72 -> 128) to fit the instantiated sizes. See
+        `vllm/gfx906_fa/gfx906_fa_mm_encoder.py`.
+        """
+        from vllm.gfx906_fa.gfx906_fa_mm_encoder import forward_vit
+
+        bsz, q_len = query.size()[:2]
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
+        output = forward_vit(
+            query, key, value, cu_seqlens, max_seqlen, self.scale, self.head_size
         )
         if is_reshaped:
             output = output.reshape(bsz, q_len, -1)
@@ -793,6 +822,8 @@ class MMEncoderAttention(CustomOp):
             return self._forward_aiter_fp8(query, key, value, cu_seqlens, max_seqlen)
         elif self.is_flash_attn_backend:
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
+        elif self.attn_backend == AttentionBackendEnum.CUSTOM:
+            return self._forward_gfx906_fa(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.TRITON_ATTN:
             return self._forward_triton(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:

@@ -5,18 +5,16 @@ use std::path::PathBuf;
 
 use expect_test::{ExpectFile, expect, expect_file};
 use serde_json::Value;
-use thiserror_ext::AsReport as _;
 
 use super::DeepSeekV4ChatRenderer;
 use crate::ChatRenderer;
-use crate::EffortValue;
 use crate::event::{AssistantContentBlock, AssistantToolCall};
 use crate::renderer::deepseek_v41::DeepSeekV41ChatRenderer;
 use crate::renderer::test_utils::{FixtureRequestOptions, fixture_chat_request};
-use crate::request::{ChatMessage, ChatRequest, ChatTool, GenerationPromptMode};
+use crate::request::{ChatMessage, ChatRequest, ChatTool, GenerationPromptMode, ReasoningEffort};
 
 fn render_request(request: &ChatRequest) -> String {
-    DeepSeekV4ChatRenderer::default()
+    DeepSeekV4ChatRenderer::new()
         .render(request)
         .unwrap()
         .prompt
@@ -33,13 +31,13 @@ fn thinking_request(messages: Vec<ChatMessage>) -> ChatRequest {
         .chat_options
         .template_kwargs
         .insert("thinking".to_string(), Value::Bool(true));
-    request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
     request
 }
 
 fn fixture_request(input_name: &str) -> ChatRequest {
     let mut request = fixture_chat_request(&fixture_path(input_name), deepseek_fixture_options());
-    request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
     request
 }
 
@@ -183,7 +181,6 @@ fn tools_keep_historical_developer() {
         description: None,
         parameters: Value::Object(Default::default()),
         strict: None,
-        defer_loading: None,
     };
     let request = thinking_request(vec![
         ChatMessage::developer("old instruction", Some(vec![tool])),
@@ -206,7 +203,7 @@ fn reasoning_effort_max_adds_prefix_when_thinking_is_enabled() {
         .chat_options
         .template_kwargs
         .insert("thinking".to_string(), Value::Bool(true));
-    request.chat_options.reasoning_effort = Some(EffortValue::from("max"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Max);
 
     let rendered = render_request(&request);
 
@@ -229,7 +226,7 @@ fn reasoning_effort_high_adds_0731_high_prefix() {
         .chat_options
         .template_kwargs
         .insert("thinking".to_string(), Value::Bool(true));
-    request.chat_options.reasoning_effort = Some(EffortValue::from("high"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::High);
 
     let rendered = render_request(&request);
 
@@ -261,7 +258,7 @@ fn reasoning_effort_xhigh_maps_to_high() {
         messages: vec![ChatMessage::user("solve it")],
         ..ChatRequest::for_test()
     };
-    request.chat_options.reasoning_effort = Some(EffortValue::from("xhigh"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::XHigh);
 
     let rendered = render_request(&request);
 
@@ -271,7 +268,7 @@ fn reasoning_effort_xhigh_maps_to_high() {
 
 #[test]
 fn minimal_and_medium_reasoning_effort_map_to_low() {
-    for effort in [EffortValue::from("minimal"), EffortValue::from("medium")] {
+    for effort in [ReasoningEffort::Minimal, ReasoningEffort::Medium] {
         let mut request = ChatRequest {
             messages: vec![ChatMessage::user("solve it")],
             ..ChatRequest::for_test()
@@ -295,7 +292,7 @@ fn reasoning_effort_low_keeps_the_default_prompt() {
         .chat_options
         .template_kwargs
         .insert("thinking".to_string(), Value::Bool(true));
-    request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
 
     let rendered = render_request(&request);
 
@@ -308,55 +305,16 @@ fn reasoning_effort_none_disables_thinking() {
         messages: vec![ChatMessage::user("answer directly")],
         ..ChatRequest::for_test()
     };
-    request.chat_options.reasoning_effort = Some(EffortValue::from("none"));
+    request
+        .chat_options
+        .template_kwargs
+        .insert("thinking".to_string(), Value::Bool(true));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::None);
 
     let rendered = render_request(&request);
 
     expect!["<｜begin▁of▁sentence｜><｜User｜>answer directly<｜Assistant｜></think>"]
         .assert_eq(&rendered);
-}
-
-#[test]
-fn normalized_reasoning_drives_both_prompt_and_compatibility_kwargs() {
-    for (kwargs, enabled, effort, prefix) in [
-        (
-            serde_json::json!({"enable_thinking": true, "reasoning_effort": "none"}),
-            true,
-            "high",
-            "Absolute maximum",
-        ),
-        (
-            serde_json::json!({"thinking": false, "enable_thinking": true, "reasoning_effort": "max"}),
-            false,
-            "none",
-            "",
-        ),
-        (
-            serde_json::json!({"reasoning_effort": "xhigh"}),
-            true,
-            "high",
-            "Absolute maximum",
-        ),
-    ] {
-        let mut request = ChatRequest::for_test();
-        request.chat_options.template_kwargs = serde_json::from_value(kwargs).unwrap();
-        let rendered = DeepSeekV4ChatRenderer::default().render(&request).unwrap();
-        let prompt = rendered.prompt.into_text().unwrap();
-        assert_eq!(prompt.ends_with("<think>"), enabled);
-        assert_eq!(prompt.contains("Reasoning Effort:"), enabled);
-        if enabled {
-            assert!(prompt.contains(prefix));
-        }
-        assert_eq!(rendered.effective_template_kwargs["thinking"], enabled);
-        assert_eq!(
-            rendered.effective_template_kwargs["enable_thinking"],
-            enabled
-        );
-        assert_eq!(
-            rendered.effective_template_kwargs["reasoning_effort"],
-            effort
-        );
-    }
 }
 
 #[test]
@@ -380,7 +338,7 @@ fn system_to_assistant_transitions_in_chat_and_thinking_modes() {
             .chat_options
             .template_kwargs
             .insert("enable_thinking".to_string(), Value::Bool(enable_thinking));
-        request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+        request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
         render_request(&request)
     });
 
@@ -408,7 +366,7 @@ fn trailing_system_transitions_in_chat_and_thinking_modes() {
             .chat_options
             .template_kwargs
             .insert("enable_thinking".to_string(), Value::Bool(enable_thinking));
-        request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+        request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
         render_request(&request)
     });
 
@@ -422,7 +380,7 @@ fn trailing_system_transitions_in_chat_and_thinking_modes() {
 }
 
 #[test]
-fn reasoning_effort_template_kwarg_selects_effort() {
+fn reasoning_effort_template_kwarg_is_ignored() {
     let mut request = ChatRequest {
         messages: vec![ChatMessage::user("solve it")],
         ..ChatRequest::for_test()
@@ -438,15 +396,15 @@ fn reasoning_effort_template_kwarg_selects_effort() {
 
     let rendered = render_request(&request);
 
-    assert!(rendered.starts_with("<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"));
+    assert!(rendered.starts_with("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"));
     assert!(rendered.ends_with("<｜Assistant｜><think>"));
 }
 
 #[test]
 fn tool_call_arguments_preserve_non_objects_like_recipe() {
     let renderers: [(&dyn ChatRenderer, &str); 2] = [
-        (&DeepSeekV4ChatRenderer::default(), "parameter"),
-        (&DeepSeekV41ChatRenderer::default(), " parameter"),
+        (&DeepSeekV4ChatRenderer::new(), "parameter"),
+        (&DeepSeekV41ChatRenderer::new(), " parameter"),
     ];
     for arguments in [
         "not json",
@@ -642,7 +600,7 @@ fn drop_thinking_false_keeps_prior_assistant_reasoning() {
         .chat_options
         .template_kwargs
         .insert("drop_thinking".to_string(), Value::Bool(false));
-    request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
 
     let rendered = render_request(&request);
 
@@ -735,7 +693,7 @@ fn trailing_system_omits_generation_prompt_when_disabled() {
         .chat_options
         .template_kwargs
         .insert("enable_thinking".to_string(), Value::Bool(false));
-    request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Low);
 
     let rendered = render_request(&request);
 
@@ -765,21 +723,4 @@ fn last_developer_omits_generation_prompt_when_disabled() {
     let rendered = render_request(&request);
 
     expect!["<｜begin▁of▁sentence｜><｜User｜>latest instruction"].assert_eq(&rendered);
-}
-
-#[test]
-fn custom_roles_are_rejected_as_request_errors() {
-    let request = ChatRequest {
-        messages: vec![
-            ChatMessage::custom("root", "identity"),
-            ChatMessage::user("hello"),
-        ],
-        ..ChatRequest::for_test()
-    };
-
-    let error = DeepSeekV4ChatRenderer::default().render(&request).unwrap_err();
-
-    assert!(error.is_request_validation_error());
-    expect!["chat role `root` is not supported by this chat renderer"]
-        .assert_eq(&error.to_report_string());
 }

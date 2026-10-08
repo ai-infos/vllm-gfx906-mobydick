@@ -71,19 +71,20 @@ def retrieve_chunks(self):
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")
 def test_pooling_chunked_prefill(vllm_runner, monkeypatch):
     """Test chunked prefill for pooling models with LastPool."""
+
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
         model_id = "Qwen/Qwen3-Embedding-0.6B"
 
         chunk_size = 10
 
-        # Cap the token budget to force chunked prefill; the
-        # long_prefill_token_threshold is not applied to a lone request.
+        # Set chunking parameters to force chunked prefill
+        # Note: Chunked prefill is automatically handled by vLLM
+        # internally based on the model size and prompt
         with vllm_runner(
             model_id,
             runner="pooling",
-            max_num_batched_tokens=chunk_size,
-            max_num_seqs=1,
+            long_prefill_token_threshold=chunk_size,
             tensor_parallel_size=1,
             enforce_eager=True,
             enable_chunked_prefill=True,
@@ -123,6 +124,7 @@ def test_pooling_chunked_prefill(vllm_runner, monkeypatch):
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")
 def test_pooling_prefix_cache(vllm_runner, monkeypatch):
     """Test chunked prefill for pooling models with LastPool."""
+
     verses = prompt.split("\n\n")
 
     with monkeypatch.context() as m:

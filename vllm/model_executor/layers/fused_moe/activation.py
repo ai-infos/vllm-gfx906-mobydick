@@ -115,7 +115,6 @@ def activation_without_mul(activation: str) -> str:
 
     Returns:
         The non-gated activation name (e.g., "silu_no_mul", "gelu_no_mul")
-
     """
     return MoEActivation.from_str(activation).without_mul().value
 

@@ -17,7 +17,6 @@ from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     MEDIA_CONNECTOR_REGISTRY,
     AsyncMultiModalItemTracker,
-    ChatCompletionMessageParam,
     ConversationMessage,
     _load_embeds_dict,
     _parse_metadata_array,
@@ -770,9 +769,7 @@ async def test_text_only_chat_does_not_initialize_media_connector(
 ):
     load_connector = MagicMock()
     monkeypatch.setattr(MEDIA_CONNECTOR_REGISTRY, "load", load_connector)
-    messages: list[ChatCompletionMessageParam] = [
-        {"role": "user", "content": "Who are you?"}
-    ]
+    messages = [{"role": "user", "content": "Who are you?"}]
 
     parse_chat_messages(
         messages,
@@ -943,6 +940,7 @@ def test_parse_chat_messages_audio_embeds_with_string(
     audio_embeds_model_config,
 ):
     """Test audio_embeds with base64 string embedding data."""
+
     import torch
 
     # Create a sample audio embedding tensor
@@ -985,6 +983,7 @@ async def test_parse_chat_messages_audio_embeds_async(
     audio_embeds_model_config,
 ):
     """Test audio_embeds with async futures."""
+
     import torch
 
     # Create a sample audio embedding tensor
@@ -2460,7 +2459,7 @@ def test_parse_chat_messages_image_vision_chunk(
     kimi_k2_5_model_config,
     image_url,
 ):
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2496,7 +2495,7 @@ def test_parse_chat_messages_video_vision_chunk(
     kimi_k2_5_model_config,
     video_url,
 ):
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2533,7 +2532,7 @@ def test_parse_chat_messages_image_vision_chunk_with_uuid(
     image_url,
 ):
     image_uuid = "image_123"
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2571,7 +2570,7 @@ def test_parse_chat_messages_video_vision_chunk_with_uuid(
     video_url,
 ):
     video_uuid = "video_456"
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2609,7 +2608,7 @@ def test_parse_chat_messages_mixed_vision_chunk(
     image_url,
     video_url,
 ):
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2658,7 +2657,7 @@ def test_parse_chat_messages_mixed_vision_chunk_with_uuid(
 ):
     image_uuid = "image_123"
     video_uuid = "video_456"
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2710,7 +2709,7 @@ async def test_parse_chat_messages_mixed_vision_chunk_async(
     image_url,
     video_url,
 ):
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2760,7 +2759,7 @@ async def test_parse_chat_messages_mixed_vision_chunk_with_uuid_async(
 ):
     image_uuid = "image_123"
     video_uuid = "video_456"
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2811,7 +2810,7 @@ async def test_parse_chat_messages_image_vision_chunk_async(
     kimi_k2_5_model_config,
     image_url,
 ):
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2848,7 +2847,7 @@ async def test_parse_chat_messages_video_vision_chunk_async(
     kimi_k2_5_model_config,
     video_url,
 ):
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2886,7 +2885,7 @@ async def test_parse_chat_messages_image_vision_chunk_with_uuid_async(
     image_url,
 ):
     image_uuid = "image_123"
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2925,7 +2924,7 @@ async def test_parse_chat_messages_video_vision_chunk_with_uuid_async(
     video_url,
 ):
     video_uuid = "video_456"
-    messages: list[ChatCompletionMessageParam] = [
+    messages = [
         {
             "role": "user",
             "content": [
@@ -2987,6 +2986,7 @@ def test_postprocess_messages_null_arguments_string():
 @pytest.mark.asyncio
 async def test_resolve_items_runs_modalities_concurrently_and_preserves_order():
     """Media fetches overlap while modality and item order are preserved."""
+
     active_fetches = 0
     max_active_fetches = 0
 
@@ -3000,7 +3000,8 @@ async def test_resolve_items_runs_modalities_concurrently_and_preserves_order():
         finally:
             active_fetches -= 1
 
-    tracker = AsyncMultiModalItemTracker(MagicMock(is_multimodal_model=True))
+    tracker = AsyncMultiModalItemTracker(MagicMock())
+    tracker._model_config.is_multimodal_model = True
     tracker.__dict__["mm_processor"] = MagicMock()
     tracker._items_by_modality["video"] = [
         lambda: _fetch("video-0", 0.02),
@@ -3194,5 +3195,5 @@ def test_validate_chat_template_rejects_invalid_type():
     with pytest.raises(
         VLLMValidationError, match="not a valid chat template type"
     ) as exc_info:
-        validate_chat_template(123)
+        validate_chat_template(123)  # type: ignore[arg-type]
     assert exc_info.value.parameter == "chat_template"

@@ -28,7 +28,6 @@ class LateInteractionParams(
             - "score_doc": score a document against a cached query.
         query_key: stable key used for both DP routing and worker cache lookup.
         query_uses: expected number of document requests
-
     """
 
     mode: str
@@ -48,7 +47,6 @@ class PoolingParams(
             `None` uses the pooler's default, which is `True` in most cases.
         dimensions: Reduce the dimensions of embeddings
             if model support matryoshka representation.
-
     """
 
     # --8<-- [start:common-pooling-params]

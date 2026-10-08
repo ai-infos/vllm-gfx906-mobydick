@@ -40,9 +40,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 import vllm.envs as envs
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
-from vllm.entrypoints.serve.exception_handling.error_response import (
-    create_error_response,
-)
 from vllm.entrypoints.serve.exception_handling.utils import sanitize_message
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
@@ -141,9 +138,15 @@ if _SDK_AVAILABLE:
 
         try:
             result = await handler.create_chat_v2(request, raw_request)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - report as 500 for parity
             logger.exception("Error in /cohere/v2/chat: %s", e)
-            return _error_response(create_error_response(e), raw_request)
+            return JSONResponse(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                content=CohereError(
+                    message=sanitize_message(str(e)),
+                    id=_request_id(raw_request),
+                ).model_dump(exclude_none=True),
+            )
 
         match result:
             case ErrorResponse():
@@ -191,17 +194,18 @@ if _SDK_AVAILABLE:
         try:
             chat_request = handler.to_chat_completion_request(request)
             result = await render_handler.render_chat_request(chat_request)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - report as 500 for parity
             logger.exception("Error in /cohere/v2/chat/render: %s", e)
-            return _error_response(create_error_response(e), raw_request)
+            return JSONResponse(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                content=CohereError(
+                    message=sanitize_message(str(e)),
+                    id=_request_id(raw_request),
+                ).model_dump(exclude_none=True),
+            )
 
         if isinstance(result, ErrorResponse):
             return _error_response(result, raw_request)
-
-        if (kwargs := result.reasoning_parser_kwargs) is not None:
-            kwargs.chat_template_kwargs = handler._engine_chat_template_kwargs(
-                kwargs.chat_template_kwargs
-            )
 
         return JSONResponse(content=result.model_dump())
 

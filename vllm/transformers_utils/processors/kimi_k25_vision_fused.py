@@ -14,11 +14,8 @@ from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.utils import TensorType
 
-from vllm.multimodal.image import open_image
 from vllm.utils.import_utils import is_numba_available
 from vllm.utils.jit_monitor import numba_workqueue_threading_layer
-
-_IDENTITY_LUT = np.tile(np.arange(256, dtype=np.uint8)[:, None], (1, 3))
 
 if is_numba_available():
     from numba import njit, prange
@@ -154,10 +151,10 @@ def _to_pil(data: Any) -> Image.Image:
     if isinstance(data, str):
         if data.startswith("data:"):
             raw_base64 = data.split(",", 1)[1]
-            return open_image(io.BytesIO(base64.b64decode(raw_base64))).convert("RGB")
-        return open_image(data).convert("RGB")
+            return Image.open(io.BytesIO(base64.b64decode(raw_base64))).convert("RGB")
+        return Image.open(data).convert("RGB")
     if isinstance(data, bytes):
-        return open_image(io.BytesIO(data)).convert("RGB")
+        return Image.open(io.BytesIO(data)).convert("RGB")
     raise ValueError(f"Unsupported data type: {type(data)}")
 
 
@@ -241,12 +238,7 @@ class KimiK25FusedVisionProcessor(BaseImageProcessor):
         self,
         medias: list[dict[str, Any]],
         return_tensors: str | TensorType | None = None,
-        do_rescale: bool = True,
-        do_normalize: bool = True,
     ) -> BatchFeature:
-        assert do_rescale == do_normalize
-        device_normalize = not do_normalize
-
         if not isinstance(medias, list):
             medias = [medias]
         if not medias:
@@ -304,9 +296,8 @@ class KimiK25FusedVisionProcessor(BaseImageProcessor):
             )
             total_patches += num_patches
 
-        lut = _IDENTITY_LUT if device_normalize else self.normalize_lut
         pixel_values_np = np.empty(
-            (total_patches, 3, patch_size, patch_size), dtype=lut.dtype
+            (total_patches, 3, patch_size, patch_size), dtype=np.float32
         )
         out_offset = 0
         with numba_workqueue_threading_layer():
@@ -327,7 +318,7 @@ class KimiK25FusedVisionProcessor(BaseImageProcessor):
                     padded_height,
                     padded_width,
                     patch_size,
-                    lut,
+                    self.normalize_lut,
                 )
                 out_offset += num_patches
 

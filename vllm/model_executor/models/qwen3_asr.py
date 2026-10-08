@@ -32,14 +32,13 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.whisper import WhisperFeatureExtractor
 
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
-from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.inputs import ModalityData, MultiModalDataDict, PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     StreamingTranscriptionPostProcessor,
-    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -190,6 +189,7 @@ class Qwen3ASRProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> Qwen3ASRProcessor:
         processor = self.ctx.get_hf_processor(
             Qwen3ASRProcessor,
+            use_fast=kwargs.pop("use_fast", True),
             **kwargs,
         )
         if not hasattr(processor, "audio_token"):
@@ -226,8 +226,10 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: MultiModalDummyOptions,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
+        num_audios = mm_counts.get("audio", 0)
+
         feature_extractor = self.info.get_feature_extractor()
 
         target_audio_length = (
@@ -238,11 +240,13 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
             * feature_extractor.sampling_rate
         )
 
+        audio_overrides = mm_options.get("audio")
+
         return {
             "audio": self._get_dummy_audios(
                 length=target_audio_length,
-                num_audios=mm_counts.get("audio", 0),
-                overrides=mm_options.get("audio"),
+                num_audios=num_audios,
+                overrides=audio_overrides,
             ),
         }
 
@@ -275,7 +279,7 @@ class Qwen3ASRMultiModalDataParser(MultiModalDataParser):
 
 
 class Qwen3ASRMultiModalProcessor(
-    Qwen3OmniMoeThinkerMultiModalProcessor[Qwen3ASRProcessingInfo]
+    Qwen3OmniMoeThinkerMultiModalProcessor,
 ):
     def _get_mm_fields_config(
         self,
@@ -317,7 +321,6 @@ class Qwen3ASRMultiModalProcessor(
             if num_features == 0:
                 audios = mm_items.get_items("audio", AudioProcessorItems)
                 audio = audios.get(item_idx)
-                assert audio is not None
                 raise ValueError(
                     f"The audio {audio} (len={len(audio)}) is too short "
                     "to be represented inside the model"
@@ -346,7 +349,6 @@ class Qwen3ASRForConditionalGeneration(
     SupportsMRoPE,
     SupportsTranscription,
     SupportsLoRA,
-    SupportsEagle3,
 ):
     # LoRA support
     packed_modules_mapping = {
@@ -616,7 +618,9 @@ class Qwen3ASRForConditionalGeneration(
         return llm_positions, mrope_position_delta
 
     def get_mm_mapping(self) -> MultiModelKeys:
-        """Get the module prefix in multimodal models."""
+        """
+        Get the module prefix in multimodal models
+        """
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             tower_model=["audio_tower."],
@@ -699,7 +703,8 @@ class Qwen3ASRForConditionalGeneration(
 
     @classmethod
     def post_process_output(cls, text: str) -> str:
-        """Post-process Qwen3-ASR raw output to extract clean transcription.
+        """
+        Post-process Qwen3-ASR raw output to extract clean transcription.
 
         The model outputs in format: "language {lang}<asr_text>{transcription}"
         This method strips the language prefix and asr_text tags.

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Benchmark script for device communicators:
+"""
+Benchmark script for device communicators:
 CustomAllreduce (oneshot, twoshot), PyNcclCommunicator,
 and SymmMemCommunicator (multimem, two-shot).
 
@@ -16,7 +17,6 @@ Usage:
 Example:
     torchrun --nproc_per_node=2 benchmark_device_communicators.py
     --sequence-lengths 512 1024 2048 --num-warmup 10 --num-trials 100
-
 """
 
 import json
@@ -54,9 +54,48 @@ logger = init_logger(__name__)
 # Default sequence lengths to benchmark
 DEFAULT_SEQUENCE_LENGTHS = [16, 64, 128, 512, 1024, 2048, 4096, 8192]
 
-# Fixed hidden size and dtype for all benchmarks
-HIDDEN_SIZE = 8192
-BENCHMARK_DTYPE = torch.bfloat16
+
+def _get_hidden_size() -> int:
+    value = os.getenv("HIDDEN_SIZE")
+    if value is None:
+        return 8192
+    try:
+        return int(value)
+    except ValueError as err:
+        raise ValueError(
+            f"Invalid HIDDEN_SIZE={value!r}; expected an integer"
+        ) from err
+
+
+def _get_benchmark_dtype() -> torch.dtype:
+    value = os.getenv("BENCHMARK_DTYPE")
+    if value is None:
+        return torch.bfloat16
+    normalized = value.strip().lower()
+    if normalized.startswith("torch."):
+        normalized = normalized[len("torch.") :]
+    aliases = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as err:
+        raise ValueError(
+            f"Invalid BENCHMARK_DTYPE={value!r}; expected one of "
+            f"{', '.join(sorted(aliases))}"
+        ) from err
+
+
+# Fixed model shape and dtype for all benchmarks; can be overridden for local
+# model-specific experiments with HIDDEN_SIZE and BENCHMARK_DTYPE.
+HIDDEN_SIZE = _get_hidden_size()
+BENCHMARK_DTYPE = _get_benchmark_dtype()
 
 # CUDA graph settings
 CUDA_GRAPH_CAPTURE_CYCLES = 10
@@ -241,6 +280,7 @@ class CommunicatorBenchmark:
         self, sequence_length: int, num_warmup: int, num_trials: int
     ) -> dict[str, float]:
         """Benchmark allreduce operations for all available communicators."""
+
         results = {}
 
         # Define communicators with their benchmark functions

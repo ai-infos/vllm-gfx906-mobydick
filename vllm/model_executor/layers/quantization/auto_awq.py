@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Union
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from torch.nn import Parameter
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 import vllm.model_executor.layers.fused_moe  # noqa
 from vllm import _custom_ops as ops
@@ -42,12 +42,16 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.c4_layer0_moe import (
+    c4_quant_layer0_enabled,
+)
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_marlin_supported,
     check_marlin_supports_layer,
     check_moe_marlin_supports_layer,
     get_marlin_input_dtype,
+    marlin_make_workspace_new,
     verify_marlin_supported,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -62,6 +66,13 @@ from vllm.model_executor.parameter import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx906
+else:
+
+    def on_gfx906() -> bool:
+        return False
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -92,7 +103,7 @@ def _replace_or_register_parameter(
 def _convert_awq_to_standard_format(
     layer: torch.nn.Module,
     w_q_name: str,
-    w_zp_name: str | None,
+    w_zp_name: str,
     size_bits: int,
 ) -> None:
     """Convert AWQ weight and zero-point tensors to standard GPTQ-like format.
@@ -100,7 +111,6 @@ def _convert_awq_to_standard_format(
     AWQ packs qweight along the output dim with a non-standard bit order.
     This converts to standard bit order and repacks qweight along the input
     dim, matching the format expected by the MPLinearKernel framework.
-    If w_zp_name is None (symmetric quantization), only the weight is converted.
     """
     pack_factor = 32 // size_bits
     mask = (1 << size_bits) - 1
@@ -138,9 +148,6 @@ def _convert_awq_to_standard_format(
         weight_loader=_noop_loader,
     )
     setattr(layer, w_q_name, new_param)
-
-    if w_zp_name is None:
-        return
 
     # --- Convert qzeros: fix AWQ bit ordering and repack
     # AWQ qzeros: (G, N // pack) packed along dim 1, AWQ bit order
@@ -227,11 +234,13 @@ class AutoAWQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if on_gfx906():
+            return [torch.half, torch.float32]
         return [torch.half, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 60 if on_gfx906() else 75
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -340,15 +349,35 @@ class AutoAWQConfig(QuantizationConfig):
                 getattr(self, "modules_to_not_convert", []),
                 match_mode="substring",
             ):
+                # C4 (gfx906): the checkpoint's deliberately-unquantized first
+                # MoE layer otherwise runs the generic Triton unquantized path
+                # (~4x/call vs the custom W4A16 kernel at M=1). Opt-in via
+                # VLLM_GFX906_QUANT_LAYER0_MOE=1, quantize its fp16 experts to
+                # int4 after load and route them through the gfx906 kernel.
+                if c4_quant_layer0_enabled():
+                    from vllm.model_executor.layers.quantization.c4_layer0_moe import (
+                        C4QuantizedLayer0MoEMethod,
+                    )
+
+                    return C4QuantizedLayer0MoEMethod(layer.moe_config, self)
                 return UnquantizedFusedMoEMethod(layer.moe_config)
 
             if not check_moe_marlin_supports_layer(
                 layer, self.group_size, allow_tile_padding=True
             ):
-                logger.warning_once(
-                    f"Layer '{prefix}' is not supported by AutoAWQMoEMarlin. "
-                    "Falling back to Moe WNA16 kernels."
-                )
+                # On gfx906 the fallback to the custom WNA16 path is
+                # intentional (Marlin MoE is unsupported there), so one
+                # info line per process instead of a per-layer warning.
+                if current_platform.is_rocm() and on_gfx906():
+                    logger.info_once(
+                        "AutoAWQMoEMarlin is not supported on gfx906; "
+                        "using Moe WNA16 kernels for all MoE layers."
+                    )
+                else:
+                    logger.warning_once(
+                        f"Layer '{prefix}' is not supported by AutoAWQMoEMarlin. "
+                        "Falling back to Moe WNA16 kernels."
+                    )
                 from vllm.model_executor.layers.quantization.moe_wna16 import (
                     MoeWNA16Config,
                 )
@@ -370,7 +399,7 @@ class AutoAWQConfig(QuantizationConfig):
     def maybe_update_config(
         self,
         model_name: str,
-        hf_config: PreTrainedConfig | None = None,
+        hf_config: PretrainedConfig | None = None,
         revision: str | None = None,
     ):
         if self.modules_to_not_convert:
@@ -396,7 +425,6 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
 
     Args:
         quant_config: The AWQ Marlin quantization config.
-
     """
 
     _kernel_backends_being_used: set[str] = set()
@@ -641,6 +669,9 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
+        device = layer.w13_qweight.device
+        layer.workspace = marlin_make_workspace_new(device, 4)
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_moe_backend,
@@ -702,6 +733,7 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         """Build the FusedMoEKernel for this layer."""
+
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         self.moe_kernel = make_wna16_moe_kernel(
             moe_quant_config=self.moe_quant_config,
@@ -713,7 +745,7 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
-            from vllm.model_executor.layers.quantization.utils.humming import (
+            from vllm.model_executor.layers.quantization.utils.humming_utils import (
                 get_humming_moe_quant_config,
             )
 
@@ -790,7 +822,6 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
-            routing_sink=layer.routing_sink,
         )
 
 
@@ -881,7 +912,6 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
 
     Args:
         quant_config: The AWQ quantization config.
-
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -889,12 +919,56 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
+        if current_platform.is_rocm() and on_gfx906():
+            bits = self.quant_config.weight_bits
+
+            # hints: shuffle twice is equal to unshuffle once
+            ops.gptq_shuffle(layer.qzeros, bits)
+            ops.gptq_shuffle(layer.qzeros, bits)
+
+            ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
+            layer.qweight.data = layer.qweight.reshape(
+                (layer.qweight.shape[0] // 8, layer.qweight.shape[1] * 8)
+            )
+            replace_parameter(layer, "qweight", layer.qweight.data)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if current_platform.is_rocm() and on_gfx906():
+            # NOTE: on gfx906, process_weights_after_loading reshapes qweight
+            # from [K, N/pack] to [K/pack, N], so qweight.shape[-1] is already
+            # the full unpacked output size. Do not multiply by pack_factor.
+            out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+
+            # The optimized GPTQ GEMM is FP16-only; preserve FP32 at the API.
+            orig_dtype = x.dtype
+            scales = layer.scales
+            if x.dtype == torch.float32:
+                x = x.to(torch.float16)
+                if scales.dtype == torch.float32:
+                    scales = scales.to(torch.float16)
+
+            reshaped_x = x.reshape(-1, x.shape[-1])
+
+            output = ops.gptq_gemm(
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                scales,
+                True,
+                True,
+                self.quant_config.weight_bits,
+            )
+            if output.dtype != orig_dtype:
+                output = output.to(orig_dtype)
+            if bias is not None:
+                output.add_(bias)
+            return output.reshape(out_shape)
+
         qweight = layer.qweight
         scales = layer.scales
         qzeros = layer.qzeros

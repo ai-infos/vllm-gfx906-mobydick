@@ -254,3 +254,15 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# rocprofv3 output (kernel traces, PMC counts) and GPU core dumps from
+# gfx906 profiling runs — can be hundreds of MB, never commit.
+.rocprofv3/
+gpucore.*.gpu
+# gfx906_fa launcher build intermediates (hipcc/llvm, dropped in the repo root by the extension build)
+gfx906_fa_launcher*.hipfb
+gfx906_fa_launcher*.bc
+gfx906_fa_launcher*.hipi
+gfx906_fa_launcher*.o
+gfx906_fa_launcher*.s
+gfx906_fa_launcher*.out*

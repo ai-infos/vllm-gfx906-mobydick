@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Unit test for ``_memcpy_u64_tiled``.
 
 Guards the head/body/tail alignment handling and the u64 body's tile
@@ -37,7 +38,7 @@ try:
     import pytest
 
     pytestmark = pytest.mark.skipif(
-        not current_platform.is_cuda(),
+        not (current_platform.is_cuda() or current_platform.is_rocm()),
         reason="_memcpy_u64_tiled needs CUDA/Triton",
     )
     _parametrize = pytest.mark.parametrize

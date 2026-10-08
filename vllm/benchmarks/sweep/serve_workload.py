@@ -4,9 +4,10 @@ import argparse
 import math
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import ClassVar, Literal, assert_never, get_args
+from typing import ClassVar, Literal, get_args
 
 import numpy as np
+from typing_extensions import assert_never
 
 from vllm.benchmarks.datasets import DEFAULT_NUM_PROMPTS
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -62,8 +63,6 @@ def run_comb_workload(
     experiment_dir: Path,
     num_runs: int,
     dry_run: bool,
-    warmup_num_prompts: int,
-    continue_on_error: bool,
     workload_var: WorkloadVariable,
     workload_value: int,
 ) -> list[dict[str, object]] | None:
@@ -83,8 +82,6 @@ def run_comb_workload(
         ),
         num_runs=num_runs,
         dry_run=dry_run,
-        warmup_num_prompts=warmup_num_prompts,
-        continue_on_error=continue_on_error,
     )
 
 
@@ -100,8 +97,6 @@ def explore_comb_workloads(
     experiment_dir: Path,
     num_runs: int,
     dry_run: bool,
-    warmup_num_prompts: int,
-    continue_on_error: bool,
 ):
     print("[WL START]")
     print(f"Serve parameters: {serve_comb.as_text() or '(None)'}")
@@ -134,8 +129,6 @@ def explore_comb_workloads(
         experiment_dir=experiment_dir,
         num_runs=num_runs,
         dry_run=dry_run,
-        warmup_num_prompts=warmup_num_prompts,
-        continue_on_error=continue_on_error,
         workload_var=workload_var,
         workload_value=1,
     )
@@ -148,22 +141,16 @@ def explore_comb_workloads(
         experiment_dir=experiment_dir,
         num_runs=num_runs,
         dry_run=dry_run,
-        warmup_num_prompts=warmup_num_prompts,
-        continue_on_error=continue_on_error,
         workload_var=workload_var,
         workload_value=dataset_size,
     )
 
-    if not serial_workload_data or not batch_workload_data:
+    if serial_workload_data is None or batch_workload_data is None:
         if dry_run:
             print("Omitting intermediate Workload iterations.")
-        else:
-            print(
-                "Unable to establish both Workload Explorer endpoints; "
-                "skipping intermediate workload levels."
-            )
-        print("[WL END]")
-        return []
+            print("[WL END]")
+
+        return
 
     serial_workload_value = math.ceil(
         _estimate_workload_avg(serial_workload_data, workload_var)
@@ -194,8 +181,6 @@ def explore_comb_workloads(
             experiment_dir=experiment_dir,
             num_runs=num_runs,
             dry_run=dry_run,
-            warmup_num_prompts=warmup_num_prompts,
-            continue_on_error=continue_on_error,
             workload_var=workload_var,
             workload_value=inter_workload_value,
         )
@@ -222,8 +207,6 @@ def explore_combs_workloads(
     experiment_dir: Path,
     num_runs: int,
     dry_run: bool,
-    warmup_num_prompts: int,
-    continue_on_error: bool,
 ):
     if any(bench_comb.has_param(workload_var) for bench_comb in bench_params):
         raise ValueError(
@@ -255,8 +238,6 @@ def explore_combs_workloads(
                     experiment_dir=experiment_dir,
                     num_runs=num_runs,
                     dry_run=dry_run,
-                    warmup_num_prompts=warmup_num_prompts,
-                    continue_on_error=continue_on_error,
                 )
 
                 if comb_data is not None:
@@ -334,8 +315,6 @@ def run_main(args: SweepServeWorkloadArgs):
             experiment_dir=experiment_dir,
             num_runs=args.num_runs,
             dry_run=args.dry_run,
-            warmup_num_prompts=args.warmup_num_prompts,
-            continue_on_error=args.continue_on_error,
         )
 
 

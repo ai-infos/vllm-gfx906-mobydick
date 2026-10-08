@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Conformer encoder components for FireRedASR2.
+"""
+Conformer encoder components for FireRedASR2.
 
 The audio encoder architecture is
 (Conv2dSubsampling → RelPositionalEncoding → N × RelPosEmbConformerBlock).
@@ -297,7 +298,9 @@ class RelPosEmbConformerBlock(nn.Module):
 
 
 class ConformerEncoder(nn.Module):
-    """Conformer encoder used by FireRedASR2."""
+    """
+    Conformer encoder used by FireRedASR2.
+    """
 
     def __init__(
         self,
