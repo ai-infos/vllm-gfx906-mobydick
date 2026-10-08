@@ -9,10 +9,9 @@ import torch.nn.functional as F
 # Import kernels
 import vllm.kernels  # noqa: F401
 from vllm import envs, ir
-from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 
 logger = init_logger(__name__)
 
@@ -65,19 +64,12 @@ class RMSNorm(CustomOp):
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
 
-        # Do not pass identity weight to native implementation (causes issue on TPU).
-        # Other implementations require weight to be passed even if all ones.
-        # Cheat and predict if native will be dispatched to:
-        #  1) if native is first in priority list
-        #  2) if variance_size_override is given (only supported by native impl)
-        # TODO(luka): address weight passing inconsistency:
-        # https://github.com/vllm-project/vllm/issues/39370
-        priority = get_current_vllm_config().kernel_config.ir_op_priority
-        var_override = self.variance_size_override is not None
-        native_rms_norm = priority.rms_norm[0] == "native" or var_override
-        native_add_rms_norm = priority.fused_add_rms_norm[0] == "native" or var_override
-        self.pass_weight = self.has_weight or not native_rms_norm
-        self.pass_weight_add = self.has_weight or not native_add_rms_norm
+        # When has_weight=False, pass weight=None so implementations that
+        # support a weightless path can skip the per-channel multiply.
+        # Implementations that require weight (e.g. oink) fall back via IR
+        # op priority when weight=None is unsupported.
+        self.pass_weight = self.has_weight
+        self.pass_weight_add = self.has_weight
 
     def forward_native(
         self,
@@ -110,9 +102,12 @@ class RMSNorm(CustomOp):
             assert self.variance_size_override is None, (
                 "Batch invariance is not supported for variance_size_override"
             )
+            pass_weight = (
+                self.pass_weight_add if residual is not None else self.pass_weight
+            )
             return rms_norm_batch_invariant(
                 x,
-                self.weight.data,
+                self.weight.data if pass_weight else None,
                 self.variance_epsilon,
                 residual=residual,
             )
@@ -152,6 +147,27 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self._one_plus_w: tuple[tuple, torch.Tensor] | None = None
+
+    def _one_plus_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """(1 + weight) in ``dtype``, cached.
+
+        Inference weights are frozen after loading (vLLM loads weights
+        before the first forward, which is where the cache is created);
+        the entry is keyed on data_ptr/dtype/device/_version so
+        parameter replacement and in-place ops on the parameter itself
+        invalidate it. The first call is always the eager cudagraph
+        warmup (vLLM warms up before any capture), so the cached
+        allocation comes from the normal pool, never a graph pool.
+        """
+        w = self.weight
+        key = (w.data_ptr(), dtype, w.device, w._version)
+        entry = self._one_plus_w
+        if entry is not None and entry[0] == key:
+            return entry[1]
+        one_plus = w.to(dtype) + 1.0
+        self._one_plus_w = (key, one_plus)
+        return one_plus
 
     def forward_native(
         self,
@@ -159,7 +175,7 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        weight = self.weight.float() + 1.0
+        weight = self._one_plus_weight(torch.float32)
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
@@ -169,7 +185,43 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, residual)
+        # The fused vllm_c kernels require weight.dtype == x.dtype, which the
+        # native path's float32 (1 + w) breaks. Gemma's (1 + w) factorization
+        # is a plain scaled RMS norm with w' = 1 + w in the input dtype, so
+        # dispatch with that instead of the fp32 decomposition.
+        weight = self._one_plus_weight(x.dtype)
+        if residual is None:
+            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x, residual, weight, self.variance_epsilon
+        )
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_gemma_rms_norm
+
+        # Fall back to the native path if the fused gemma kernels are not
+        # available in the installed vllm-xpu-kernels package.
+        if not hasattr(torch.ops._C, "gemma_rms_norm"):
+            return self.forward_native(x, residual)
+
+        # Pass the raw (bf16/fp16) weight; the +1 offset and the fp32 multiply
+        # are folded into the kernel (matches forward_native numerics).
+        if residual is not None:
+            torch.ops.vllm.xpu_fused_add_gemma_rms_norm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            return x, residual
+        # empty_like preserves x's strides, but the kernel requires a
+        # contiguous out (unlike x, which it can handle non-contiguous).
+        out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+        torch.ops.vllm.xpu_gemma_rms_norm(
+            out, x, self.weight.data, self.variance_epsilon
+        )
+        return out
 
 
 # --8<-- [start:rms_norm_gated]
@@ -291,7 +343,9 @@ class RMSNormGated(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
+        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+            rmsnorm_fn,
+        )
 
         return rmsnorm_fn(
             x,

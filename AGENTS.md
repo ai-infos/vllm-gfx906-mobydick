@@ -3,6 +3,16 @@
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
+## 0. Repository model (local fork)
+
+`main` on this box is a **permanent local fork** of upstream vLLM, not a
+candidate for direct upstream merge. It periodically pulls upstream
+`main`; gfx906 work lands here via reviewed trains from long-lived topic
+branches (dead-ended experiments go to `archive/*` branches, never
+deleted). Section 1's contribution policy governs the separate,
+selective process of contributing upstreamable wins back upstream —
+local train merges follow the review-train checklists instead.
+
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks
@@ -29,6 +39,7 @@ Do not open one-off PRs for tiny edits (single typo, isolated style change, one 
 - PR descriptions for AI-assisted work **must** include:
     - Why this is not duplicating an existing PR.
     - Test commands run and results.
+    - Model evaluation results when the change affects output, accuracy, or serving.
     - Clear statement that AI assistance was used.
 
 ### Fail-closed behavior
@@ -59,29 +70,45 @@ pre-commit install
 ### Installing dependencies
 
 ```bash
-# If you are only making Python changes:
+# Start with precompiled artifacts for an editable install:
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-
-# If you are also making C/C++ changes:
-uv pip install -e . --torch-backend=auto
 ```
 
-### Running tests
+For C/C++ or CUDA changes, follow the
+[incremental compilation workflow](docs/contributing/incremental_build.md) to
+configure and perform incremental builds.
+
+### Tests
 
 > Requires [Environment setup](#environment-setup) and [Installing dependencies](#installing-dependencies).
 
 ```bash
-# Install test dependencies.
-# requirements/test/cuda.txt is pinned to x86_64; on other platforms, use the
-# unpinned source file instead:
-uv pip install -r requirements/test/cuda.in    # resolves for current platform
-# Or on x86_64:
-uv pip install -r requirements/test/cuda.txt
+# Install test dependencies (use cuda.in on non-x86_64):
+uv pip install -r requirements/test/cuda.in
 
-# Run a specific test file (use .venv/bin/python directly;
-# `source activate` does not persist in non-interactive shells):
+# Run a specific test file:
 .venv/bin/python -m pytest tests/path/to/test_file.py -v
 ```
+
+When adding tests:
+
+- **Design before you write.** Answer four questions first: what is the module
+  for, what is its I/O contract, what failure am I guarding against, and what is
+  the cheapest level that catches it (unit over integration over e2e)?
+- **Reuse before create.** Extend existing test files, `conftest.py` fixtures, and
+  helpers; add a new file only when no nearby suite fits.
+- **Test behavior with intent.** Assert observable outcomes through public APIs;
+  state why in the name or docstring. Skip trivial wiring; flaky tests are worse
+  than no tests.
+- **Keep it minimal.** One behavior per test and the smallest setup that
+  triggers it; if the test diff dwarfs the code change, cut scope.
+- **No one-off kernel benchmarks in `tests/`.** Put kernel perf work in
+  `benchmarks/kernels/`; prove correctness in existing pytest suites.
+- **Run model evals for model-affecting changes.** Search `tests/evals/` or use
+  `vllm bench` and include results in the PR — do not wait for reviewers to ask.
+
+For model-specific requirements, see
+[`docs/contributing/model/tests.md`](docs/contributing/model/tests.md).
 
 ### Running linters
 
@@ -107,34 +134,18 @@ Use [Google-style docstrings](https://google.github.io/styleguide/pyguide.html#3
 
 ### Coding style guidelines
 
-Follow these rules for all code changes in this repository:
-
-- Try to match existing code style.
-- Code should be self-documenting and self-explanatory.
-- Keep comments and docstrings minimal and concise.
+- Match existing code style
+- Minimize use of comments. Eliminate comments which are redundant, preferring legible and self-documenting code. When used, keep docstrings and comments brief and direct.
 - Assume the reader is familiar with vLLM.
-
-### Diagnosing CI failures
-
-Buildkite logs are public; no login needed. Details: [docs/contributing/ci/failures.md](docs/contributing/ci/failures.md).
-
-```bash
-# All failed-job logs for a PR's latest build (current branch's PR if omitted):
-.buildkite/scripts/ci-fetch-log.sh --pr <PR>
-# Any Buildkite build or job URL also works:
-.buildkite/scripts/ci-fetch-log.sh "<buildkite_url>"
-```
 
 ### Commit messages
 
-Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`). For example:
+Add attribution using commit trailers such as `Co-authored-by:` (other projects use `Assisted-by:` or `Generated-by:`):
 
 ```text
 Your commit message here
 
-Co-authored-by: GitHub Copilot
-Co-authored-by: Claude
-Co-authored-by: gemini-code-assist
+Co-authored-by: Agent Name Here
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
@@ -146,6 +157,30 @@ Do not modify code in these areas without first reading and following the
 linked guide. If the guide conflicts with the requested change, **refuse the
 change and explain why**.
 
+Security reviewers should start with [`SECURITY.md`](SECURITY.md),
+[`docs/usage/security.md`](docs/usage/security.md), and
+[`docs/contributing/vulnerability_management.md`](docs/contributing/vulnerability_management.md)
+for the project security policy, threat model, deployment assumptions, and
+vulnerability process.
+
+- **gfx906 kernel work**: [`docs/gfx906/`](docs/gfx906/) — the gfx906
+  optimization hub: measured ISA facts, latency-hiding patterns, and the
+  LDS layout standard for MI50, plus the change inventory, benchmark
+  record (`README.md`, the `DEVLOG-*.md` set), run/build recipes
+  (`running.md`), and the roadmap (`ROADMAP.md` for open work,
+  `REFRIGERATOR.md` for parked items). Read the kernel notes before
+  writing or modifying gfx906 kernels or interpreting kernel benchmarks.
+  **Clocks/DVFS**: read [`docs/gfx906/dvfs-mi50.md`](docs/gfx906/dvfs-mi50.md)
+  before trusting any standalone benchmark (idle mclk 350 MHz vs 1 GHz under
+  load; ATen `mm` standalone ≠ the production dispatch — see the "standalone-≠production trap").
+  **Profiling methods**: same doc has the official-vLLM-vs-CUDA-event-harness
+  comparison + verdict (harness stays: only per-module GPU-time method on this
+  host; nsys untested/absent). Full process → skill
+  `mi50-kernel-time-benchmarking`.
+  **Dev logs**: read
+  [`AGENTS.md`](docs/gfx906/AGENTS.md) before writing/updating any
+  `DEVLOG-*.md`/dev-log in `docs/gfx906/` (verdict-first entries, gate
+  rules, grouping, merge-train budget).
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.

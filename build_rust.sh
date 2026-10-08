@@ -9,8 +9,16 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
+PYTHON="${VIRTUAL_ENV:-$REPO_ROOT/.venv}/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+    echo "Create the project environment with uv venv --python 3.12 first." >&2
+    exit 1
+fi
+
 # Read the required toolchain from rust-toolchain.toml.
-TOOLCHAIN=$(grep '^channel' "$REPO_ROOT/rust-toolchain.toml" | sed 's/.*= *"\(.*\)"/\1/')
+TOOLCHAIN=$("$PYTHON" -c \
+    'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["toolchain"]["channel"])' \
+    "$REPO_ROOT/rust-toolchain.toml")
 
 # Ensure rustup and the required toolchain are available.
 if ! command -v rustup &>/dev/null; then
@@ -30,4 +38,4 @@ else
     PROFILE_ARG="--release"
 fi
 
-python3 "$REPO_ROOT/tools/build_rust.py" "$PROFILE_ARG"
+"$PYTHON" "$REPO_ROOT/tools/build_rust.py" "$PROFILE_ARG"

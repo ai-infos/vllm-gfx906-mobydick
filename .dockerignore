@@ -1,5 +1,11 @@
 /.venv
+/.git
+/.deps
+/.cache
 /build
+/artifacts/vllm-rocm-install/
+/bake-config-build-*.json
+/wheel-export/
 dist
 vllm/*.so
 vllm/vllm-rs

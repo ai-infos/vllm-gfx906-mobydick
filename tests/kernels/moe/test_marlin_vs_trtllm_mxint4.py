@@ -5,8 +5,12 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     fused_marlin_moe,
+)
+from vllm.model_executor.layers.fused_moe.experts.trtllm_mxint4_moe import (
+    TrtLlmMxint4ExpertsMonolithic,
 )
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     grouped_topk,
@@ -77,6 +81,14 @@ __all__ = [
 ]
 
 
+def test_trtllm_mxint4_activation_supports_vllm_gated_silu():
+    assert TrtLlmMxint4ExpertsMonolithic._supports_activation(MoEActivation.SILU)
+    assert TrtLlmMxint4ExpertsMonolithic._supports_activation(MoEActivation.SWIGLUOAI)
+    assert not TrtLlmMxint4ExpertsMonolithic._supports_activation(
+        MoEActivation.RELU2_NO_MUL
+    )
+
+
 def marlin_quantize_moe_weights(
     weights_bf16: torch.Tensor, group_size: int = 32
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -101,9 +113,7 @@ def marlin_quantize_moe_weights(
     for i in range(e):
         # Transpose for Marlin: [n, k] → [k, n]
         w_t = weights_bf16[i].T.contiguous()
-        _, w_q, w_s, _, _, _ = marlin_quantize(
-            w_t, scalar_types.uint4b8, group_size, act_order=False
-        )
+        _, w_q, w_s = marlin_quantize(w_t, scalar_types.uint4b8, group_size)
         weight_list.append(w_q)
         scale_list.append(w_s)
 
@@ -236,16 +246,11 @@ def test_marlin_vs_trtllm_mxint4_moe_kimik2(monkeypatch, m, n, k, e, topk, group
         expert_map=None,
         global_scale1=None,
         global_scale2=None,
-        g_idx1=None,
-        g_idx2=None,
         input_global_scale1=None,
         input_global_scale2=None,
-        sort_indices1=None,
-        sort_indices2=None,
         w1_zeros=None,
         w2_zeros=None,
         input_dtype=dtype,
-        is_k_full=True,
     )
 
     # Sanity check: manually compute BF16 reference for comparison

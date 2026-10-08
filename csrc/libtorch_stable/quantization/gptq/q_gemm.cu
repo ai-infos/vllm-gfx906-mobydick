@@ -55,7 +55,34 @@ __host__ __forceinline__ hipblasStatus_t __compat_hipblasHgemm(
   #define rocblas_hgemm __compat_hipblasHgemm
 #endif
 
+// SYNC-COPY source: also copied (renamed dot22_8_f_m1mi) into
+// q_gemm_m1_maxilp.cu -- keep in lockstep. See that file's header.
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
+  half2 result = {};
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
+  return __half2float(__low2half(result)) + __half2float(__high2half(result));
+}
+
+__forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
+                                           const float g_result,
+                                           const float qs_f) {
+  half2 result = {};
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
+  float result_f =
+      __half2float(__low2half(result)) + __half2float(__high2half(result));
+  return fma(result_f, qs_f, g_result);
+}
+
+__forceinline__ __device__ half dot22_8_h(half2 (&dq)[4], const half* a_ptr,
+                                          const half g_result,
+                                          const half qs_h) {
+  // Use FP32 accumulator to avoid potential overflow since unscaled weights are
+  // in the range -128..127
+
   float result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
   #pragma unroll
@@ -89,8 +116,14 @@ typedef void (*fp_gemm_half_q_half_gptq_kernel)(const half*, const uint32_t*,
                                                 const uint32_t*, const half*,
                                                 half*, const int, const int,
                                                 const int, const int,
-                                                const bool, const int*);
+                                                const bool);
 
+// SYNC-COPY (2/2): the M=1 gfx906 max-ilp variant of this kernel lives
+// in q_gemm_m1_maxilp.cu (gemm_half_q_half_gptq_4bit_kernel_m1mi) and
+// must be kept in lockstep with this one (names aside); the same applies
+// to dot22_8_f above (copied as dot22_8_f_m1mi there). A one-sided edit
+// silently changes M=1 gfx906 numerics/perf. See the SYNCHRONIZATION
+// WARNING in the header of q_gemm_m1_maxilp.cu.
 template <bool first_block, int m_count>
 __launch_bounds__(BLOCK_KN_SIZE)
 __global__ void gemm_half_q_half_gptq_4bit_kernel(
@@ -98,7 +131,7 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,
     const int size_m, const int size_n, const int size_k, const int groups,
-    const bool use_v2_format, const int* __restrict__ b_q_perm) {
+    const bool use_v2_format) {
   MatrixView_half a_(a, size_m, size_k);
   MatrixView_half_rw c_(c, size_m, size_n);
   MatrixView_q4_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
@@ -126,22 +159,12 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
       const half* a_ptr = a_.item_ptr(offset_m + m, 0);
       half* block_a_ptr = block_a[m];
 
-      half a0;
-      if (b_q_perm)
-        a0 = a_ptr[b_q_perm[offset_k + t]];
-      else
-        a0 = a_ptr[offset_k + t];
-      block_a_ptr[t] = a0;
+      block_a_ptr[t] = a_ptr[offset_k + t];
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -237,7 +260,7 @@ __global__ void gemm_half_q_half_gptq_2bit_kernel(
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,
     const int size_m, const int size_n, const int size_k, const int groups,
-    const bool use_v2_format, const int* __restrict__ b_q_perm) {
+    const bool use_v2_format) {
   MatrixView_half a_(a, size_m, size_k);
   MatrixView_half_rw c_(c, size_m, size_n);
   MatrixView_q2_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
@@ -265,22 +288,12 @@ __global__ void gemm_half_q_half_gptq_2bit_kernel(
       const half* a_ptr = a_.item_ptr(offset_m + m, 0);
       half* block_a_ptr = block_a[m];
 
-      half a0;
-      if (b_q_perm)
-        a0 = a_ptr[b_q_perm[offset_k + t]];
-      else
-        a0 = a_ptr[offset_k + t];
-      block_a_ptr[t] = a0;
+      block_a_ptr[t] = a_ptr[offset_k + t];
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -360,7 +373,7 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,
     const int size_m, const int size_n, const int size_k, const int groups,
-    const bool use_v2_format, const int* __restrict__ b_q_perm) {
+    const bool use_v2_format) {
   MatrixView_half a_(a, size_m, size_k);
   MatrixView_half_rw c_(c, size_m, size_n);
   MatrixView_q3_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
@@ -388,22 +401,12 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
       const half* a_ptr = a_.item_ptr(offset_m + m, 0);
       half* block_a_ptr = block_a[m];
 
-      half a0;
-      if (b_q_perm)
-        a0 = a_ptr[b_q_perm[offset_k + t]];
-      else
-        a0 = a_ptr[offset_k + t];
-      block_a_ptr[t] = a0;
+      block_a_ptr[t] = a_ptr[offset_k + t];
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -490,7 +493,7 @@ __global__ void gemm_half_q_half_gptq_8bit_kernel(
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, half* __restrict__ c,
     const int size_m, const int size_n, const int size_k, const int groups,
-    const bool use_v2_format, const int* __restrict__ b_q_perm) {
+    const bool use_v2_format) {
   MatrixView_half a_(a, size_m, size_k);
   MatrixView_half_rw c_(c, size_m, size_n);
   MatrixView_q8_row b_gptq_qzeros_(b_gptq_qzeros, groups, size_n);
@@ -518,22 +521,12 @@ __global__ void gemm_half_q_half_gptq_8bit_kernel(
       const half* a_ptr = a_.item_ptr(offset_m + m, 0);
       half* block_a_ptr = block_a[m];
 
-      half a0;
-      if (b_q_perm)
-        a0 = a_ptr[b_q_perm[offset_k + t]];
-      else
-        a0 = a_ptr[offset_k + t];
-      block_a_ptr[t] = a0;
+      block_a_ptr[t] = a_ptr[offset_k + t];
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -648,12 +641,46 @@ fp_gemm_half_q_half_gptq_kernel pick_gemm_half_q_half_gptq_kernel(
   return NULL;
 }
 
+// Defined in q_gemm_m1_maxilp.cu (the max-ilp M=1 twin of this file's
+// 4-bit kernel; keep the two in sync -- see that file's header).
+void qgemm_m1_maxilp_launch(const half* a, const uint32_t* b_q_weight,
+                            const uint32_t* b_gptq_qzeros,
+                            const half* b_gptq_scales, half* c, int size_m,
+                            int size_n, int size_k, int groups,
+                            bool use_v2_format);
+
 void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
                                 const uint32_t* b_gptq_qzeros,
-                                const half* b_gptq_scales, const int* b_q_perm,
-                                half* c, int size_m, int size_n, int size_k,
-                                int m_count, int groups, bool use_v2_format,
-                                int bit) {
+                                const half* b_gptq_scales, half* c, int size_m,
+                                int size_n, int size_k, int m_count, int groups,
+                                bool use_v2_format, int bit) {
+  // gfx906: M=1 4-bit takes the max-ilp-scheduled kernel
+  // (q_gemm_m1_maxilp.cu -- SYNC-COPY twin of the 4-bit kernel above);
+  // M>=2 shapes regressed under max-ilp and keep the unflagged kernel.
+  // Runtime arch guard (this file and the twin TU are ROCm-only, and the
+  // flag is applied to the twin only for gfx906 builds).
+  // See docs/gfx906/DEVLOG-spec-decode.md.
+  {
+    // Runtime arch guard via the CUDA runtime API (stable-ABI builds
+    // cannot use at::cuda::getCurrentDeviceProperties).
+    static const bool gfx906 = [] {
+      int dev = 0;
+      cudaGetDevice(&dev);
+      cudaDeviceProp prop = {};
+      cudaGetDeviceProperties(&prop, dev);
+      // gcnArchName carries a suffix on this machine
+      // ("gfx906:sramecc+:xnack+"), so match the prefix, not equality.
+      return strncmp(prop.gcnArchName, "gfx906", 6) == 0;
+    }();
+    if (gfx906 && m_count == 1 && bit == 4 &&
+        (getenv("VLLM_GFX906_QGEMM_M1_MAXILP") == nullptr ||
+         strcmp(getenv("VLLM_GFX906_QGEMM_M1_MAXILP"), "0") != 0)) {
+      qgemm_m1_maxilp_launch(a, b_q_weight, b_gptq_qzeros, b_gptq_scales,
+                             c, size_m, size_n, size_k, groups,
+                             use_v2_format);
+      return;
+    }
+  }
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;
@@ -666,13 +693,13 @@ void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
       pick_gemm_half_q_half_gptq_kernel(true, m_count, bit);
 
   const cudaStream_t stream = get_current_cuda_stream();
-  kernel<<<gridDim, blockDim, 0, stream>>>(
-      a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c, size_m, size_n, size_k,
-      groups, use_v2_format, b_q_perm);
+  kernel<<<gridDim, blockDim, 0, stream>>>(a, b_q_weight, b_gptq_qzeros,
+                                           b_gptq_scales, c, size_m, size_n,
+                                           size_k, groups, use_v2_format);
 }
 
 __global__ void reconstruct_exllama_8bit_kernel(
-    const uint32_t* __restrict__ b_q_weight, const int* __restrict__ b_q_perm,
+    const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, const int size_k, const int size_n,
     const int groups, const bool use_v2_format, half* __restrict__ b) {
@@ -688,13 +715,7 @@ __global__ void reconstruct_exllama_8bit_kernel(
 
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
-  // Preload remapping table
-  __shared__ int perm[BLOCK_KN_SIZE];
   auto t = threadIdx.x;
-
-  if (b_q_perm) {
-    if (offset_k + t < size_k) perm[t] = b_q_perm[offset_k + t];
-  }
 
   // Column
   int n = offset_n + t * 4;
@@ -715,8 +736,6 @@ __global__ void reconstruct_exllama_8bit_kernel(
   half2 scales[4];
   b_gptq_qzeros_.item4(zeros, group, n);
   b_gptq_scales_.item4_h2(scales, group, n);
-
-  __syncthreads();
 
   int k = offset_k;
   int lk = 0;
@@ -746,25 +765,13 @@ __global__ void reconstruct_exllama_8bit_kernel(
       dequant_8bit_8(load_int4[0].w, load_int4[1].w, dq[3], size_n,
                      zeros[3] + zero_offset);
 
-      // half* dqh = (half*)dq;
-      if (b_q_perm) {
-        for (int j = 0; j < 4; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(perm[lk++], n, __low2half(dq[0][j]), __low2half(dq[1][j]),
-                  __low2half(dq[2][j]), __low2half(dq[3][j]));
-          b_.set4(perm[lk++], n, __high2half(dq[0][j]), __high2half(dq[1][j]),
-                  __high2half(dq[2][j]), __high2half(dq[3][j]));
-        }
-      } else {
-        for (int j = 0; j < 4; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(offset_k + lk++, n, __low2half(dq[0][j]),
-                  __low2half(dq[1][j]), __low2half(dq[2][j]),
-                  __low2half(dq[3][j]));
-          b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
-                  __high2half(dq[1][j]), __high2half(dq[2][j]),
-                  __high2half(dq[3][j]));
-        }
+      for (int j = 0; j < 4; j++) {
+        for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
+        b_.set4(offset_k + lk++, n, __low2half(dq[0][j]), __low2half(dq[1][j]),
+                __low2half(dq[2][j]), __low2half(dq[3][j]));
+        b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
+                __high2half(dq[1][j]), __high2half(dq[2][j]),
+                __high2half(dq[3][j]));
       }
     }
     k += 32;
@@ -772,7 +779,7 @@ __global__ void reconstruct_exllama_8bit_kernel(
 }
 
 __global__ void reconstruct_exllama_4bit_kernel(
-    const uint32_t* __restrict__ b_q_weight, const int* __restrict__ b_q_perm,
+    const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, const int size_k, const int size_n,
     const int groups, const bool use_v2_format, half* __restrict__ b) {
@@ -788,13 +795,7 @@ __global__ void reconstruct_exllama_4bit_kernel(
 
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
-  // Preload remapping table
-  __shared__ int perm[BLOCK_KN_SIZE];
   auto t = threadIdx.x;
-
-  if (b_q_perm) {
-    if (offset_k + t < size_k) perm[t] = b_q_perm[offset_k + t];
-  }
 
   // Column
   int n = offset_n + t * 4;
@@ -821,8 +822,6 @@ __global__ void reconstruct_exllama_4bit_kernel(
   dequant_4bit_8_prep_zero(zeros[1] + zero_offset, z1z16[1], y1y16[1]);
   dequant_4bit_8_prep_zero(zeros[2] + zero_offset, z1z16[2], y1y16[2]);
   dequant_4bit_8_prep_zero(zeros[3] + zero_offset, z1z16[3], y1y16[3]);
-
-  __syncthreads();
 
   int k = offset_k;
   int lk = 0;
@@ -854,25 +853,13 @@ __global__ void reconstruct_exllama_4bit_kernel(
                           false);
 
       b_ptr += size_n;
-      // half* dqh = (half*)dq;
-      if (b_q_perm) {
-        for (int j = 0; j < 4; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(perm[lk++], n, __low2half(dq[0][j]), __low2half(dq[1][j]),
-                  __low2half(dq[2][j]), __low2half(dq[3][j]));
-          b_.set4(perm[lk++], n, __high2half(dq[0][j]), __high2half(dq[1][j]),
-                  __high2half(dq[2][j]), __high2half(dq[3][j]));
-        }
-      } else {
-        for (int j = 0; j < 4; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(offset_k + lk++, n, __low2half(dq[0][j]),
-                  __low2half(dq[1][j]), __low2half(dq[2][j]),
-                  __low2half(dq[3][j]));
-          b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
-                  __high2half(dq[1][j]), __high2half(dq[2][j]),
-                  __high2half(dq[3][j]));
-        }
+      for (int j = 0; j < 4; j++) {
+        for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
+        b_.set4(offset_k + lk++, n, __low2half(dq[0][j]), __low2half(dq[1][j]),
+                __low2half(dq[2][j]), __low2half(dq[3][j]));
+        b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
+                __high2half(dq[1][j]), __high2half(dq[2][j]),
+                __high2half(dq[3][j]));
       }
     }
     k += 32;
@@ -880,7 +867,7 @@ __global__ void reconstruct_exllama_4bit_kernel(
 }
 
 __global__ void reconstruct_exllama_3bit_kernel(
-    const uint32_t* __restrict__ b_q_weight, const int* __restrict__ b_q_perm,
+    const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, const int size_k, const int size_n,
     const int groups, const bool use_v2_format, half* __restrict__ b) {
@@ -896,13 +883,7 @@ __global__ void reconstruct_exllama_3bit_kernel(
 
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
-  // Preload remapping table
-  __shared__ int perm[BLOCK_KN_SIZE];
   auto t = threadIdx.x;
-
-  if (b_q_perm) {
-    if (offset_k + t < size_k) perm[t] = b_q_perm[offset_k + t];
-  }
 
   // Column
   int n = offset_n + t * 4;
@@ -923,8 +904,6 @@ __global__ void reconstruct_exllama_3bit_kernel(
   half2 scales[4];
   b_gptq_qzeros_.item4(zeros, group, n);
   b_gptq_scales_.item4_h2(scales, group, n);
-
-  __syncthreads();
 
   int k = offset_k;
   int lk = 0;
@@ -956,24 +935,13 @@ __global__ void reconstruct_exllama_3bit_kernel(
       dequant_3bit_32(load_int4[0].w, load_int4[1].w, load_int4[2].w, dq[3],
                       size_n, zeros[3] + zero_offset);
 
-      if (b_q_perm) {
-        for (int j = 0; j < 16; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(perm[lk++], n, __low2half(dq[0][j]), __low2half(dq[1][j]),
-                  __low2half(dq[2][j]), __low2half(dq[3][j]));
-          b_.set4(perm[lk++], n, __high2half(dq[0][j]), __high2half(dq[1][j]),
-                  __high2half(dq[2][j]), __high2half(dq[3][j]));
-        }
-      } else {
-        for (int j = 0; j < 16; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(offset_k + lk++, n, __low2half(dq[0][j]),
-                  __low2half(dq[1][j]), __low2half(dq[2][j]),
-                  __low2half(dq[3][j]));
-          b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
-                  __high2half(dq[1][j]), __high2half(dq[2][j]),
-                  __high2half(dq[3][j]));
-        }
+      for (int j = 0; j < 16; j++) {
+        for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
+        b_.set4(offset_k + lk++, n, __low2half(dq[0][j]), __low2half(dq[1][j]),
+                __low2half(dq[2][j]), __low2half(dq[3][j]));
+        b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
+                __high2half(dq[1][j]), __high2half(dq[2][j]),
+                __high2half(dq[3][j]));
       }
     }
     k += 32;
@@ -981,7 +949,7 @@ __global__ void reconstruct_exllama_3bit_kernel(
 }
 
 __global__ void reconstruct_exllama_2bit_kernel(
-    const uint32_t* __restrict__ b_q_weight, const int* __restrict__ b_q_perm,
+    const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_gptq_qzeros,
     const half* __restrict__ b_gptq_scales, const int size_k, const int size_n,
     const int groups, const bool use_v2_format, half* __restrict__ b) {
@@ -997,13 +965,7 @@ __global__ void reconstruct_exllama_2bit_kernel(
 
   int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
 
-  // Preload remapping table
-  __shared__ int perm[BLOCK_KN_SIZE];
   auto t = threadIdx.x;
-
-  if (b_q_perm) {
-    if (offset_k + t < size_k) perm[t] = b_q_perm[offset_k + t];
-  }
 
   // Column
   int n = offset_n + t * 4;
@@ -1024,8 +986,6 @@ __global__ void reconstruct_exllama_2bit_kernel(
   half2 scales[4];
   b_gptq_qzeros_.item4(zeros, group, n);
   b_gptq_scales_.item4_h2(scales, group, n);
-
-  __syncthreads();
 
   int k = offset_k;
   int lk = 0;
@@ -1049,25 +1009,13 @@ __global__ void reconstruct_exllama_2bit_kernel(
       dequant_2bit_16(load_int4.w, dq[3], size_n, zeros[3] + zero_offset);
 
       b_ptr += size_n;
-      // half* dqh = (half*)dq;
-      if (b_q_perm) {
-        for (int j = 0; j < 8; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(perm[lk++], n, __low2half(dq[0][j]), __low2half(dq[1][j]),
-                  __low2half(dq[2][j]), __low2half(dq[3][j]));
-          b_.set4(perm[lk++], n, __high2half(dq[0][j]), __high2half(dq[1][j]),
-                  __high2half(dq[2][j]), __high2half(dq[3][j]));
-        }
-      } else {
-        for (int j = 0; j < 8; j++) {
-          for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
-          b_.set4(offset_k + lk++, n, __low2half(dq[0][j]),
-                  __low2half(dq[1][j]), __low2half(dq[2][j]),
-                  __low2half(dq[3][j]));
-          b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
-                  __high2half(dq[1][j]), __high2half(dq[2][j]),
-                  __high2half(dq[3][j]));
-        }
+      for (int j = 0; j < 8; j++) {
+        for (int v = 0; v < 4; v++) dq[v][j] = __hmul2(scales[v], dq[v][j]);
+        b_.set4(offset_k + lk++, n, __low2half(dq[0][j]), __low2half(dq[1][j]),
+                __low2half(dq[2][j]), __low2half(dq[3][j]));
+        b_.set4(offset_k + lk++, n, __high2half(dq[0][j]),
+                __high2half(dq[1][j]), __high2half(dq[2][j]),
+                __high2half(dq[3][j]));
       }
     }
     k += 32;
@@ -1076,9 +1024,8 @@ __global__ void reconstruct_exllama_2bit_kernel(
 
 void reconstruct_exllama(const uint32_t* b_q_weight,
                          const uint32_t* b_gptq_qzeros,
-                         const half* b_gptq_scales, const int* b_q_perm,
-                         half* out, int height, int width, int groups,
-                         bool use_v2_format, int bit) {
+                         const half* b_gptq_scales, half* out, int height,
+                         int width, int groups, bool use_v2_format, int bit) {
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;
@@ -1096,15 +1043,15 @@ void reconstruct_exllama(const uint32_t* b_q_weight,
 
   const cudaStream_t stream = get_current_cuda_stream();
   reconstruct_exllama_kernel<<<gridDim, blockDim, 0, stream>>>(
-      b_q_weight, b_q_perm, b_gptq_qzeros, b_gptq_scales, height, width, groups,
+      b_q_weight, b_gptq_qzeros, b_gptq_scales, height, width, groups,
       use_v2_format, out);
 }
 
 __global__ void gemm_half_q_half_alt_4bit_kernel(
     const half2* __restrict__ vec, const uint32_t* __restrict__ mat,
     half* __restrict__ mul, const half* __restrict__ scales,
-    const uint32_t* __restrict__ zeros, const int* __restrict__ g_idx,
-    int batch, int height, int width, bool use_v2_format) {
+    const uint32_t* __restrict__ zeros, int batch, int height, int width,
+    int groups, bool use_v2_format) {
   int zero_width = width / 8;
   int vec_height = height * 4;
   const int blockwidth2 = BLOCK_KN_SIZE / 2;
@@ -1141,6 +1088,7 @@ __global__ void gemm_half_q_half_alt_4bit_kernel(
 
   int i = width * h + w;
   int g_h = h * 8;
+  int group_size = vec_height * 2 / groups;
   int k = 0;
   int z_w = w / 8;
   int z_mod = (w % 8) * 4;
@@ -1152,8 +1100,8 @@ __global__ void gemm_half_q_half_alt_4bit_kernel(
     half2 scales_tmp[4];
     half2 zeros_tmp[4];
     for (int tmp_k = 0; tmp_k < 4; tmp_k++) {
-      int g = g_idx[g_h + (k + tmp_k) * 2];
-      int g2 = g_idx[g_h + (k + tmp_k) * 2 + 1];
+      int g = (g_h + (k + tmp_k) * 2) / group_size;
+      int g2 = (g_h + (k + tmp_k) * 2 + 1) / group_size;
       half scale_f = scales[g * width + w];
       half scale_f2 = scales[g2 * width + w];
       half2 scale = __halves2half2(scale_f, scale_f2);
@@ -1195,8 +1143,8 @@ __global__ void gemm_half_q_half_alt_4bit_kernel(
 __global__ void gemm_half_q_half_alt_8bit_kernel(
     const half2* __restrict__ vec, const uint32_t* __restrict__ mat,
     half* __restrict__ mul, const half* __restrict__ scales,
-    const uint32_t* __restrict__ zeros, const int* __restrict__ g_idx,
-    int batch, int height, int width, bool use_v2_format) {
+    const uint32_t* __restrict__ zeros, int batch, int height, int width,
+    int groups, bool use_v2_format) {
   int zero_width = width / 4;
   int vec_height = height * 2;
   const int blockwidth2 = BLOCK_KN_SIZE / 2;
@@ -1225,6 +1173,7 @@ __global__ void gemm_half_q_half_alt_8bit_kernel(
 
   int i = width * h + w;
   int g_h = h * 4;
+  int group_size = vec_height * 2 / groups;
   int k = 0;
   int z_w = w / 4;
   int z_mod = (w % 4) * 8;
@@ -1236,8 +1185,8 @@ __global__ void gemm_half_q_half_alt_8bit_kernel(
     half2 scales_tmp[2];
     half2 zeros_tmp[2];
     for (int tmp_k = 0; tmp_k < 2; tmp_k++) {
-      int g = g_idx[g_h + (k + tmp_k) * 2];
-      int g2 = g_idx[g_h + (k + tmp_k) * 2 + 1];
+      int g = (g_h + (k + tmp_k) * 2) / group_size;
+      int g2 = (g_h + (k + tmp_k) * 2 + 1) / group_size;
       half scale_f = scales[g * width + w];
       half scale_f2 = scales[g2 * width + w];
       half2 scale = __halves2half2(scale_f, scale_f2);
@@ -1274,8 +1223,8 @@ __global__ void gemm_half_q_half_alt_8bit_kernel(
 
 void gemm_half_q_half_alt(const half* a, const uint32_t* b_q_weight,
                           const uint32_t* b_gptq_qzeros,
-                          const half* b_gptq_scales, const int* b_g_idx,
-                          half* c, int size_m, int size_n, int size_k,
+                          const half* b_gptq_scales, half* c, int size_m,
+                          int size_n, int size_k, int groups,
                           bool use_v2_format, int bit) {
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
@@ -1292,16 +1241,15 @@ void gemm_half_q_half_alt(const half* a, const uint32_t* b_q_weight,
 
   const cudaStream_t stream = get_current_cuda_stream();
   kernel<<<gridDim, blockDim, 0, stream>>>(
-      (const half2*)a, b_q_weight, c, b_gptq_scales, b_gptq_qzeros, b_g_idx,
-      size_m, size_k / 32 * bit, size_n, use_v2_format);
+      (const half2*)a, b_q_weight, c, b_gptq_scales, b_gptq_qzeros, size_m,
+      size_k / 32 * bit, size_n, groups, use_v2_format);
 }
 
 template <class T, int bit>
 __global__ void reconstruct_gptq_kernel(
     const uint32_t* __restrict__ w, const half* __restrict__ w_scales,
-    const uint32_t* __restrict__ w_zeros, const int* __restrict__ g_idx,
-    const int height, const int width, const int group,
-    const bool use_v2_format, half* __restrict__ out) {
+    const uint32_t* __restrict__ w_zeros, const int height, const int width,
+    const int num_groups, const bool use_v2_format, half* __restrict__ out) {
   // Start of block
 
   auto column = BLOCK_KN_SIZE * blockIdx.x + threadIdx.x;
@@ -1311,8 +1259,8 @@ __global__ void reconstruct_gptq_kernel(
   // Views
 
   MatrixView_half_rw out_(out, height, width);
-  MatrixView_half w_scales_(w_scales, group, width);
-  T w_zeros_(w_zeros, group, width);
+  MatrixView_half w_scales_(w_scales, num_groups, width);
+  T w_zeros_(w_zeros, num_groups, width);
 
   // GPTQv2 and GPTQv1 handles zero points differently
   int zero_offset = use_v2_format ? 0 : 1;
@@ -1322,7 +1270,7 @@ __global__ void reconstruct_gptq_kernel(
 
 #pragma unroll
   for (int s = 0; s < 32; s += bit) {
-    int group = g_idx[row + s / bit];
+    int group = (row + s / bit) / (height / num_groups);
     half w_scale = w_scales_.item(group, column);
     uint32_t w_zero = w_zeros_.item(group, column) + zero_offset;
     half w_item =
@@ -1335,9 +1283,8 @@ __global__ void reconstruct_gptq_kernel(
 
 __global__ void reconstruct_gptq_3bit_kernel(
     const uint32_t* __restrict__ w, const half* __restrict__ w_scales,
-    const uint32_t* __restrict__ w_zeros, const int* __restrict__ g_idx,
-    const int height, const int width, const int group,
-    const bool use_v2_format, half* __restrict__ out) {
+    const uint32_t* __restrict__ w_zeros, const int height, const int width,
+    const int num_groups, const bool use_v2_format, half* __restrict__ out) {
   // Start of block
   auto column = BLOCK_KN_SIZE * blockIdx.x + threadIdx.x;
   auto row = blockIdx.y * 32;
@@ -1346,8 +1293,8 @@ __global__ void reconstruct_gptq_3bit_kernel(
   // Views
 
   MatrixView_half_rw out_(out, height, width);
-  MatrixView_half w_scales_(w_scales, group, width);
-  MatrixView_q3_row w_zeros_(w_zeros, group, width);
+  MatrixView_half w_scales_(w_scales, num_groups, width);
+  MatrixView_q3_row w_zeros_(w_zeros, num_groups, width);
 
   // GPTQv2 and GPTQv1 handles zero points differently
   int zero_offset = use_v2_format ? 0 : 1;
@@ -1359,7 +1306,7 @@ __global__ void reconstruct_gptq_3bit_kernel(
 
 #pragma unroll
   for (int i = 0; i < 32; i += 1) {
-    int group = g_idx[row + i];
+    int group = (row + i) / (height / num_groups);
     half w_scale = w_scales_.item(group, column);
     uint32_t w_zero = w_zeros_.item(group, column) + zero_offset;
     int w_item;
@@ -1380,9 +1327,8 @@ __global__ void reconstruct_gptq_3bit_kernel(
 }
 
 void reconstruct_gptq(const uint32_t* b_q_weight, const uint32_t* b_gptq_qzeros,
-                      const half* b_gptq_scales, const int* b_g_idx, half* out,
-                      int height, int width, int groups, bool use_v2_format,
-                      int bit) {
+                      const half* b_gptq_scales, half* out, int height,
+                      int width, int groups, bool use_v2_format, int bit) {
   dim3 blockDim, gridDim;
   blockDim.x = BLOCK_KN_SIZE;
   blockDim.y = 1;
@@ -1401,17 +1347,16 @@ void reconstruct_gptq(const uint32_t* b_q_weight, const uint32_t* b_gptq_qzeros,
 
   const cudaStream_t stream = get_current_cuda_stream();
   kernel<<<gridDim, blockDim, 0, stream>>>(b_q_weight, b_gptq_scales,
-                                           b_gptq_qzeros, b_g_idx, height,
-                                           width, groups, use_v2_format, out);
+                                           b_gptq_qzeros, height, width, groups,
+                                           use_v2_format, out);
 }
 
 void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
                            const uint32_t* b_q_weight,
                            const uint32_t* b_gptq_qzeros,
-                           const half* b_gptq_scales, const int* b_g_idx,
-                           half* c, half* temp_dq, int size_m, int size_n,
-                           int size_k, int groups, bool use_exllama,
-                           bool use_v2_format, int bit) {
+                           const half* b_gptq_scales, half* c, half* temp_dq,
+                           int size_m, int size_n, int size_k, int groups,
+                           bool use_exllama, bool use_v2_format, int bit) {
   bool use_reconstruct;
   if (use_exllama) {
     use_reconstruct = ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
@@ -1424,11 +1369,11 @@ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
   if (use_reconstruct) {
     // Reconstruct FP16 matrix, then cuBLAS
     if (use_exllama) {
-      reconstruct_exllama(b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx,
-                          temp_dq, size_k, size_n, groups, use_v2_format, bit);
+      reconstruct_exllama(b_q_weight, b_gptq_qzeros, b_gptq_scales, temp_dq,
+                          size_k, size_n, groups, use_v2_format, bit);
     } else {
-      reconstruct_gptq(b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx,
-                       temp_dq, size_k, size_n, groups, use_v2_format, bit);
+      reconstruct_gptq(b_q_weight, b_gptq_qzeros, b_gptq_scales, temp_dq,
+                       size_k, size_n, groups, use_v2_format, bit);
     }
 
     const half alpha = __float2half(1.0f);
@@ -1442,20 +1387,20 @@ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
     int last_chunk_size = size_m - last_chunk;
 
     if (max_chunks) {
-      gemm_half_q_half_cuda_part(a, b_q_weight, b_gptq_qzeros, b_gptq_scales,
-                                 b_g_idx, c, last_chunk, size_n, size_k,
-                                 BLOCK_M_SIZE_MAX, groups, use_v2_format, bit);
+      gemm_half_q_half_cuda_part(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c,
+                                 last_chunk, size_n, size_k, BLOCK_M_SIZE_MAX,
+                                 groups, use_v2_format, bit);
     }
 
     if (last_chunk_size) {
       gemm_half_q_half_cuda_part(
           a + last_chunk * size_k, b_q_weight, b_gptq_qzeros, b_gptq_scales,
-          b_g_idx, c + last_chunk * size_n, last_chunk_size, size_n, size_k,
+          c + last_chunk * size_n, last_chunk_size, size_n, size_k,
           last_chunk_size, groups, use_v2_format, bit);
     }
   } else {
-    gemm_half_q_half_alt(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx,
-                         c, size_m, size_n, size_k, use_v2_format, bit);
+    gemm_half_q_half_alt(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c, size_m,
+                         size_n, size_k, groups, use_v2_format, bit);
   }
 }
 
@@ -1511,214 +1456,8 @@ __global__ void shuffle_3bit_kernel(uint32_t* __restrict__ b_q_weight,
   }
 }
 
-__global__ void make_sequential_4bit_kernel(const uint32_t* __restrict__ w,
-                                            uint32_t* __restrict__ w_new,
-                                            const int* __restrict__ q_perm,
-                                            const int w_width) {
-  const uint64_t* w2 = (uint64_t*)w;
-  uint64_t* w_new2 = (uint64_t*)w_new;
-  int w2_stride = w_width >> 1;
-  auto w2_column = THREADS_X * blockIdx.x + threadIdx.x;
-  if (w2_column >= w2_stride) return;
-  auto w_new2_row = blockIdx.y;
-  int q_perm_idx = w_new2_row << 3;
-  uint64_t dst = 0;
-
-#pragma unroll
-  for (int i = 0; i < 8; i++) {
-    int source_row = q_perm[q_perm_idx++];
-
-    int w2_row = source_row >> 3;
-    int w2_subrow = source_row & 0x07;
-    int w2_row_shift = w2_subrow << 2;
-    int wnew2_row_shift = i << 2;
-
-    uint64_t src = w2[w2_row * w2_stride + w2_column];
-    src >>= w2_row_shift;
-    src &= 0x0000000f0000000f;
-    src <<= wnew2_row_shift;
-    dst |= src;
-  }
-  w_new2[w_new2_row * w2_stride + w2_column] = dst;
-}
-
-__global__ void make_sequential_2bit_kernel(const uint32_t* __restrict__ w,
-                                            uint32_t* __restrict__ w_new,
-                                            const int* __restrict__ q_perm,
-                                            const int w_width) {
-  const uint64_t* w2 = (uint64_t*)w;
-  uint64_t* w_new2 = (uint64_t*)w_new;
-  int w2_stride = w_width >> 1;
-  auto w2_column = THREADS_X * blockIdx.x + threadIdx.x;
-  if (w2_column >= w2_stride) return;
-  auto w_new2_row = blockIdx.y;
-  int q_perm_idx = w_new2_row << 4;
-  uint64_t dst = 0;
-
-#pragma unroll
-  for (int i = 0; i < 16; i++) {
-    int source_row = q_perm[q_perm_idx++];
-
-    int w2_row = source_row >> 4;
-    int w2_subrow = source_row & 0x0f;
-    int w2_row_shift = w2_subrow << 1;
-    int wnew2_row_shift = i << 1;
-
-    uint64_t src = w2[w2_row * w2_stride + w2_column];
-    src >>= w2_row_shift;
-    src &= 0x0000000300000003;
-    src <<= wnew2_row_shift;
-    dst |= src;
-  }
-  w_new2[w_new2_row * w2_stride + w2_column] = dst;
-}
-
-__global__ void make_sequential_3bit_kernel(const uint32_t* __restrict__ w,
-                                            uint32_t* __restrict__ w_new,
-                                            const int* __restrict__ q_perm,
-                                            const int w_width) {
-  auto w_column = THREADS_X * blockIdx.x + threadIdx.x;
-  if (w_column >= w_width) return;
-  auto w_new_row = blockIdx.y * 3;
-  auto q_perm_idx = blockIdx.y << 5;
-  uint32_t dst[3] = {0, 0, 0};
-
-#pragma unroll
-  for (int i = 0; i < 32; i++) {
-    int source_row = q_perm[q_perm_idx++];
-    int z_w = (source_row / 32) * 3;
-    int z_mod = source_row % 32;
-    int z_bit;
-
-    if (z_mod != 10) {
-      if (z_mod != 21) {
-        z_bit = z_mod;
-        if (z_bit > 21) {
-          z_bit *= 3;
-          z_bit -= 64;
-          z_w += 2;
-        } else if (z_bit > 10) {
-          z_bit *= 3;
-          z_bit -= 32;
-          z_w += 1;
-        } else {
-          z_bit *= 3;
-        }
-      } else {
-        z_w += 1;
-      }
-    }
-
-    uint64_t src;
-    if (z_mod == 10) {
-      src = (w[z_w * w_width + w_column] >> 30) |
-            ((w[(z_w + 1) * w_width + w_column] << 2) & 0x4);
-    } else if (z_mod == 21) {
-      src = (w[z_w * w_width + w_column] >> 31) |
-            ((w[(z_w + 1) * w_width + w_column] << 1) & 0x6);
-    } else {
-      src = w[z_w * w_width + w_column];
-      src >>= z_bit;
-      src &= 0x07;
-    }
-
-    z_w = 0;
-    if (i != 10) {
-      if (i != 21) {
-        z_bit = i;
-        if (z_bit > 21) {
-          z_bit *= 3;
-          z_bit -= 64;
-          z_w += 2;
-        } else if (z_bit > 10) {
-          z_bit *= 3;
-          z_bit -= 32;
-          z_w += 1;
-        } else {
-          z_bit *= 3;
-        }
-      } else {
-        z_w += 1;
-      }
-    }
-    if (i == 10) {
-      dst[z_w] |= (src & 0x03) << 30;
-      dst[z_w + 1] |= ((src & 0x4) >> 2);
-    } else if (i == 21) {
-      dst[z_w] |= (src & 0x01) << 31;
-      dst[z_w + 1] |= ((src & 0x6) >> 1);
-    } else {
-      dst[z_w] |= (src << z_bit);
-    }
-  }
-  w_new[w_new_row * w_width + w_column] = dst[0];
-  w_new[(w_new_row + 1) * w_width + w_column] = dst[1];
-  w_new[(w_new_row + 2) * w_width + w_column] = dst[2];
-}
-
-__global__ void make_sequential_8bit_kernel(const uint32_t* __restrict__ w,
-                                            uint32_t* __restrict__ w_new,
-                                            const int* __restrict__ q_perm,
-                                            const int w_width) {
-  const uint64_t* w2 = (uint64_t*)w;
-  uint64_t* w_new2 = (uint64_t*)w_new;
-  int w2_stride = w_width >> 1;
-  auto w2_column = THREADS_X * blockIdx.x + threadIdx.x;
-  if (w2_column >= w2_stride) return;
-  auto w_new2_row = blockIdx.y;
-  int q_perm_idx = w_new2_row << 2;
-  uint64_t dst = 0;
-
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-    int source_row = q_perm[q_perm_idx++];
-
-    int w2_row = source_row >> 2;
-    int w2_subrow = source_row & 0x03;
-    int w2_row_shift = w2_subrow << 3;
-    int wnew2_row_shift = i << 3;
-
-    uint64_t src = w2[w2_row * w2_stride + w2_column];
-    src >>= w2_row_shift;
-    src &= 0x000000ff000000ff;
-    src <<= wnew2_row_shift;
-    dst |= src;
-  }
-  w_new2[w_new2_row * w2_stride + w2_column] = dst;
-}
-
-void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height,
-                            int width, int bit) {
-  if (q_perm) {
-    uint32_t* new_qweight = NULL;
-    cudaMalloc(&new_qweight, height / 32 * bit * width * sizeof(uint32_t));
-
-    dim3 blockDim, gridDim;
-    blockDim.x = THREADS_X;
-    blockDim.y = 1;
-    gridDim.x = DIVIDE(width, THREADS_X);
-    gridDim.y = height / 32 * bit;
-
-    auto kernel = make_sequential_4bit_kernel;
-    if (bit == 2) {
-      kernel = make_sequential_2bit_kernel;
-    } else if (bit == 3) {
-      kernel = make_sequential_3bit_kernel;
-      gridDim.y = height / 32;
-    } else if (bit == 8) {
-      kernel = make_sequential_8bit_kernel;
-    }
-    const cudaStream_t stream = get_current_cuda_stream();
-    kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, new_qweight, q_perm,
-                                             width);
-    // Replace qweights
-    cudaMemcpyAsync(q_weight, new_qweight,
-                    height / 32 * bit * width * sizeof(uint32_t),
-                    cudaMemcpyDeviceToDevice);
-    // Cleanup
-    cudaDeviceSynchronize();
-    cudaFree(new_qweight);
-  }
+void shuffle_exllama_weight(uint32_t* q_weight, int height, int width,
+                            int bit) {
   dim3 blockDim, gridDim;
   blockDim.x = THREADS_X;
   blockDim.y = 1;
@@ -1791,13 +1530,21 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
                                 torch::stable::Tensor b_q_weight,
                                 torch::stable::Tensor b_gptq_qzeros,
                                 torch::stable::Tensor b_gptq_scales,
-                                torch::stable::Tensor b_g_idx,
                                 bool use_exllama, bool use_v2_format,
                                 int64_t bit) {
   const torch::stable::accelerator::DeviceGuard device_guard(
       a.get_device_index());
+  const int64_t num_groups = b_gptq_qzeros.size(0);
+  STD_TORCH_CHECK(num_groups > 0, "GPTQ requires at least one scale group");
+  STD_TORCH_CHECK(b_gptq_scales.size(0) == num_groups,
+                  "GPTQ scales and zero-points must have the same number of "
+                  "groups");
+  STD_TORCH_CHECK(a.size(1) % num_groups == 0, "Input size K = ", a.size(1),
+                  " is not divisible by the number of groups = ", num_groups);
+  // Split-K CTAs have no global barrier: initialize before any atomic add.
   auto c = torch::stable::empty({a.size(0), b_q_weight.size(1)},
                                 a.scalar_type(), std::nullopt, a.device());
+  torch::stable::zero_(c);
   auto temp_dq =
       torch::stable::empty({b_q_weight.size(0) * 32 / bit, b_q_weight.size(1)},
                            a.scalar_type(), std::nullopt, a.device());
@@ -1806,31 +1553,21 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
       get_current_cuda_blas_handle(), (const half*)a.data_ptr(),
       (const uint32_t*)b_q_weight.data_ptr(),
       (const uint32_t*)b_gptq_qzeros.data_ptr(),
-      (const half*)b_gptq_scales.data_ptr(),
-      b_g_idx.device().type() == torch::stable::DeviceType::Meta ||
-              b_g_idx.numel() == 0
-          ? NULL
-          : (const int*)b_g_idx.data_ptr(),
-      (half*)c.data_ptr(), (half*)temp_dq.data_ptr(),
-      c.size(0),              // m
-      c.size(1),              // n
-      a.size(1),              // k
-      b_gptq_qzeros.size(0),  // group number
-      use_exllama, use_v2_format, bit);
+      (const half*)b_gptq_scales.data_ptr(), (half*)c.data_ptr(),
+      (half*)temp_dq.data_ptr(),
+      c.size(0),  // m
+      c.size(1),  // n
+      a.size(1),  // k
+      num_groups, use_exllama, use_v2_format, bit);
   return c;
 }
 
-void gptq_shuffle(torch::stable::Tensor q_weight,
-                  torch::stable::Tensor q_perm, int64_t bit) {
+void gptq_shuffle(torch::stable::Tensor q_weight, int64_t bit) {
   const torch::stable::accelerator::DeviceGuard device_guard(
       q_weight.get_device_index());
-  vllm::gptq::shuffle_exllama_weight(
-      (uint32_t*)q_weight.data_ptr(),
-      q_perm.device().type() == torch::stable::DeviceType::Meta ||
-              q_perm.numel() == 0
-          ? NULL
-          : (int*)q_perm.data_ptr(),
-      q_weight.size(0) * 32 / bit, q_weight.size(1), bit);
+  vllm::gptq::shuffle_exllama_weight((uint32_t*)q_weight.data_ptr(),
+                                     q_weight.size(0) * 32 / bit,
+                                     q_weight.size(1), bit);
 }
 
 void gptq_shuffle_awq_qweight(torch::stable::Tensor q_weight, int64_t bit) {

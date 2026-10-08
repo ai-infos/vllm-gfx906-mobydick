@@ -1,0 +1,47 @@
+name: ⬆️ Upstream contribution
+description: Work to contribute back to vllm-project/vllm, ROCm or ROCR. Human owner required.
+title: "[Upstream]: "
+labels: ["roadmap", "kind: upstream", "upstream"]
+body:
+  - type: input
+    id: roadmap_id
+    attributes:
+      label: Roadmap ID
+      placeholder: e.g. UP-1, U4, ROCR-1
+  - type: input
+    id: target
+    attributes:
+      label: Target repository / issue
+      placeholder: vllm-project/vllm#NNNNN
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: The change
+      description: File(s) and the one-line description of the fix/feature.
+    validations:
+      required: true
+  - type: textarea
+    id: duplicate
+    attributes:
+      label: Duplicate-work check
+      description: >
+        Output of `gh issue view <n> --comments` and `gh pr list --search ...`, plus why this
+        is not a duplicate. AGENTS.md §1 requires this before any PR.
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Tests / model evals run
+      description: Commands and results. Output-affecting changes need model eval results.
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: Accountable human
+      description: A human must own and defend every upstream PR (no pure code-agent PRs).
+    validations:
+      required: true

@@ -2,20 +2,45 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 import torch.nn as nn
 
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config.model import LogprobsMode
+from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
-    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+    from vllm.v1.sample.ops.topk_topp_triton import (
+        _topk_topp,
+        _topp_split_mask,
+        _topp_split_stats,
+        _topp_split_step,
+        apply_top_k_top_p_triton,
+    )
 
 logger = init_logger(__name__)
+
+
+def register_top_k_top_p_warmups() -> None:
+    """Register every native accelerator sampling kernel used at runtime."""
+    if HAS_TRITON and not current_platform.is_cpu():
+        _topk_topp.register_warmup()
+        if current_platform.is_cuda_alike():
+            _topp_split_stats.register_warmup()
+            _topp_split_step.register_warmup()
+            _topp_split_mask.register_warmup()
+
+
+def _skip_aiter_sampler_on_gfx1250() -> bool:
+    # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
+    from vllm.platforms.rocm import on_gfx1250
+
+    return on_gfx1250()
 
 
 def flashinfer_sampler_supported() -> bool:
@@ -87,7 +112,7 @@ class TopKTopPSampler(nn.Module):
             # FlashInfer doesn't expose post-top-k/top-p logits/logprobs,
             # so it can't be used when the configured mode requires them.
             can_use_flashinfer = (
-                logprobs_mode not in ("processed_logits", "processed_logprobs")
+                logprobs_mode not in PROCESSED_LOGPROBS_MODES
                 and flashinfer_sampler_supported()
             )
             self.forward = (
@@ -108,8 +133,9 @@ class TopKTopPSampler(nn.Module):
             else:
                 self.forward = self.forward_native
         elif (
-            logprobs_mode not in ("processed_logits", "processed_logprobs")
+            logprobs_mode not in PROCESSED_LOGPROBS_MODES
             and rocm_aiter_ops.is_enabled()
+            and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
@@ -119,6 +145,9 @@ class TopKTopPSampler(nn.Module):
             self.forward = self.forward_hip
         else:
             self.forward = self.forward_native
+
+        # Every accelerator backend can fall back to native sampling at runtime.
+        register_top_k_top_p_warmups()
 
     def forward_native(
         self,
@@ -165,7 +194,7 @@ class TopKTopPSampler(nn.Module):
             return self.forward_native(logits, generators, k, p)
         if self.use_fp64_gumbel:
             return self.forward_native(logits, generators, k, p)
-        assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
+        assert self.logprobs_mode not in PROCESSED_LOGPROBS_MODES, (
             "FlashInfer does not support returning logits/logprobs"
         )
         # flashinfer sampling functions expect contiguous logits.
@@ -192,7 +221,7 @@ class TopKTopPSampler(nn.Module):
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
-        if len(generators) != logits.shape[0] and not self.use_fp64_gumbel:
+        if not generators and not self.use_fp64_gumbel:
             return compiled_random_sample(logits), logits_to_return
 
         probs = logits.softmax(dim=-1, dtype=torch.float32)
@@ -236,10 +265,9 @@ class TopKTopPSampler(nn.Module):
             return self.forward_native(logits, generators, k, p)
         if self.use_fp64_gumbel:
             return self.forward_native(logits, generators, k, p)
-        assert self.logprobs_mode not in (
-            "processed_logits",
-            "processed_logprobs",
-        ), "aiter sampler does not support returning logits/logprobs."
+        assert self.logprobs_mode not in PROCESSED_LOGPROBS_MODES, (
+            "aiter sampler does not support returning logits/logprobs."
+        )
         if self.aiter_ops is None and not self._init_aiter_ops():
             return self.forward_native(logits, generators, k, p)
         return self.aiter_sample(logits, k, p, generators), None
@@ -300,10 +328,7 @@ class TopKTopPSampler(nn.Module):
             logits.shape[0], dtype=torch.int64, device=logits.device
         )
         logits_to_return = None
-        if (
-            self.logprobs_mode == "processed_logits"
-            or self.logprobs_mode == "processed_logprobs"
-        ):
+        if self.logprobs_mode in PROCESSED_LOGPROBS_MODES:
             logits_to_return = torch.empty_like(logits)
 
         assert len(generators) != logits.shape[0], (
@@ -334,7 +359,7 @@ class TopKTopPSampler(nn.Module):
 
 # Note: this is a workaround for
 # https://github.com/pytorch/pytorch/pull/151218
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     q = torch.empty_like(probs)
@@ -348,16 +373,117 @@ def apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
-    if current_platform.is_cpu():
-        if HAS_TRITON:
-            return apply_top_k_top_p_triton(logits, k, p)
-        return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
-
-    if HAS_TRITON and logits.shape[0] >= 8:
+    if HAS_TRITON:
         return apply_top_k_top_p_triton(logits, k, p)
 
+    # SYV-4 (gfx906): small-batch top-k/top-p without the full-vocab sort.
+    # Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
+    # fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
+    # SYV-4); implementation is ours for the gfx906 ROCm path. The pytorch
+    # path below sorts all ~248k logits per row (~0.35 ms at B=1); when every
+    # row's k is small and host-known, torch.topk(k) + a threshold mask is
+    # O(V log k) and bit-equivalent modulo fp rounding.
+    if (
+        _sort_free_small_k_enabled()
+        and _can_use_sort_free_small_k(logits, k)
+    ):
+        return apply_top_k_top_p_sort_free(logits, k, p)
+
     # Use pytorch sort implementation for small batch sizes.
-    return apply_top_k_top_p_pytorch(logits, k, p)
+    is_cpu = current_platform.is_cpu()
+    return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=is_cpu)
+
+
+def _sort_free_small_k_enabled() -> bool:
+    """Opt-out for the SYV-4 sort-free small-k path (default ON)."""
+    return os.environ.get("VLLM_GFX906_SORT_FREE_SMALL_K", "1") == "1"
+
+
+def _can_use_sort_free_small_k(
+    logits: torch.Tensor, k: torch.Tensor | None
+) -> bool:
+    """Preconditions for the sort-free path.
+
+    ``k`` is the per-row top-k from the input batch (GPU int32); rows whose
+    request does not use top-k are padded with ``vocab_size`` by
+    ``gpu_input_batch``. Such full-vocab rows cannot be handled here (top-p
+    over the whole vocabulary needs the sort), so any of them forces the
+    fallback. The max-k check is one small device reduction + sync — same
+    class of sync the reference path already performs.
+    """
+    if k is None or not k.is_cuda:
+        return False
+    if logits.shape[0] >= 8:
+        return False
+    # One device reduction + sync (the reference path performs the same class
+    # of sync). gpu_input_batch only ever stores values in [1, vocab_size],
+    # so max(k) >= vocab_size iff some row is a disabled/padded full-vocab row.
+    kmax = int(k.max())
+    return kmax < logits.shape[1] and kmax <= 64
+
+
+def apply_top_k_top_p_sort_free(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """SYV-4: top-k/top-p without sorting the full vocabulary.
+
+    Technique ported from syv-ai/qwen38-27b-rtx3090 (docs/optimizations.md,
+    fetched 2026-09-02; see docs/gfx906/RECON-syv-qwen38-27b-rtx3090.md
+    SYV-4); implementation is ours for the gfx906 ROCm path.
+
+    Equivalent to ``apply_top_k_top_p_pytorch`` for batches where every row's
+    k is small (<= 64). The reference path sorts all ~248k logits per row
+    (~0.35 ms at B=1) and scatters back; here one ``torch.topk(k)`` gives the
+    descending candidates, from which both thresholds are derived:
+
+    - top-k: mask everything below the per-row k-th largest value (the
+      reference's ascending-sort gather picks the same value up to tie order,
+      and tied values are numerically equal);
+    - top-p: cumulative softmax mass over the row's own top-k candidates in
+      descending order; mask below the crossing value. This mirrors the
+      reference exactly — it masks the sub-k-threshold entries first (they
+      contribute 0 to the softmax), so its cumsum also runs over the top-k
+      survivors only.
+
+    Masked entries contribute exp(-inf) = 0 to the final softmax denominator,
+    so renormalized probabilities match the reference up to fp rounding.
+    At least one entry always survives (the crossing value itself is kept).
+
+    The logits tensor is updated in-place.
+    """
+    assert k is not None
+    kk = int(k.max())  # <= 64 by precondition; all rows partial here
+    vals, _ = logits.topk(kk, dim=1)  # [B, kk], descending per row
+
+    # Per-row top-k threshold: the k-th largest value.
+    k_thresh = vals.gather(1, (k - 1).unsqueeze(1)).squeeze(1)  # [B]
+    logits.masked_fill_(logits < k_thresh.unsqueeze(1), -float("inf"))
+
+    if p is not None:
+        # Per-row top-p over each row's own top-k candidates only. The reference
+        # softmaxes the full vocab with non-candidates masked to -inf, so its
+        # per-candidate probabilities equal this restricted softmax exactly.
+        cand = vals.masked_fill_(
+            torch.arange(kk, device=vals.device).unsqueeze(0) >= k.unsqueeze(1),
+            -float("inf"),
+        )
+        probs_desc = cand.softmax(dim=-1)          # [B, kk], descending order
+        cum = torch.cumsum(probs_desc, dim=-1)     # cum[j] = mass of top-(j+1)
+        # keep_count = smallest n with cum[n-1] >= p  ==  (# of j with cum[j] < p) + 1.
+        # `below` is monotone [1..1 0..0] (cum is non-decreasing), so its sum is
+        # exactly that count — no argmax/bool op needed (ROCm has no bool kernels).
+        below = (cum < p.unsqueeze(1)).to(torch.int32)
+        # keep_count = smallest n with cum[n-1] >= p, clamped to this row's own
+        # k: (a) at p=1.0 the final cum entry can round just under 1.0, pushing
+        # the count to kk+1; (b) when a row's top-k mass cannot reach its target
+        # p (e.g. top_k=3 with p=0.95), the reference keeps exactly that row's
+        # k candidates — without the per-row clamp the gather would land on a
+        # -inf slot and top-p would silently no-op for the row.
+        keep_count = torch.clamp(torch.minimum(below.sum(dim=1) + 1, k), min=1)
+        p_thresh = vals.gather(1, (keep_count - 1).unsqueeze(1)).squeeze(1)
+        logits.masked_fill_(logits < p_thresh.unsqueeze(1), -float("inf"))
+
+    return logits
 
 
 def apply_top_k_top_p_pytorch(
@@ -509,7 +635,4 @@ def flashinfer_sample(
 
 
 def _to_tensor_scalar_tuple(x):
-    if isinstance(x, torch.Tensor):
-        return (x, 0)
-    else:
-        return (None, x)
+    return (x, 0) if isinstance(x, torch.Tensor) else (None, x)

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
+import os
 from functools import partial
 
 import torch
@@ -71,6 +73,47 @@ def fused_grouped_topk(
     return topk_values, topk_indices
 
 
+def _grouped_topk_single_group(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str,
+    routed_scaling_factor: float,
+    e_score_correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NH-5: the single-group degenerate case (n_group == 1, topk_group == 1).
+
+    The generic grouped_topk chain's two group topk calls and the group
+    mask are provable no-ops when there is one group (group_idx is always
+    0, group_mask is all ones, the masked_fill is the identity), so it
+    degenerates to a single topk over the biased scores. Biased scores
+    select, pre-bias scores weight, and the renormalize/scale/cast tail
+    is byte-identical to the generic chain, so the outputs are
+    bit-equal to it. See docs/gfx906/DEVLOG-nemotron-h.md (NH-5).
+    """
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+    if e_score_correction_bias is not None:
+        biased = scores + e_score_correction_bias.unsqueeze(0)
+        topk_ids = torch.topk(
+            biased, k=topk, dim=-1, sorted=envs.VLLM_BATCH_INVARIANT
+        )[1]
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(
+            scores, k=topk, dim=-1, sorted=envs.VLLM_BATCH_INVARIANT
+        )
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
 # This is used by the Deepseek-V2 and Deepseek-V3 model
 @torch.compile(
     dynamic=True,
@@ -90,7 +133,7 @@ def grouped_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
-        and current_platform.is_cuda()
+        and (current_platform.is_cuda() or current_platform.is_xpu())
         and num_expert_group <= 32
         and topk <= 32
         and e_score_correction_bias is not None
@@ -105,6 +148,28 @@ def grouped_topk(
             topk_group=topk_group,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
+        )
+
+    # NH-5 (docs/gfx906/DEVLOG-nemotron-h.md): the single-group
+    # degenerate case (n_group == 1, topk_group == 1, e.g. Nemotron-H)
+    # reduces to one topk over the biased scores; the generic chain's
+    # two group topk calls and the group mask are provable no-ops there.
+    # Node removal only — the C1 rule (removal transfers to serving,
+    # replacing the production topk kernel does not, see
+    # DEVLOG-moe-c1-routing-fusion.md). Opt out with
+    # VLLM_GFX906_TOPK_SINGLE_GROUP=0.
+    if (
+        num_expert_group == 1
+        and topk_group == 1
+        and os.environ.get("VLLM_GFX906_TOPK_SINGLE_GROUP", "1") == "1"
+    ):
+        return _grouped_topk_single_group(
+            gating_output,
+            topk,
+            renormalize,
+            scoring_func,
+            routed_scaling_factor,
+            e_score_correction_bias,
         )
 
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"

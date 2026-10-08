@@ -7,8 +7,28 @@
 # torchvision==0.26.0
 # torchaudio==2.11.0
 # triton==3.6.0
+
+# 0.29.0 (2026-09-15): gfx906 uses *stock* upstream Triton 3.8.0 — upstream
+# carries gfx906 natively since aa53dba7455 (ISAFamily::GCN5_1), so the fork
+# (ai-infos/triton-gfx906, v3.6.0 + a 7-line gfx906 patch) is no longer needed and
+# is kept only as a rollback. Build from the upstream v3.8.0 tag with the recipe in
+# README.md ("TRITON 3.8.0"), or try AMD's ROCm-index wheel (3.7.1+git0263a6a6,
+# the line below) which carries the AMD backend + gfx906; the PyPI 3.8.0 wheel
+# segfaults on import here. Gates: docs/gfx906/RECON-triton-1.md.
+#
+# 0.29.0 merge note: upstream now pins the AMD multi-arch wheel index and
+# torch 2.12.0+rocm7.14.0 here. This fork builds against the gfx906-native
+# TheRock/ROCm 7.14 torch (2.13.0+gfx906.2026xxxx, installed manually — see
+# docs/gfx906/running.md), so upstream's lines are kept commented for the
+# next build decision rather than silently downgrading our stack:
+#
+# --extra-index-url https://repo.amd.com/rocm/whl-multi-arch/
+# torch==2.12.0+rocm7.14.0
+# torchvision==0.27.0+rocm7.14.0
+# torchaudio==2.11.0+rocm7.14.0
+# triton==3.7.1+git0263a6a6
 cmake>=3.26.1,<4
-packaging>=24.2
+packaging>=26.2
 setuptools>=77.0.3,<80.0.0
 setuptools-scm>=8
 setuptools-rust>=1.9.0

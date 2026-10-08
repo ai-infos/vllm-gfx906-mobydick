@@ -1,8 +1,10 @@
-mod encoding;
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use vllm_text::Prompt;
 
-use super::{ChatRenderer, RenderedPrompt};
+use super::deepseek::{self, DsDialect};
+use super::{ChatRenderer, RenderedPrompt, request_template_kwargs};
 use crate::Result;
 use crate::request::ChatRequest;
 
@@ -21,7 +23,9 @@ impl ChatRenderer for DeepSeekV4ChatRenderer {
         request.validate()?;
 
         Ok(RenderedPrompt {
-            prompt: Prompt::Text(encoding::render_request(request)?),
+            prompt: Prompt::Text(deepseek::render_request(request, DsDialect::V4)?),
+            media_order: None,
+            effective_template_kwargs: request_template_kwargs(request),
         })
     }
 }

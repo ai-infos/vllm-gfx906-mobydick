@@ -10,13 +10,14 @@ import torch.nn as nn
 from transformers import BatchFeature, LlavaNextVideoConfig, LlavaNextVideoProcessor
 
 from vllm.config import VllmConfig
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.models.clip import CLIPVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
+    MultiModalKwargsItem,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import (
@@ -36,8 +37,14 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from .llava import init_vision_tower_for_llava
+from .module_mapping import MultiModelKeys
 from .siglip import SiglipVisionModel
 from .utils import (
     AutoWeightsLoader,
@@ -175,6 +182,7 @@ class LlavaNextVideoDummyInputsBuilder(
         )
 
         video_overrides = mm_options.get("video")
+        assert video_overrides is None or isinstance(video_overrides, VideoDummyOptions)
 
         return {
             "video": self._get_dummy_videos(
@@ -214,6 +222,7 @@ class LlavaNextVideoMultiModalProcessor(
             if isinstance(videos, VideoEmbeddingItems):
                 num_video_tokens = videos.get_feature_size(item_idx)
             else:
+                assert isinstance(videos, VideoProcessorItems)
                 image_size = videos.get_frame_size(item_idx)
                 num_video_tokens = self.info.get_num_video_tokens(
                     image_width=image_size.width,
@@ -298,7 +307,14 @@ class LlavaNextMultiModalProjector(nn.Module):
     info=LlavaNextVideoProcessingInfo,
     dummy_inputs=LlavaNextVideoDummyInputsBuilder,
 )
-class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class LlavaNextVideoForConditionalGeneration(
+    nn.Module, SupportsLoRA, SupportsMultiModal, SupportsPP
+):
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # mapping for new names in checkpoint saved after transformers v4.52
@@ -309,6 +325,8 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             "lm_head.": "language_model.lm_head.",
         }
     )
+
+    supports_tower_connector_lora = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -326,6 +344,12 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         self.config = config
         self.multimodal_config = multimodal_config
+
+        vision_encoder_info = get_vision_encoder_info(config)
+        self.patch_grid_length = vision_encoder_info.get_patch_grid_length()
+        self.pooled_grid_length = math.ceil(
+            self.patch_grid_length / config.spatial_pool_stride
+        )
 
         with self._mark_tower_model(vllm_config, "video"):
             # Initialize the vision tower only up to the required feature layer
@@ -460,3 +484,41 @@ class LlavaNextVideoForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             ignore_unexpected_prefixes=["image_newline"],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """
+        Get the module prefix in multimodal models
+        """
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector="multi_modal_projector",
+            tower_model="vision_tower",
+        )
+
+    def get_mm_lora_token_counts(
+        self,
+        *,
+        modality: str,
+        mm_kwargs: MultiModalKwargsItem | None,
+        num_mm_embeds: int,
+    ) -> tuple[int, int | None]:
+        del modality, mm_kwargs
+
+        # Invert the spatial pooling done by `vision_resampler`: each frame
+        # contributes `pooled_grid_length ** 2` tokens after the language
+        # model's placeholder count, but `patch_grid_length ** 2` tokens
+        # when it leaves the vision encoder.
+        pooled_tokens_per_frame = self.pooled_grid_length**2
+        patch_tokens_per_frame = self.patch_grid_length**2
+        if (
+            num_mm_embeds <= 0
+            or pooled_tokens_per_frame <= 0
+            or patch_tokens_per_frame <= 0
+        ):
+            return 0, 0
+
+        num_frames = num_mm_embeds // pooled_tokens_per_frame
+        return (
+            num_frames * patch_tokens_per_frame,
+            num_frames * pooled_tokens_per_frame,
+        )

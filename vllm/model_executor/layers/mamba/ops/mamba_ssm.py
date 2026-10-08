@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 if current_platform.is_xpu():
@@ -53,7 +54,7 @@ def get_ssm_config_file_name(
 
 
 def get_ssm_device_name() -> str:
-    return current_platform.get_device_name().replace(" ", "_")
+    return get_device_name_as_file_name()
 
 
 def _canonical_cache_dtype(cache_dtype: str) -> str:
@@ -332,7 +333,15 @@ def _selective_scan_update_kernel(
     if HAS_STATE_BATCH_INDICES:
         if IS_SPEC_DECODING:
             num_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64)
+            # Preserve the existing zero-count clamp while bounding the
+            # accepted-token-derived state lookup to this request's row.
+            # The bound is the ROW stride (elements per batch row), matching
+            # fused_recurrent.py's i_t < stride_indices_seq: for a contiguous
+            # [batch, T] tensor stride(0) == T. stride(1) would be 1 there,
+            # which rejects every accepted count > 1 (and a padded row keeps
+            # any overshoot inside this request's allocated slack).
             init_token_idx = tl.maximum(num_accepted - 1, 0)
+            valid_initial_token = init_token_idx < stride_state_indices_batch
         else:
             init_token_idx = 0
 
@@ -346,9 +355,21 @@ def _selective_scan_update_kernel(
                 dst_state_batch_idx * stride_state_batch + pid_h * stride_state_head
             )
 
-        state_batch_indices_ptr += (
-            pid_b * stride_state_indices_batch + init_token_idx * stride_state_indices_T
-        )
+        state_batch_indices_ptr += pid_b * stride_state_indices_batch
+        if IS_SPEC_DECODING and not valid_initial_token:
+            # Bounds port of upstream PR #50021 (SYV-10, vendored FLA
+            # file): invalid initial token -> zero-fill the output rows
+            # instead of reading state through a garbage block id.
+            # Gated: tests/kernels/mamba/test_spec_decode_bounds.py.
+            offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            zero = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
+            out_ptr += bos * stride_out_batch + pid_h * stride_out_head
+            for _ in range(seq_len):
+                tl.store(out_ptr + offs_m * stride_out_dim, zero, mask=offs_m < dim)
+                out_ptr += stride_out_batch
+            return
+
+        state_batch_indices_ptr += init_token_idx * stride_state_indices_T
         state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     else:
@@ -844,3 +865,13 @@ def selective_scan_fn(
         return delta  # output written inplace to delta
     else:
         return z  # output written inplace to z
+
+
+from vllm.platforms import current_platform  # noqa: E402
+
+if current_platform.is_cpu():
+    from vllm.model_executor.layers.mamba.ops.cpu.mamba_ssm import (
+        selective_state_update as selective_state_update_cpu,
+    )
+
+    selective_state_update = selective_state_update_cpu  # type: ignore

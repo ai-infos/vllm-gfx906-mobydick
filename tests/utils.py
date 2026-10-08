@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, MutableMapping, Sequence
 from contextlib import ExitStack, contextmanager
 from multiprocessing import Process, get_context
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from unittest.mock import patch
 
 import anthropic
@@ -33,7 +33,6 @@ import pytest
 import requests
 import torch
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import HF_HUB_OFFLINE
 from openai.types.completion import Completion
 from typing_extensions import ParamSpec
@@ -47,22 +46,23 @@ from vllm.distributed import (
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import ServeSubcommand
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.linear import (
-    _KernelT,
-    init_fp8_linear_kernel,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.platforms import current_platform
 from vllm.tokenizers import get_tokenizer
+from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.mem_constants import GB_bytes
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.torch_utils import (
     set_random_seed,  # noqa: F401 - re-exported for use in test files
 )
+from vllm.v1.engine.utils import get_engine_process_shutdown_timeout
+
+if TYPE_CHECKING:
+    from vllm.model_executor.kernels.linear import _KernelT
 
 logger = init_logger(__name__)
 
@@ -77,7 +77,7 @@ def prewarm_hf_cache(assets: list[tuple[str, str]]) -> None:
         return
     for repo_id, filename in assets:
         try:
-            hf_hub_download(repo_id=repo_id, filename=filename)
+            hf_api().hf_hub_download(repo_id=repo_id, filename=filename)
         except Exception as e:
             logger.warning(
                 "Failed to prefetch %s/%s: %r. Tests depending on this asset may fail.",
@@ -108,6 +108,7 @@ if current_platform.is_rocm():
 elif current_platform.is_cuda():
     from vllm.third_party.pynvml import (
         nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetHandleByUUID,
         nvmlDeviceGetMemoryInfo,
         nvmlInit,
         nvmlShutdown,
@@ -130,12 +131,6 @@ else:
 VLLM_PATH = Path(__file__).parent.parent
 """Path to root of the vLLM repository."""
 
-# ROCm: disable skinny GEMM to avoid non-deterministic results from
-# atomic reductions in wvSplitKrc kernel.
-# See: https://github.com/vllm-project/vllm/pull/33493#issuecomment-3906083975
-ROCM_ENV_OVERRIDES = (
-    {"VLLM_ROCM_USE_SKINNY_GEMM": "0"} if current_platform.is_rocm() else {}
-)
 # ROCm: disable prefix caching and eliminate batch variance to reduce
 # test flakiness.
 ROCM_EXTRA_ARGS = (
@@ -152,6 +147,28 @@ ROCM_ENGINE_KWARGS: dict = (
 _TILELANG_TVM_PYTHONPATH_FRAGMENT = os.path.join(
     "tilelang", "3rdparty", "tvm", "python"
 )
+_SENSITIVE_CLI_ARG_NARGS = {"--api-key": "+", "--hf-token": "?"}
+
+
+def _redact_sensitive_cli_args(args: Sequence[str]) -> list[str]:
+    redacted_args = list(args)
+    index = 0
+    while index < len(args):
+        name, separator, _ = args[index].partition("=")
+        nargs = _SENSITIVE_CLI_ARG_NARGS.get(name.replace("_", "-"))
+        if nargs is None:
+            index += 1
+            continue
+        if separator:
+            redacted_args[index] = f"{name}=***"
+        index += 1
+        if not separator or nargs == "+":
+            while index < len(args) and not args[index].startswith("-"):
+                redacted_args[index] = "***"
+                index += 1
+                if nargs == "?":
+                    break
+    return redacted_args
 
 
 def _sanitize_pythonpath_value(pythonpath: str | None) -> str:
@@ -242,6 +259,9 @@ class RemoteVLLMServer:
             model_loader = get_model_loader(load_config)
             model_loader.download_model(model_config)
 
+    def _get_process_termination_timeout(self) -> float:
+        return 15.0
+
     def __init__(
         self,
         model: str,
@@ -292,6 +312,7 @@ class RemoteVLLMServer:
         self.show_hidden_metrics = (
             getattr(args, "show_hidden_metrics_for_version", None) is not None
         )
+        self._request_shutdown_timeout = float(args.shutdown_timeout)
 
         with _temporarily_sanitized_pythonpath_env():
             self._pre_download_model(model, args)
@@ -421,7 +442,7 @@ class RemoteVLLMServer:
             print(f"[RemoteOpenAIServer] Sent SIGTERM to process {pid}")
 
         try:
-            self.proc.wait(timeout=15)
+            self.proc.wait(timeout=self._get_process_termination_timeout())
             print(f"[RemoteOpenAIServer] Server {pid} terminated gracefully")
         except subprocess.TimeoutExpired:
             # Phase 2: SIGKILL the entire process group
@@ -604,6 +625,13 @@ class RemoteVLLMServer:
                         mem_info = nvmlDeviceGetMemoryInfo(handle)
                         total_used += mem_info.used
                     return total_used
+            elif current_platform.is_xpu():
+                total_used = 0
+                device_count = current_platform.device_count()
+                for i in range(device_count):
+                    free, total = torch.xpu.mem_get_info(i)
+                    total_used += total - free
+                return total_used
         except Exception as e:
             print(f"[RemoteOpenAIServer] Could not query GPU memory: {e}")
             return None
@@ -756,6 +784,14 @@ class RemoteVLLMServer:
 class RemoteOpenAIServer(RemoteVLLMServer):
     """Launches ``vllm serve`` for testing OpenAI-compatible endpoints."""
 
+    def _get_process_termination_timeout(self) -> float:
+        engine_timeout = get_engine_process_shutdown_timeout(
+            self._request_shutdown_timeout,
+            self._request_shutdown_timeout,
+        )
+        assert engine_timeout is not None
+        return engine_timeout + super()._get_process_termination_timeout()
+
     def _create_cli_subcommand(self):
         return ServeSubcommand()
 
@@ -770,8 +806,8 @@ class RemoteOpenAIServer(RemoteVLLMServer):
             env.update(env_dict)
         _sanitize_pythonpath_env(env)
         serve_cmd = ["vllm", "serve", model, *vllm_serve_args]
-        print(f"Launching RemoteOpenAIServer with: {' '.join(serve_cmd)}")
-        print(f"Environment variables: {env}")
+        redacted_serve_cmd = _redact_sensitive_cli_args(serve_cmd)
+        print(f"Launching RemoteOpenAIServer with: {' '.join(redacted_serve_cmd)}")
         self.proc: subprocess.Popen = subprocess.Popen(
             serve_cmd,
             env=env,
@@ -798,7 +834,10 @@ class RemoteLaunchRenderServer(RemoteVLLMServer):
             env.update(env_dict)
         _sanitize_pythonpath_env(env)
         serve_cmd = ["vllm", "launch", "render", model, *vllm_serve_args]
-        print(f"Launching RemoteLaunchRenderServer with: {' '.join(serve_cmd)}")
+        redacted_serve_cmd = _redact_sensitive_cli_args(serve_cmd)
+        print(
+            f"Launching RemoteLaunchRenderServer with: {' '.join(redacted_serve_cmd)}"
+        )
         self.proc: subprocess.Popen = subprocess.Popen(
             serve_cmd,
             env=env,
@@ -887,7 +926,7 @@ class RemoteOpenAIServerCustom(RemoteOpenAIServer):
             self.proc.terminate()
             print(f"[RemoteOpenAIServerCustom] Sent SIGTERM to process {pid}")
 
-        self.proc.join(15)
+        self.proc.join(self._get_process_termination_timeout())
         if self.proc.is_alive():
             print(
                 f"[RemoteOpenAIServerCustom] Server {pid} did not respond "
@@ -1377,6 +1416,8 @@ def init_test_distributed_environment(
     rank: int,
     distributed_init_port: str,
     local_rank: int = -1,
+    data_parallel_size: int = 1,
+    data_parallel_master_port: int | None = None,
 ) -> None:
     # Note: This function is often called from Ray worker processes, so we
     # can't rely on pytest fixtures to set the config. We check if the config
@@ -1388,6 +1429,29 @@ def init_test_distributed_environment(
     )
 
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
+
+    if data_parallel_size > 1:
+        # For DP we need to set a common DP master port
+        from vllm.config.parallel import ParallelConfig
+
+        assert data_parallel_master_port is not None, (
+            "data_parallel_master_port is required when data_parallel_size > 1"
+        )
+        tp_pp_world = tp_size * pp_size
+        parallel_config = ParallelConfig(
+            data_parallel_size=data_parallel_size,
+            data_parallel_rank=rank // tp_pp_world,
+            _data_parallel_master_port_list=[int(data_parallel_master_port)],
+        )
+        with set_current_vllm_config(VllmConfig(parallel_config=parallel_config)):
+            init_distributed_environment(
+                world_size=tp_pp_world,
+                rank=rank % tp_pp_world,
+                distributed_init_method=distributed_init_method,
+                local_rank=local_rank if local_rank >= 0 else rank,
+            )
+            ensure_model_parallel_initialized(tp_size, pp_size)
+        return
 
     if get_current_vllm_config_or_none() is not None:
         # Config already set, use it directly
@@ -1415,6 +1479,7 @@ def multi_process_parallel(
     tp_size: int,
     pp_size: int,
     test_target: Any,
+    data_parallel_size: int = 1,
 ) -> None:
     import ray
 
@@ -1435,21 +1500,77 @@ def multi_process_parallel(
     )
 
     distributed_init_port = get_open_port()
+    # Separate port for the DP master group; only used when data_parallel_size > 1.
+    data_parallel_master_port = get_open_port() if data_parallel_size > 1 else None
+    world_size = data_parallel_size * tp_size * pp_size
     try:
         refs = []
-        for rank in range(tp_size * pp_size):
-            refs.append(
-                test_target.remote(
-                    monkeypatch,
-                    tp_size,
-                    pp_size,
-                    rank,
-                    distributed_init_port,
-                ),
-            )
+        for rank in range(world_size):
+            if data_parallel_size > 1:
+                refs.append(
+                    test_target.remote(
+                        monkeypatch,
+                        tp_size,
+                        pp_size,
+                        rank,
+                        distributed_init_port,
+                        data_parallel_size,
+                        data_parallel_master_port,
+                    ),
+                )
+            else:
+                refs.append(
+                    test_target.remote(
+                        monkeypatch,
+                        tp_size,
+                        pp_size,
+                        rank,
+                        distributed_init_port,
+                    ),
+                )
         ray.get(refs)
     finally:
         ray.shutdown()
+
+
+def assert_rocm_custom_allreduce_backend_state(
+    use_aiter_custom_ar: bool,
+    quick_reduce_quantization: str,
+) -> None:
+    from vllm.distributed.parallel_state import get_tp_group
+
+    device_communicator = get_tp_group().device_communicator
+    aiter_ar_comm = device_communicator.aiter_ar_comm
+    if use_aiter_custom_ar:
+        assert aiter_ar_comm is not None, "AITER CustomAllreduce was not initialized."
+        assert not aiter_ar_comm.disabled, "AITER CustomAllreduce is disabled."
+        assert device_communicator.ca_comm is None, (
+            "vLLM CustomAllreduce should not be initialized when AITER CA is used."
+        )
+    else:
+        assert aiter_ar_comm is None, (
+            "AITER CustomAllreduce should not be initialized when disabled."
+        )
+        assert device_communicator.ca_comm is not None, (
+            "vLLM CustomAllreduce should be initialized when AITER CA is disabled."
+        )
+
+    qr_comm = device_communicator.qr_comm
+    assert qr_comm is not None, "QuickReduce communicator was not initialized."
+    if quick_reduce_quantization == "NONE":
+        assert qr_comm.disabled, "QuickReduce should be disabled."
+    else:
+        assert not qr_comm.disabled, "QuickReduce should be enabled."
+
+
+def assert_rocm_custom_allreduce_backend_state_on_worker(
+    _worker,
+    use_aiter_custom_ar: bool,
+    quick_reduce_quantization: str,
+) -> None:
+    assert_rocm_custom_allreduce_backend_state(
+        use_aiter_custom_ar, quick_reduce_quantization
+    )
 
 
 @contextmanager
@@ -1464,7 +1585,7 @@ def error_on_warning(category: type[Warning] = Warning):
         yield
 
 
-def get_physical_device_indices(devices):
+def get_physical_device_indices(devices: list[int]):
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices is None:
         return devices
@@ -1474,78 +1595,167 @@ def get_physical_device_indices(devices):
     return [index_mapping[i] for i in devices if i in index_mapping]
 
 
+def get_nvml_device_handle(device: int):
+    visible_devices = os.environ.get("NVIDIA_VISIBLE_DEVICES")
+    if visible_devices is not None:
+        identifiers = visible_devices.split(",")
+        if device < len(identifiers):
+            identifier = identifiers[device]
+            if identifier.startswith(("GPU-", "MIG-")):
+                return nvmlDeviceGetHandleByUUID(identifier)
+
+    return nvmlDeviceGetHandleByIndex(device)
+
+
 @_nvml()
+def record_gpu_memory_usage_stats(
+    *,
+    devices: list[int],
+) -> dict[int, tuple[float, float]]:
+    output: dict[int, tuple[float, float]] = {}
+    for device in devices:
+        if current_platform.is_rocm():
+            dev_handle = amdsmi_get_processor_handles()[device]
+            mem_info = amdsmi_get_gpu_vram_usage(dev_handle)
+            gb_used = mem_info["vram_used"] / 2**10
+            gb_total = mem_info["vram_total"] / 2**10
+        elif current_platform.is_xpu():
+            # nvml/amdsmi are unavailable on XPU. Query device memory through
+            # torch.accelerator.get_memory_info, which the XPU platform patches
+            # to return (free, total) bytes via Level Zero.
+            free_b, total_b = torch.accelerator.get_memory_info(device)
+            gb_used = (total_b - free_b) / 2**30
+            gb_total = total_b / 2**30
+        else:
+            dev_handle = get_nvml_device_handle(device)
+            mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
+            gb_used = mem_info.used / 2**30
+            gb_total = mem_info.total / 2**30
+        output[device] = (gb_used, gb_total)
+    return output
+
+
 def wait_for_gpu_memory_to_clear(
     *,
     devices: list[int],
-    threshold_bytes: int | None = None,
-    threshold_ratio: float | None = None,
+    threshold_bytes: int | dict[int, int] | None = None,
+    threshold_ratio: float | dict[int, float] | None = None,
     timeout_s: float = 120,
+    stable_duration_s: float = 0,
+    stable_tolerance_bytes: int = 512 * 1024**2,
+    poll_interval_s: float = 5,
 ) -> None:
     assert threshold_bytes is not None or threshold_ratio is not None
-    if (
-        current_platform.is_rocm()
-        and threshold_ratio is not None
-        and threshold_ratio < 0.05
-    ):
+    devices = get_physical_device_indices(devices)
+    if isinstance(threshold_bytes, int):
+        threshold_bytes = {device: threshold_bytes for device in devices}
+    elif isinstance(threshold_bytes, dict):
+        assert threshold_bytes.keys() == set(devices)
+    if isinstance(threshold_ratio, float):
+        threshold_ratio = {device: threshold_ratio for device in devices}
+    elif isinstance(threshold_ratio, dict):
+        assert threshold_ratio.keys() == set(devices)
+    if current_platform.is_rocm() and threshold_ratio is not None:
         # ROCm can keep a small runtime/driver footprint resident even after
         # all model allocations are gone. On MI300 this has been observed
         # around 2.5 GiB, which is above a strict 1% idle threshold but nowhere
         # near the amount of free memory needed by the next vLLM runner.
-        min_threshold_bytes = 4 * 1024**3
-        threshold_bytes = max(threshold_bytes or 0, min_threshold_bytes)
+        min_threshold_b = 4 * 1024**3
+        if threshold_bytes is None:
+            threshold_bytes = {}
+        for device, ratio in threshold_ratio.items():
+            threshold_bytes[device] = max(
+                threshold_bytes.get(device, 0), min_threshold_b if ratio < 0.05 else 0
+            )
 
     # Use nvml instead of pytorch to reduce measurement error from torch cuda
     # context.
-    devices = get_physical_device_indices(devices)
     start_time = time.time()
+    stable_since: float | None = None
+    stable_used_bytes: dict[int, int] | None = None
     while True:
-        output: dict[int, str] = {}
-        output_raw: dict[int, tuple[float, float]] = {}
-        for device in devices:
-            if current_platform.is_rocm():
-                dev_handle = amdsmi_get_processor_handles()[device]
-                mem_info = amdsmi_get_gpu_vram_usage(dev_handle)
-                gb_used = mem_info["vram_used"] / 2**10
-                gb_total = mem_info["vram_total"] / 2**10
-            else:
-                dev_handle = nvmlDeviceGetHandleByIndex(device)
-                mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
-                gb_used = mem_info.used / 2**30
-                gb_total = mem_info.total / 2**30
-            output_raw[device] = (gb_used, gb_total)
-            output[device] = f"{gb_used:.02f}/{gb_total:.02f}"
-
+        output_raw = record_gpu_memory_usage_stats(devices=devices)
+        used_bytes_by_device = {
+            device: int(gb_used * 2**30) for device, (gb_used, _) in output_raw.items()
+        }
+        output = {
+            device: f"{gb_used:.02f}/{gb_total:.02f}"
+            for device, (gb_used, gb_total) in output_raw.items()
+        }
         print("gpu memory used/total (GiB): ", end="")
         for k, v in output.items():
             print(f"{k}={v}; ", end="")
         print("")
 
         if threshold_bytes is not None and threshold_ratio is not None:
-            threshold_gib = threshold_bytes / 2**30
-            threshold = f"max({threshold_gib:.2f} GiB, {threshold_ratio:.3f})"
+            threshold_gib = {
+                device: threshold_b / 2**30
+                for device, threshold_b in threshold_bytes.items()
+            }
+            threshold = "; ".join(
+                f"{device=}: max({threshold_gib[device]:.2f} GiB, "
+                f"{threshold_ratio[device]:.3f})"
+                for device in devices
+            )
             all_free = all(
-                used <= max(threshold_gib, total * threshold_ratio)
-                for used, total in output_raw.values()
+                used <= max(threshold_gib[device], total * threshold_ratio[device])
+                for device, (used, total) in output_raw.items()
             )
         elif threshold_bytes is not None:
-            threshold_gib = threshold_bytes / 2**30
-            threshold = f"{threshold_gib} GiB"
-            all_free = all(used <= threshold_gib for used, _ in output_raw.values())
+            threshold_gib = {
+                device: threshold_b / 2**30
+                for device, threshold_b in threshold_bytes.items()
+            }
+            threshold = "; ".join(
+                f"{device=}: {threshold_gib[device]:.2f} GiB" for device in devices
+            )
+            all_free = all(
+                used <= threshold_gib[device]
+                for device, (used, _) in output_raw.items()
+            )
         else:
             assert threshold_ratio is not None
-            threshold = f"{threshold_ratio:.3f}"
+            threshold = "; ".join(
+                f"{device=}: {threshold_ratio[device]:.3f}" for device in devices
+            )
             all_free = all(
-                used / total <= threshold_ratio for used, total in output_raw.values()
+                used / total <= threshold_ratio[device]
+                for device, (used, total) in output_raw.items()
             )
 
         dur_s = time.time() - start_time
         if all_free:
-            print(
-                f"Done waiting for free GPU memory on devices {devices=} "
-                f"({threshold=}) {dur_s=:.02f}"
-            )
-            break
+            if stable_duration_s <= 0:
+                print(
+                    f"Done waiting for free GPU memory on devices {devices=} "
+                    f"({threshold=}) {dur_s=:.02f}"
+                )
+                break
+
+            now = time.time()
+            if stable_used_bytes is None:
+                stable_since = now
+                stable_used_bytes = used_bytes_by_device
+            else:
+                memory_changed = any(
+                    abs(used_bytes_by_device[device] - stable_used_bytes[device])
+                    > stable_tolerance_bytes
+                    for device in devices
+                )
+                if memory_changed:
+                    stable_since = now
+                    stable_used_bytes = used_bytes_by_device
+                elif (
+                    stable_since is not None and now - stable_since >= stable_duration_s
+                ):
+                    print(
+                        f"Done waiting for stable free GPU memory on devices "
+                        f"{devices=} ({threshold=}) {dur_s=:.02f}"
+                    )
+                    break
+        else:
+            stable_since = None
+            stable_used_bytes = None
 
         if dur_s >= timeout_s:
             raise ValueError(
@@ -1553,32 +1763,36 @@ def wait_for_gpu_memory_to_clear(
                 f"{dur_s=:.02f} ({threshold=})"
             )
 
-        time.sleep(5)
+        time.sleep(poll_interval_s)
 
 
-def wait_for_rocm_memory_to_settle(
+def wait_for_memory_to_settle(
     *,
-    threshold_ratio: float = 0.1,
+    threshold_ratio: float | dict[int, float] | None = 0.1,
     timeout_s: float = 240,
 ) -> None:
-    """Block until ROCm device VRAM usage drops below ``threshold_ratio``.
+    """Block until ROCm or XPU device VRAM usage drops below ``threshold_ratio``.
 
-    ROCm reclaims GPU memory more lazily than CUDA, so back-to-back model
+    ROCm and XPU reclaims GPU memory more lazily than CUDA, so back-to-back model
     loads in a single test process can OOM the *next* engine/model startup
     even after ``cleanup_dist_env_and_memory``. This gives the driver time to
     actually release VRAM before the next allocation. No-op off ROCm.
     """
-    if not current_platform.is_rocm():
+    if not current_platform.is_rocm() and not current_platform.is_xpu():
         return
 
     num_gpus = current_platform.device_count()
     if num_gpus == 0:
         return
+    if threshold_ratio is None:
+        threshold_ratio = 0.1
 
     wait_for_gpu_memory_to_clear(
         devices=list(range(num_gpus)),
         threshold_ratio=threshold_ratio,
         timeout_s=timeout_s,
+        stable_duration_s=2.0,
+        poll_interval_s=1.0,
     )
 
 
@@ -1849,7 +2063,10 @@ def large_gpu_mark(min_gb: int) -> pytest.MarkDecorator:
 
     return pytest.mark.skipif(
         memory_gb < min_gb,
-        reason=f"Need at least {min_gb}GB GPU memory to run the test.",
+        reason=(
+            f"Need at least {min_gb}GB GPU memory to run the test "
+            f"(found {memory_gb}GB)."
+        ),
     )
 
 
@@ -2198,9 +2415,15 @@ class TestFP8Layer(torch.nn.Module):
         out_dtype: torch.dtype | None = None,
         transpose_weights: bool = False,
         device: torch.device | None = None,
-        force_kernel: type[_KernelT] | None = None,
+        force_kernel: "type[_KernelT] | None" = None,
     ):
         super().__init__()
+        from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
+
+        self.input_size_per_partition = weight_shape[1]
+        self.output_size_per_partition = weight_shape[0]
+        self.logical_widths = [self.output_size_per_partition]
+        self.orig_dtype = input_dtype
         act_scale_desc = activation_quant_key.scale
         weight_scale_desc = weight_quant_key.scale
         is_block_wise = act_scale_desc.group_shape.is_per_group()
@@ -2208,11 +2431,12 @@ class TestFP8Layer(torch.nn.Module):
             block_size = weight_scale_desc.group_shape.col
             weight_scale_shape = weight_shape[0] // block_size
             self.weight_scale_inv = torch.rand(
-                (weight_scale_shape, weight_scale_shape), dtype=torch.float32
+                (weight_scale_shape, weight_scale_shape),
+                dtype=torch.float32,
+                device=device,
             )
-            self.weight = torch.rand(weight_shape).to(dtype=FP8_DTYPE)
+            self.weight = torch.rand(weight_shape, device=device).to(dtype=FP8_DTYPE)
             self.input_scale = None
-            self.weight_scale = None
             self.weight_block_size = [block_size, block_size]
             if transpose_weights:
                 self.weight = self.weight.t()

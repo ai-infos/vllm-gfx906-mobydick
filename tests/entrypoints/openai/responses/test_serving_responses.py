@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import AsyncExitStack
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from openai.types.responses import (
+    ResponseFunctionToolCall,
     ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
     ResponseReasoningItem,
     ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent,
@@ -23,17 +27,22 @@ from openai.types.responses.tool import (
     Mcp,
     Tool,
 )
+from openai_harmony import Message as OpenAIHarmonyMessage
+from openai_harmony import Role
 
 import vllm.envs as envs
-from vllm.entrypoints.mcp.tool_server import ToolServer
-from vllm.entrypoints.openai.engine.protocol import (
+from vllm.entrypoints.generate.base.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
-    ErrorResponse,
     RequestResponseMetadata,
 )
-from vllm.entrypoints.openai.responses.context import ConversationContext, SimpleContext
+from vllm.entrypoints.mcp.tool_server import ToolServer
+from vllm.entrypoints.openai.responses.context import (
+    ConversationContext,
+    HarmonyContext,
+    SimpleContext,
+)
 from vllm.entrypoints.openai.responses.protocol import (
     ResponseCreatedEvent,
     ResponseRawMessageAndToken,
@@ -43,15 +52,31 @@ from vllm.entrypoints.openai.responses.protocol import (
 )
 from vllm.entrypoints.openai.responses.serving import (
     OpenAIServingResponses,
-    _extract_allowed_tools_from_mcp_requests,
     extract_tool_types,
 )
 from vllm.entrypoints.openai.responses.streaming_events import (
     StreamingState,
 )
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.inputs import tokens_input
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.parser.harmony import Segment
+from vllm.renderers import TokenizeParams
+from vllm.renderers.online_renderer import (
+    OnlineRenderer,
+    _extract_allowed_tools_from_mcp_requests,
+)
 from vllm.sampling_params import SamplingParams
+
+pytestmark = pytest.mark.skip_global_cleanup
+
+
+def _new_online_renderer() -> OnlineRenderer:
+    renderer = OnlineRenderer.__new__(OnlineRenderer)
+    renderer.exclude_tools_when_tool_choice_none = False
+    renderer.parser = None
+    renderer.trust_request_chat_template = True
+    return renderer
 
 
 class MockConversationContext(ConversationContext):
@@ -204,6 +229,325 @@ def test_response_created_event_uses_public_json_schema_alias() -> None:
     assert event.response.text.format.model_dump(by_alias=True)["schema"] == schema
 
 
+@pytest.mark.asyncio
+async def test_online_renderer_renders_non_harmony_responses_with_explicit_history():
+    renderer = _new_online_renderer()
+    renderer.use_harmony = False
+    renderer.chat_template = "server-template"
+    renderer.chat_template_content_format = "string"
+    renderer.default_chat_template_kwargs = {"server_default": "kept"}
+    renderer.parser = None
+    renderer.preprocess_chat = AsyncMock(
+        return_value=(
+            [],
+            [tokens_input([11, 12, 13], cache_salt="request-salt")],
+        )
+    )
+    previous_messages = [
+        {"role": "system", "content": "old instructions"},
+        {"role": "user", "content": "first"},
+    ]
+    previous_outputs = [
+        ResponseOutputMessage(
+            id="msg_1",
+            content=[
+                ResponseOutputText(
+                    annotations=[],
+                    text="prior answer",
+                    type="output_text",
+                )
+            ],
+            role="assistant",
+            status="completed",
+            type="message",
+        )
+    ]
+    request = ResponsesRequest(
+        input="next",
+        instructions="new instructions",
+        tools=[],
+        cache_salt="request-salt",
+        chat_template_kwargs={"request_default": "kept"},
+    )
+
+    result = await renderer.render_responses(
+        request,
+        previous_messages=previous_messages,
+        previous_response_outputs=previous_outputs,
+    )
+
+    assert not isinstance(result, ErrorResponse)
+    assert result.messages == [
+        {"role": "system", "content": "new instructions"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "prior answer"},
+        {"role": "user", "content": "next"},
+    ]
+    assert result.engine_input["prompt_token_ids"] == [11, 12, 13]
+    assert result.engine_input["cache_salt"] == "request-salt"
+    assert previous_messages[0]["content"] == "old instructions"
+    assert previous_outputs[0].content[0].text == "prior answer"
+
+    preprocess_kwargs = renderer.preprocess_chat.call_args.kwargs
+    assert preprocess_kwargs["default_template"] == "server-template"
+    assert preprocess_kwargs["default_template_content_format"] == "string"
+    assert preprocess_kwargs["default_template_kwargs"]["server_default"] == "kept"
+    assert preprocess_kwargs["default_template_kwargs"]["request_default"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_rejects_untrusted_responses_chat_template():
+    renderer = _new_online_renderer()
+    renderer.use_harmony = False
+    renderer.chat_template = "server-template"
+    renderer.chat_template_content_format = "string"
+    renderer.default_chat_template_kwargs = {}
+    renderer.exclude_tools_when_tool_choice_none = False
+    renderer.trust_request_chat_template = False
+    renderer.parser = None
+    renderer.preprocess_chat = AsyncMock(
+        return_value=([], [tokens_input([1])]),
+    )
+    request = ResponsesRequest(
+        input="hello",
+        chat_template_kwargs={"chat_template": "{{ messages }}"},
+    )
+
+    result = await renderer.render_responses(request)
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error.code == 400
+    assert "untrusted chat template" in result.error.message.lower()
+    renderer.preprocess_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_rejects_harmony_history_for_non_harmony_model():
+    renderer = _new_online_renderer()
+    renderer.use_harmony = False
+    request = ResponsesRequest(input="next")
+
+    result = await renderer.render_responses(
+        request,
+        previous_messages=[
+            OpenAIHarmonyMessage.from_role_and_content(Role.USER, "first")
+        ],
+    )
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error.param == "previous_response_id"
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_rejects_chat_history_for_harmony_model():
+    renderer = _new_online_renderer()
+    renderer.use_harmony = True
+    request = ResponsesRequest(input="next")
+
+    result = await renderer.render_responses(
+        request,
+        previous_messages=[{"role": "user", "content": "first"}],
+    )
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error.param == "previous_response_id"
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_adjusts_harmony_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class StubParser:
+        def __init__(self, tokenizer, tools, *, model_config):
+            pass
+
+        def adjust_request(self, request):
+            request.cache_salt = "adjusted"
+            return request
+
+    renderer = _new_online_renderer()
+    renderer.use_harmony = True
+    renderer.parser = StubParser
+    renderer.model_config = SimpleNamespace(max_model_len=100)
+    tokenizer = SimpleNamespace(truncation_side="left")
+    renderer.renderer = SimpleNamespace(
+        tokenizer=tokenizer,
+        get_tokenizer=lambda: tokenizer,
+    )
+    monkeypatch.setattr(
+        "vllm.renderers.online_renderer.render_for_completion",
+        lambda messages: [1],
+    )
+    request = ResponsesRequest(
+        input="next",
+        tools=[
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        tool_choice={"type": "function", "name": "lookup"},
+    )
+
+    result = await renderer.render_responses(request)
+
+    assert not isinstance(result, ErrorResponse)
+    assert result.engine_input["cache_salt"] == "adjusted"
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_applies_responses_token_budget_to_harmony_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    renderer = _new_online_renderer()
+    renderer.use_harmony = True
+    renderer.model_config = SimpleNamespace(max_model_len=5)
+    renderer.renderer = SimpleNamespace(
+        tokenizer=SimpleNamespace(truncation_side="left")
+    )
+    monkeypatch.setattr(
+        "vllm.renderers.online_renderer.render_for_completion",
+        lambda messages: [1, 2, 3, 4, 5, 6],
+    )
+    request = ResponsesRequest(
+        input="hello",
+        max_output_tokens=2,
+        truncation="auto",
+    )
+
+    result = await renderer.render_responses(request)
+
+    assert not isinstance(result, ErrorResponse)
+    assert result.engine_input["prompt_token_ids"] == [4, 5, 6]
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_renders_harmony_continuation_with_call_linkage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    renderer = _new_online_renderer()
+    renderer.use_harmony = True
+    renderer.model_config = SimpleNamespace(max_model_len=100)
+    renderer.renderer = SimpleNamespace(
+        tokenizer=SimpleNamespace(truncation_side="left")
+    )
+    monkeypatch.setattr(
+        "vllm.renderers.online_renderer.render_for_completion",
+        lambda messages: [1],
+    )
+    previous_messages = [
+        OpenAIHarmonyMessage.from_role_and_content(Role.USER, "first"),
+    ]
+    previous_outputs = [
+        ResponseFunctionToolCall(
+            arguments='{"city":"Paris"}',
+            call_id="call_1",
+            name="lookup_weather",
+            type="function_call",
+        )
+    ]
+    request = ResponsesRequest(
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "sunny",
+            }
+        ],
+        instructions="replacement instructions are ignored on continuations",
+        reasoning={"effort": "high"},
+        tools=[
+            {
+                "type": "function",
+                "name": "lookup_weather",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        cache_salt="request-salt",
+    )
+
+    result = await renderer.render_responses(
+        request,
+        previous_messages=previous_messages,
+        previous_response_outputs=previous_outputs,
+    )
+
+    assert not isinstance(result, ErrorResponse)
+    assert result.messages[0] is previous_messages[0]
+    tool_output = result.messages[-1]
+    assert tool_output.author.role == "tool"
+    assert tool_output.author.name == "functions.lookup_weather"
+    assert tool_output.channel == "commentary"
+    assert tool_output.recipient == "assistant"
+    assert result.engine_input["cache_salt"] == "request-salt"
+    assert "arrival_time" in result.engine_input
+    assert previous_messages == [
+        OpenAIHarmonyMessage.from_role_and_content(Role.USER, "first"),
+    ]
+    assert previous_outputs[0].call_id == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_returns_typed_error_for_bad_harmony_call_reference():
+    renderer = _new_online_renderer()
+    renderer.use_harmony = True
+    request = ResponsesRequest(
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "missing",
+                "output": "orphaned",
+            }
+        ],
+        tools=[],
+    )
+
+    result = await renderer.render_responses(request)
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error.type == "invalid_request_error"
+    assert result.error.param == "input"
+    assert "No call message found for missing" in result.error.message
+
+
+@pytest.mark.asyncio
+async def test_online_renderer_preserves_missing_harmony_builtin_tool_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    renderer = _new_online_renderer()
+    renderer.use_harmony = True
+    renderer.model_config = SimpleNamespace(max_model_len=100)
+    renderer.renderer = SimpleNamespace(
+        tokenizer=SimpleNamespace(truncation_side="left")
+    )
+    monkeypatch.setattr(
+        "vllm.renderers.online_renderer.render_for_completion",
+        lambda messages: [1],
+    )
+    request = ResponsesRequest(
+        input="search",
+        tools=[{"type": "web_search_preview"}],
+    )
+
+    result = await renderer.render_responses(request, tool_server=None)
+
+    assert not isinstance(result, ErrorResponse)
+
+
+@pytest.mark.parametrize(
+    "engine_inputs",
+    [[], [tokens_input([1]), tokens_input([2])]],
+)
+def test_responses_render_result_rejects_non_single_prompt(engine_inputs):
+    renderer = _new_online_renderer()
+
+    result = renderer._responses_render_result([], engine_inputs)
+
+    assert isinstance(result, ErrorResponse)
+    assert f"got {len(engine_inputs)}" in result.error.message
+
+
 class TestInitializeToolSessions:
     """Test class for _initialize_tool_sessions method"""
 
@@ -230,7 +574,7 @@ class TestInitializeToolSessions:
         instance = OpenAIServingResponses(
             engine_client=engine_client,
             models=models,
-            openai_serving_render=MagicMock(),
+            online_renderer=MagicMock(),
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
@@ -238,6 +582,139 @@ class TestInitializeToolSessions:
         )
 
         return instance
+
+    @pytest.mark.asyncio
+    async def test_stateful_harmony_delegates_named_tool_choice_to_renderer(
+        self,
+        serving_responses_instance,
+    ):
+        serving_responses_instance.use_harmony = True
+        serving_responses_instance.online_renderer.render_responses = AsyncMock(
+            return_value=SimpleNamespace(
+                messages=[],
+                engine_input=tokens_input([1]),
+            )
+        )
+        request = ResponsesRequest(
+            input="hello",
+            tool_choice={"type": "function", "name": "lookup"},
+            tools=[
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        )
+
+        result = await serving_responses_instance._render_resolved_response_inputs(
+            request,
+            None,
+        )
+
+        assert result.engine_input["prompt_token_ids"] == [1]
+        serving_responses_instance.online_renderer.render_responses.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_render_next_turn_reuses_shared_responses_renderer(
+        self, serving_responses_instance
+    ):
+        serving_responses_instance.online_renderer.render_responses = AsyncMock(
+            return_value=SimpleNamespace(
+                messages=[],
+                engine_input=tokens_input([8, 9], cache_salt="request-salt"),
+            )
+        )
+        serving_responses_instance.online_renderer.preprocess_chat = AsyncMock(
+            return_value=([], [tokens_input([1])])
+        )
+        request = ResponsesRequest(
+            input="first",
+            instructions="initial instructions",
+            cache_salt="request-salt",
+        )
+        turn_messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "tool call"},
+            {"role": "tool", "content": "tool output"},
+        ]
+
+        engine_inputs = await serving_responses_instance._render_next_turn(
+            request,
+            turn_messages,
+        )
+
+        assert engine_inputs[0]["prompt_token_ids"] == [8, 9]
+        render_request = (
+            serving_responses_instance.online_renderer.render_responses.call_args.args[
+                0
+            ]
+        )
+        assert render_request.input == turn_messages
+        assert render_request.instructions is None
+        assert render_request.cache_salt == "request-salt"
+
+    @pytest.mark.asyncio
+    async def test_harmony_tool_followup_preserves_render_params(
+        self, serving_responses_instance, monkeypatch: pytest.MonkeyPatch
+    ):
+        class ToolCallingHarmonyContext(HarmonyContext):
+            def __init__(self):
+                self._messages = []
+                self._needs_tool_call = True
+
+            def append_output(self, output) -> None:
+                pass
+
+            def need_builtin_tool_call(self) -> bool:
+                return self._needs_tool_call
+
+            async def call_tool(self):
+                self._needs_tool_call = False
+                return []
+
+            def append_tool_output(self, output) -> None:
+                self._messages.extend(output)
+
+        async def generate_output():
+            yield MagicMock()
+
+        context = ToolCallingHarmonyContext()
+        serving_responses_instance.engine_client.generate.side_effect = (
+            lambda *args, **kwargs: generate_output()
+        )
+        monkeypatch.setattr(
+            "vllm.renderers.online_renderer.render_for_completion",
+            lambda messages: [1, 2, 3, 4],
+        )
+        online_renderer = serving_responses_instance.online_renderer
+        online_renderer.renderer = SimpleNamespace(
+            tokenizer=SimpleNamespace(truncation_side="left")
+        )
+        serving_responses_instance.online_renderer.render_responses_harmony_messages = (
+            OnlineRenderer.render_responses_harmony_messages.__get__(online_renderer)
+        )
+        serving_responses_instance._extract_prompt_len = MagicMock(return_value=2)
+
+        async for _ in serving_responses_instance._generate_with_builtin_tools(
+            request_id="req",
+            engine_input=tokens_input([1], cache_salt="request-salt"),
+            sampling_params=MagicMock(),
+            context=context,
+            tok_params=TokenizeParams(
+                max_total_tokens=3,
+                max_output_tokens=1,
+                truncate_prompt_tokens=-1,
+            ),
+        ):
+            pass
+
+        assert serving_responses_instance.engine_client.generate.call_count == 2
+        followup_engine_input = (
+            serving_responses_instance.engine_client.generate.call_args_list[1].args[0]
+        )
+        assert followup_engine_input.get("cache_salt") == "request-salt"
+        assert followup_engine_input["prompt_token_ids"] == [3, 4]
 
     @pytest.mark.asyncio
     async def test_initialize_tool_sessions(
@@ -316,7 +793,7 @@ class TestValidateGeneratorInput:
         instance = OpenAIServingResponses(
             engine_client=engine_client,
             models=models,
-            openai_serving_render=MagicMock(),
+            online_renderer=MagicMock(),
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
@@ -359,6 +836,10 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
         def get_vocab(self):
             return self._vocab
 
+        def decode(self, token_ids):
+            id_to_token = {v: k for k, v in self._vocab.items()}
+            return "".join(id_to_token.get(token_id, "x") for token_id in token_ids)
+
     # Force non-harmony, SimpleContext path
     monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
 
@@ -379,15 +860,22 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
     serving = OpenAIServingResponses(
         engine_client=engine_client,
         models=models,
-        openai_serving_render=MagicMock(),
+        online_renderer=MagicMock(),
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
         reasoning_parser="qwen3",
     )
 
+    request = ResponsesRequest(input="hi", tools=[], stream=False)
+    response_parser = serving._make_response_parser(
+        request,
+        tokenizer,
+        serving._effective_chat_template_kwargs(request),
+    )
+
     # Build a SimpleContext with thinking tokens in the output.
-    context = SimpleContext()
+    context = SimpleContext(response_parser=response_parser)
     token_ids = [1, 10, 2, 20]  # <think> 10 </think> 20 -> reasoning token count = 1
     completion = CompletionOutput(
         index=0,
@@ -412,7 +900,6 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
     async def dummy_result_generator():
         yield None
 
-    request = ResponsesRequest(input="hi", tools=[], stream=False)
     sampling_params = SamplingParams(max_tokens=16)
     metadata = RequestResponseMetadata(request_id="req")
 
@@ -528,13 +1015,9 @@ class TestHarmonyPreambleStreaming:
     """Tests for preamble (commentary with no recipient) streaming events."""
 
     @staticmethod
-    def _make_ctx(*, channel, recipient, delta="hello"):
-        """Build a lightweight mock StreamingHarmonyContext."""
-        ctx = MagicMock()
-        ctx.last_content_delta = delta
-        ctx.parser.current_channel = channel
-        ctx.parser.current_recipient = recipient
-        return ctx
+    def _make_segment(*, channel, recipient, delta="hello"):
+        """Build a lightweight segment for Harmony streaming tests."""
+        return Segment(channel=channel, recipient=recipient, delta=delta)
 
     @staticmethod
     def _make_previous_item(*, channel, recipient, text="preamble text"):
@@ -553,10 +1036,10 @@ class TestHarmonyPreambleStreaming:
             emit_content_delta_events,
         )
 
-        ctx = self._make_ctx(channel="commentary", recipient=None)
+        segment = self._make_segment(channel="commentary", recipient=None)
         state = StreamingState()
 
-        events = emit_content_delta_events(ctx, state)
+        events = emit_content_delta_events(segment, state)
 
         type_names = [e.type for e in events]
         assert "response.output_text.delta" in type_names
@@ -568,13 +1051,13 @@ class TestHarmonyPreambleStreaming:
             emit_content_delta_events,
         )
 
-        ctx = self._make_ctx(channel="commentary", recipient=None, delta="w")
+        segment = self._make_segment(channel="commentary", recipient=None, delta="w")
         state = StreamingState()
         state.sent_output_item_added = True
         state.current_item_id = "msg_test"
         state.current_content_index = 0
 
-        events = emit_content_delta_events(ctx, state)
+        events = emit_content_delta_events(segment, state)
 
         type_names = [e.type for e in events]
         assert "response.output_text.delta" in type_names
@@ -586,13 +1069,13 @@ class TestHarmonyPreambleStreaming:
             emit_content_delta_events,
         )
 
-        ctx = self._make_ctx(
+        segment = self._make_segment(
             channel="commentary",
             recipient="functions.get_weather",
         )
         state = StreamingState()
 
-        events = emit_content_delta_events(ctx, state)
+        events = emit_content_delta_events(segment, state)
 
         type_names = [e.type for e in events]
         assert "response.output_text.delta" not in type_names
@@ -606,6 +1089,7 @@ class TestHarmonyPreambleStreaming:
 
         previous = self._make_previous_item(channel="commentary", recipient=None)
         state = StreamingState()
+        state.sent_output_item_added = True
         state.current_item_id = "msg_test"
         state.current_output_index = 0
         state.current_content_index = 0
@@ -628,17 +1112,57 @@ class TestHarmonyPreambleStreaming:
             channel="commentary", recipient="functions.get_weather"
         )
         state = StreamingState()
+        state.is_first_function_call_delta = True
         state.current_item_id = "fc_test"
+        state.current_call_id = "call_test"
 
         events = emit_previous_item_done_events(previous, state)
 
         type_names = [e.type for e in events]
         assert "response.output_text.done" not in type_names
 
+    @pytest.mark.xfail(
+        reason=(
+            "TODO: Ensure added/in-progress events are emitted for zero-delta items."
+            "So we can safely emit done events for zero-delta items."
+        ),
+        strict=True,
+    )
+    def test_zero_delta_items_should_preserve_streaming_lifecycle(
+        self,
+    ) -> None:
+        """Zero-delta Harmony items should still produce a coherent lifecycle."""
+        from vllm.entrypoints.openai.responses.streaming_events import (
+            emit_previous_item_done_events,
+        )
 
-def _make_simple_context_with_output(text, token_ids):
+        cases: list[tuple[str, str | None, str]] = [
+            ("commentary", None, "msg_stale"),
+            ("analysis", None, "msg_stale"),
+            ("commentary", "functions.get_weather", "fc_stale"),
+            ("commentary", "python", "tool_stale"),
+            ("commentary", "repo_browser.list", "mcp_stale"),
+        ]
+
+        for channel, recipient, current_item_id in cases:
+            previous = self._make_previous_item(channel=channel, recipient=recipient)
+            state = StreamingState()
+            state.current_item_id = current_item_id
+            state.current_call_id = "call_stale"
+            state.current_content_index = 0
+
+            events = emit_previous_item_done_events(
+                previous, state, function_tool_names=None
+            )
+
+            type_names = [e.type for e in events]
+            assert "response.output_item.added" in type_names
+            assert "response.output_item.done" in type_names
+
+
+def _make_simple_context_with_output(text, token_ids, response_parser=None):
     """Create a SimpleContext with a RequestOutput containing the given text."""
-    ctx = SimpleContext()
+    ctx = SimpleContext(response_parser=response_parser)
     completion = CompletionOutput(
         index=0,
         text=text,
@@ -678,7 +1202,7 @@ def _make_serving_instance_with_reasoning():
     serving = OpenAIServingResponses(
         engine_client=engine_client,
         models=models,
-        openai_serving_render=MagicMock(),
+        online_renderer=MagicMock(),
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
@@ -719,6 +1243,7 @@ def _mock_parser_with_reasoning(serving, delta_sequence: list[DeltaMessage]):
     mock_parser_instance.parse_delta = mock_parse_delta
     mock_parser_instance.is_reasoning_end = MagicMock(return_value=False)
     serving.parser = MagicMock(return_value=mock_parser_instance)
+    return mock_parser_instance
 
 
 class TestStreamingReasoningToContentTransition:
@@ -745,12 +1270,12 @@ class TestStreamingReasoningToContentTransition:
             DeltaMessage(reasoning=" end", content="hello"),  # mixed delta
             DeltaMessage(content=" world"),
         ]
-        _mock_parser_with_reasoning(serving, delta_sequence)
+        response_parser = _mock_parser_with_reasoning(serving, delta_sequence)
         # Create contexts for each streaming chunk
         contexts = [
-            _make_simple_context_with_output("chunk1", [10]),
-            _make_simple_context_with_output("chunk2", [20]),
-            _make_simple_context_with_output("chunk3", [30]),
+            _make_simple_context_with_output("chunk1", [10], response_parser),
+            _make_simple_context_with_output("chunk2", [20], response_parser),
+            _make_simple_context_with_output("chunk3", [30], response_parser),
         ]
 
         async def result_generator():
@@ -767,7 +1292,7 @@ class TestStreamingReasoningToContentTransition:
             request=request,
             sampling_params=sampling_params,
             result_generator=result_generator(),
-            context=SimpleContext(),
+            context=SimpleContext(response_parser=response_parser),
             model_name="test-model",
             tokenizer=MagicMock(),
             request_metadata=metadata,
@@ -813,11 +1338,11 @@ class TestStreamingReasoningToContentTransition:
             DeltaMessage(reasoning="thinking"),
             DeltaMessage(content="answer"),
         ]
-        _mock_parser_with_reasoning(serving, delta_sequence)
+        response_parser = _mock_parser_with_reasoning(serving, delta_sequence)
 
         contexts = [
-            _make_simple_context_with_output("chunk1", [10]),
-            _make_simple_context_with_output("chunk2", [20]),
+            _make_simple_context_with_output("chunk1", [10], response_parser),
+            _make_simple_context_with_output("chunk2", [20], response_parser),
         ]
 
         async def result_generator():
@@ -834,7 +1359,7 @@ class TestStreamingReasoningToContentTransition:
             request=request,
             sampling_params=sampling_params,
             result_generator=result_generator(),
-            context=SimpleContext(),
+            context=SimpleContext(response_parser=response_parser),
             model_name="test-model",
             tokenizer=MagicMock(),
             request_metadata=metadata,
@@ -875,11 +1400,11 @@ class TestStreamingReasoningToContentTransition:
             DeltaMessage(reasoning="step 1"),
             DeltaMessage(reasoning=" step 2"),
         ]
-        _mock_parser_with_reasoning(serving, delta_sequence)
+        response_parser = _mock_parser_with_reasoning(serving, delta_sequence)
 
         contexts = [
-            _make_simple_context_with_output("chunk1", [10]),
-            _make_simple_context_with_output("chunk2", [20]),
+            _make_simple_context_with_output("chunk1", [10], response_parser),
+            _make_simple_context_with_output("chunk2", [20], response_parser),
         ]
 
         async def result_generator():
@@ -896,7 +1421,7 @@ class TestStreamingReasoningToContentTransition:
             request=request,
             sampling_params=sampling_params,
             result_generator=result_generator(),
-            context=SimpleContext(),
+            context=SimpleContext(response_parser=response_parser),
             model_name="test-model",
             tokenizer=MagicMock(),
             request_metadata=metadata,
@@ -936,10 +1461,10 @@ class TestAutoToolStreaming:
     @staticmethod
     async def _collect_events(delta_sequence: list[DeltaMessage]):
         serving = _make_serving_instance_with_reasoning()
-        _mock_parser_with_reasoning(serving, delta_sequence)
+        response_parser = _mock_parser_with_reasoning(serving, delta_sequence)
 
         contexts = [
-            _make_simple_context_with_output("chunk", [i])
+            _make_simple_context_with_output("chunk", [i], response_parser)
             for i in range(len(delta_sequence))
         ]
 
@@ -974,7 +1499,7 @@ class TestAutoToolStreaming:
             request=request,
             sampling_params=sampling_params,
             result_generator=result_generator(),
-            context=SimpleContext(),
+            context=SimpleContext(response_parser=response_parser),
             model_name="test-model",
             tokenizer=MagicMock(),
             request_metadata=metadata,

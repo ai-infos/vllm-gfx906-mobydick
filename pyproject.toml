@@ -7,7 +7,7 @@ requires = [
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
     "setuptools-rust>=1.9.0",
-    "torch == 2.11.0",
+    "torch == 2.13.0",
     "wheel",
     "jinja2",
 ]
@@ -46,6 +46,7 @@ vllm = "vllm.entrypoints.cli.main:main"
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
+gfx906_fa = "vllm.gfx906_fa.gfx906_fa_backend:register"
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -55,9 +56,15 @@ where = ["."]
 include = ["vllm*"]
 
 [tool.ruff.lint.per-file-ignores]
+# `vllm` is the only installed package; everything else is standalone scripts
+"!vllm/**" = ["INP"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+# gfx906 kernel micro-benchmarks: timing lambdas deliberately capture the
+# loop-local tensors (B023); the F821s on those lambdas are false
+# positives from the same pattern.
+"benchmarks/kernels/gfx906/*" = ["B023", "F821"]
 
 [tool.ruff.lint]
 select = [
@@ -77,6 +84,8 @@ select = [
     "I",
     # flake8-logging-format
     "G",
+    # flake8-no-pep420
+    "INP",
 ]
 ignore = [
     # star imports
@@ -122,21 +131,23 @@ python = "./.venv"
 [tool.typos.files]
 # these files may be written in non english words
 extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",
-    "benchmarks/sonnet.txt", "tests/lora/data/*", "build/*",
+    "benchmarks/sonnet.txt", "rust/src/bench/src/datasets/sonnet.txt",
+    "tests/lora/data/*", "build/*",
     "examples/pooling/token_embed/*", "tests/models/language/pooling/*",
     "vllm/third_party/*", "vllm/entrypoints/serve/instrumentator/static/*",
     "tests/entrypoints/speech_to_text/transcription/test_transcription_validation.py",
     "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
-    "rust/src/chat/src/renderer/deepseek_v32/fixtures/*",
-    "rust/src/tool-parser/src/gemma4.rs", "rust/src/text/src/output/decoded.rs",
-    "rust/src/tokenizer/src/incremental.rs", "rust/src/reasoning-parser/src/tests.rs"]
+    "rust/src/chat/src/renderer/deepseek_v32/fixtures/*", "rust/src/parser/**",
+    "rust/src/text/src/output/decoded.rs",
+    "rust/src/tokenizer/src/incremental.rs"]
 ignore-hidden = false
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [".*[Uu][Ee][0-9][Mm][0-9].*"]
 
 [tool.typos.default.extend-identifiers]
+a63ede7 = "a63ede7"
 bbc5b7ede = "bbc5b7ede"
 NOOPs = "NOOPs"
 nin_shortcut = "nin_shortcut"
@@ -154,6 +165,8 @@ view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
+Hel = "Hel"
+wether = "wether"
 iy = "iy"
 indx = "indx"
 # intel cpu features

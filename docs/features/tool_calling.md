@@ -321,15 +321,6 @@ For Qwen2.5, the chat template in tokenizer_config.json has already included sup
 
 Flags: `--tool-call-parser hermes`
 
-### MiniMax Models (`minimax_m1`)
-
-Supported models:
-
-* `MiniMaxAi/MiniMax-M1-40k` (use with [examples/tool_chat_template_minimax_m1.jinja](../../examples/tool_chat_template_minimax_m1.jinja))
-* `MiniMaxAi/MiniMax-M1-80k` (use with [examples/tool_chat_template_minimax_m1.jinja](../../examples/tool_chat_template_minimax_m1.jinja))
-
-Flags: `--tool-call-parser minimax --chat-template examples/tool_chat_template_minimax_m1.jinja`
-
 ### DeepSeek-V3 Models (`deepseek_v3`)
 
 Supported models:
@@ -347,7 +338,7 @@ Supported models:
 
 Flags: `--tool-call-parser deepseek_v31 --chat-template {see_above}`
 
-### OpenAI OSS Models ('openai`)
+### OpenAI OSS Models (`openai`)
 
 Supported models:
 
@@ -375,15 +366,16 @@ Flags:
 * For non-reasoning: `--tool-call-parser hunyuan_a13b`
 * For reasoning: `--tool-call-parser hunyuan_a13b --reasoning-parser hunyuan_a13b`
 
-### Cohere Command A Reasoning (`cohere_command3`)
+### Cohere Command (`cohere_command3` / `cohere_command4`)
 
 Supported models:
 
-* [`CohereLabs/command-a-reasoning-08-2025`](https://huggingface.co/CohereLabs/command-a-reasoning-08-2025)
+* [`CohereLabs/command-a-reasoning-08-2025`](https://huggingface.co/CohereLabs/command-a-reasoning-08-2025) (`cohere_command3`)
+* [`CohereLabs/command-a-plus-05-2026`](https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16) and [`CohereLabs/North-Mini-Code-1.0`](https://huggingface.co/CohereLabs/North-Mini-Code-1.0) (`cohere_command4`)
 
-Flags: `--tool-call-parser cohere_command3 --reasoning-parser cohere_command3`
+Flags: `--tool-call-parser cohere_command4 --reasoning-parser cohere_command4`.
 
-Note: the Cohere tool parser requires the `cohere_melody` package, which is not installed by default. Before using this parser please install the [cohere_melody](https://pypi.org/project/cohere-melody/) package.
+Note: the Cohere parser requires the `cohere_melody` package, which is not installed by default. Before using this parser please install the [cohere_melody](https://pypi.org/project/cohere-melody/) package.
 
 ### LongCat-Flash-Chat Models (`longcat`)
 

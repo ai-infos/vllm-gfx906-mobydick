@@ -9,13 +9,24 @@ from contextlib import contextmanager
 from typing import Any
 
 
+def redact_sensitive_namespace(
+    args: argparse.Namespace, fields: tuple[str, ...]
+) -> argparse.Namespace:
+    """Return a copy of CLI arguments with selected values redacted."""
+    redacted_args = argparse.Namespace(**vars(args))
+    for field in fields:
+        if getattr(redacted_args, field, None) is not None:
+            setattr(redacted_args, field, "***")
+    return redacted_args
+
+
 def extract_field(
     args: argparse.Namespace, extra_info: dict[str, Any], field_name: str
 ) -> str:
     if field_name in extra_info:
         return extra_info[field_name]
 
-    v = args
+    v: Any = args
     # For example, args.compilation_config.mode
     for nested_field in field_name.split("."):
         if not hasattr(v, nested_field):
@@ -43,7 +54,7 @@ def convert_to_pytorch_benchmark_format(
     on metric per record
     https://github.com/pytorch/pytorch/wiki/How-to-integrate-with-PyTorch-OSS-benchmark-database
     """
-    records = []
+    records: list[Any] = []
     if not os.environ.get("SAVE_TO_PYTORCH_BENCHMARK_FORMAT", False):
         return records
 

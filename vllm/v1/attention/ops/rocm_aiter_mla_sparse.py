@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+from collections.abc import Callable
 from importlib.util import find_spec
 
 import torch
@@ -10,7 +11,9 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
@@ -23,6 +26,157 @@ if current_platform.is_rocm():
 else:
     _ON_GFX942 = False
     _ON_GFX950 = False
+
+logger = init_logger(__name__)
+
+
+@functools.cache
+def _get_aiter_topk_ops() -> tuple[Callable[..., None], Callable[..., None]] | None:
+    try:
+        from aiter.ops.topk import (
+            top_k_per_row_decode,
+            top_k_per_row_prefill,
+        )
+    except ImportError:
+        return None
+    return top_k_per_row_prefill, top_k_per_row_decode
+
+
+@functools.cache
+def _get_aiter_sparse_prefill_opus() -> Callable[..., torch.Tensor] | None:
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_mla_enabled():
+        return None
+    try:
+        from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
+    except ImportError:
+        return None
+    logger.info_once("Using AITER OPUS for large sparse MLA prefill on gfx950")
+    return pa_sparse_prefill_opus
+
+
+_GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 64 * 1024
+_GFX950_C4A_NATIVE_MAX_ROWS = 256
+_GFX950_DSV4_NATIVE_MAX_COLUMNS = 1024 * 1024
+# Conservative perf gate, not a correctness bound: OPUS is correct for any query
+# count, but Triton stays faster below this measured crossover.
+_GFX950_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES = 1024
+
+
+def _get_aiter_top_k_kernel(
+    *,
+    is_prefill: bool,
+    compress_ratio: int,
+    num_rows: int,
+    max_valid_seq_len: int | None = None,
+    num_columns: int | None = None,
+    topk_tokens: int = 1024,
+    on_gfx950: bool = _ON_GFX950,
+) -> Callable[..., None] | None:
+    if compress_ratio <= 1 or not on_gfx950:
+        return None
+
+    if not is_prefill:
+        assert max_valid_seq_len is not None
+        if (
+            topk_tokens == 512
+            and 0 < num_rows <= 384
+            and num_columns is not None
+            and num_columns <= _GFX950_DSV4_NATIVE_MAX_COLUMNS
+        ):
+            return None
+        # AITER v0.1.19 decode is one-block only. This measured gfx950
+        # FP32/k=1024 compressed-row boundary is independent of the native
+        # split-count boundary in sampler.cu.
+        if (
+            num_rows <= _GFX950_C4A_NATIVE_MAX_ROWS
+            and max_valid_seq_len > _GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN
+        ):
+            return None
+
+    topk_ops = _get_aiter_topk_ops()
+    if topk_ops is None:
+        return None
+    return topk_ops[0] if is_prefill else topk_ops[1]
+
+
+@triton.jit
+def _localize_aiter_prefill_topk_kernel(
+    indices_ptr,
+    row_starts_ptr,
+    indices_stride,
+    num_topk,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_topk
+    indices = tl.load(indices_ptr + row_idx * indices_stride + offsets, mask=mask)
+    row_start = tl.load(row_starts_ptr + row_idx)
+    localized = tl.where(indices < 0, indices, indices - row_start)
+    tl.store(
+        indices_ptr + row_idx * indices_stride + offsets,
+        localized,
+        mask=mask,
+    )
+
+
+def _localize_aiter_prefill_topk(
+    indices: torch.Tensor,
+    row_starts: torch.Tensor,
+) -> None:
+    num_rows, num_topk = indices.shape
+    block_size = 256
+    _localize_aiter_prefill_topk_kernel[(num_rows, triton.cdiv(num_topk, block_size))](
+        indices,
+        row_starts,
+        indices.stride(0),
+        num_topk,
+        BLOCK_SIZE=block_size,
+    )
+
+
+def _launch_aiter_top_k_per_row_prefill(
+    top_k_per_row_prefill: Callable[..., None],
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        None,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        k=topk_tokens,
+    )
+    _localize_aiter_prefill_topk(indices, row_starts)
+
+
+def _launch_aiter_top_k_per_row_decode(
+    top_k_per_row_decode: Callable[..., None],
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens.reshape(-1),
+        indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        k=topk_tokens,
+    )
+
 
 @triton.jit
 def _indexer_k_quant_and_cache_kernel(
@@ -57,7 +211,9 @@ def _indexer_k_quant_and_cache_kernel(
     slot_id = tl.load(slot_mapping_ptr + tid)
     if slot_id < 0:
         return
-    block_id = slot_id // block_size
+    # The packed KV layout makes per-block strides large
+    # enough that block_id * stride can exceed 32-bit range.
+    block_id = (slot_id // block_size).to(tl.int64)
     block_offset = slot_id % block_size
     tile_block_id = block_offset // BLOCK_TILE_SIZE
     tile_block_offset = block_offset % BLOCK_TILE_SIZE
@@ -146,21 +302,102 @@ def _cp_gather_indexer_quant_cache_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
-    NUM_TOKENS: tl.constexpr,
-    NUM_BATCHES: tl.constexpr,
-    BLOCK_TABLE_WIDTH: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
+    num_tokens,
+    num_batches,
+    block_table_width,
+    num_blocks,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, HEAD_DIM)
-    valid_tid = tid < NUM_TOKENS
+    valid_tid = tid < num_tokens
     batch_id = tl.load(token_to_seq_ptr + tid, mask=valid_tid, other=-1)
-    valid_batch = (batch_id >= 0) & (batch_id < NUM_BATCHES)
+    valid_batch = (batch_id >= 0) & (batch_id < num_batches)
     safe_batch_id = tl.where(valid_batch, batch_id, 0)
     batch_start = tl.load(cu_seqlen_ptr + safe_batch_id, mask=valid_batch, other=0)
     batch_end = tl.load(cu_seqlen_ptr + safe_batch_id + 1, mask=valid_batch, other=0)
     batch_offset = tid - batch_start
     valid_token = valid_tid & valid_batch & (tid >= batch_start) & (tid < batch_end)
+    if not valid_token:
+        return
+    block_table_id = batch_offset // block_size
+    block_offset = batch_offset % block_size
+    valid_block_table = (
+        valid_token
+        & (block_table_id >= 0)
+        & (block_table_id < block_table_width)
+        & (block_offset >= 0)
+        & (block_offset < block_size)
+    )
+    safe_block_table_id = tl.where(valid_block_table, block_table_id, 0)
+    block_table_offset = safe_batch_id * block_table_stride + safe_block_table_id
+    block_id = tl.load(
+        block_table_ptr + block_table_offset, mask=valid_block_table, other=-1
+    )
+    valid_block = valid_block_table & (block_id >= 0) & (block_id < num_blocks)
+    # The packed KV layout makes per-block strides large
+    # enough that block_id * stride can exceed 32-bit range.
+    safe_block_id = tl.where(valid_block, block_id, 0).to(tl.int64)
+    safe_block_offset = tl.where(valid_block, block_offset, 0)
+    tiled_block_offset = safe_block_offset % BLOCK_TILE_SIZE
+    if LAYOUT == "SHUFFLE":
+        src_cache_offset = (
+            safe_block_id * kv_cache_stride
+            + (safe_block_offset // BLOCK_TILE_SIZE) * HEAD_DIM * BLOCK_TILE_SIZE
+            + tiled_block_offset * HEAD_TILE_SIZE
+        )
+    else:
+        src_cache_offset = (
+            safe_block_id * kv_cache_stride + safe_block_offset * HEAD_DIM
+        )
+    src_scale_offset = safe_block_id * kv_cache_scale_stride + safe_block_offset
+    dst_offset = tid * HEAD_DIM
+    src_scale_ptr = kv_cache_scale_ptr + src_scale_offset
+    src_cache_ptr = kv_cache_ptr + src_cache_offset
+    dst_k_ptr = k_fp8_ptr + dst_offset
+    scale_val = tl.load(src_scale_ptr, mask=valid_block, other=0.0)
+    tl.store(k_scale_ptr + tid, scale_val)
+    if LAYOUT == "SHUFFLE":
+        tiled_src_offset = (
+            offset // HEAD_TILE_SIZE * HEAD_TILE_SIZE * BLOCK_TILE_SIZE
+            + offset % HEAD_TILE_SIZE
+        )
+    else:
+        tiled_src_offset = offset
+    val = tl.load(src_cache_ptr + tiled_src_offset)
+    tl.store(dst_k_ptr + offset, val, mask=valid_block)
+
+
+@triton.jit(do_not_specialize=["num_batches"])
+def _cp_gather_indexer_quant_cache_gfx950_kernel(
+    kv_cache_ptr,  # [n_blks,blk_size//tile_blk,head_dim//16B,tile_blk,16B]
+    # [n_blks, blk_size, head_dim]
+    kv_cache_scale_ptr,  # [n_blks, blk_size]
+    k_fp8_ptr,  # [num_tokens, head_dim]
+    k_scale_ptr,  # [num_tokens]
+    block_table_ptr,  # [batch_size, block_table_stride]
+    cu_seqlen_ptr,  # [batch_size + 1]
+    token_to_seq_ptr,  # [num_tokens]
+    block_size,
+    block_table_stride,
+    kv_cache_stride,
+    kv_cache_scale_stride,
+    LAYOUT: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_TILE_SIZE: tl.constexpr,
+    HEAD_TILE_SIZE: tl.constexpr,
+    num_batches,
+    BLOCK_TABLE_WIDTH: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    tid = tl.program_id(0)
+    offset = tl.arange(0, HEAD_DIM)
+    batch_id = tl.load(token_to_seq_ptr + tid)
+    valid_batch = (batch_id >= 0) & (batch_id < num_batches)
+    safe_batch_id = tl.where(valid_batch, batch_id, 0)
+    batch_start = tl.load(cu_seqlen_ptr + safe_batch_id, mask=valid_batch, other=0)
+    batch_end = tl.load(cu_seqlen_ptr + safe_batch_id + 1, mask=valid_batch, other=0)
+    batch_offset = tid - batch_start
+    valid_token = valid_batch & (tid >= batch_start) & (tid < batch_end)
     if not valid_token:
         return
     block_table_id = batch_offset // block_size
@@ -178,7 +415,9 @@ def _cp_gather_indexer_quant_cache_kernel(
         block_table_ptr + block_table_offset, mask=valid_block_table, other=-1
     )
     valid_block = valid_block_table & (block_id >= 0) & (block_id < NUM_BLOCKS)
-    safe_block_id = tl.where(valid_block, block_id, 0)
+    # The packed KV layout makes per-block strides large
+    # enough that block_id * stride can exceed 32-bit range.
+    safe_block_id = tl.where(valid_block, block_id, 0).to(tl.int64)
     safe_block_offset = tl.where(valid_block, block_offset, 0)
     tiled_block_offset = safe_block_offset % BLOCK_TILE_SIZE
     if LAYOUT == "SHUFFLE":
@@ -232,7 +471,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
-    _cp_gather_indexer_quant_cache_kernel[grid](
+    kernel_args = (
         k_cache_value,
         k_cache_scale,
         k_fp8,
@@ -248,276 +487,22 @@ def cp_gather_indexer_k_quant_cache_triton(
         head_dim,
         block_tile_size,
         head_tile_size,
-        num_tokens,
-        cu_seqlen.shape[0] - 1,
-        block_table.shape[1],
-        num_blocks,
     )
-
-
-@triton.jit
-def _deepgemm_fp16_paged_mqa_logits_stage1(
-    # Dimensions
-    batch_size, next_n,
-    # Q: [Batch, NextN, Heads, Dim] FP16
-    Q_buffer,
-    stride_q_batch: tl.int64, stride_q_next_n: tl.int64,
-    stride_q_heads: tl.int64, stride_q_dim: tl.int64,
-    # KV: [NumBlocks, BlockSize, 1, Dim] FP16
-    KV_buffer,
-    stride_kv_blk: tl.int64,   # stride(0): jump to next physical block
-    stride_kv_tok: tl.int64,   # stride(1): jump to next token in block
-    # Runtime data
-    context_len_ptr,            # [Batch] int32
-    block_table,                # [Batch, MaxNumBlocks] int32
-    weights,                    # [Batch*NextN, Heads] FP32
-    stride_w_row: tl.int64,    # weights.stride(0)
-    # Output: [Batch*NextN, max_model_len] FP32 (head-reduced!)
-    Out_buffer,
-    stride_out_row: tl.int64,  # output.stride(0)
-    # Sizes
-    max_num_blocks,
-    # Compile-time constants
-    NUM_HEADS: tl.constexpr,    # 64
-    BLOCK_D: tl.constexpr,      # 64 (D-chunk size)
-    HEAD_DIM: tl.constexpr,     # 128
-    CHUNK_K: tl.constexpr,      # 64 (= BlockSize)
-):
-    """
-    Optimized decode kernel with in-kernel head reduction.
-    Each program handles ONE (batch_item, kv_block) pair and processes ALL
-    heads internally using HEAD_GROUP=8. Output is already head-reduced.
-    Grid: (num_kv_blocks_max, batch_size * next_n)
-    """
-    pid_kv_block = tl.program_id(0)   # which logical KV block
-    pid_bn = tl.program_id(1)         # which (batch, next_n) element
-
-    pid_batch = pid_bn // next_n
-    pid_next_n = pid_bn % next_n
-
-    # Load context length for this batch element
-    context_length = tl.load(context_len_ptr + pid_batch)
-
-    # How many KV blocks does this sequence actually have?
-    num_kv_blocks = tl.cdiv(context_length, CHUNK_K)
-
-    # Early exit: this program's KV block is beyond the sequence length
-    if pid_kv_block >= num_kv_blocks:
-        return
-
-    # Compute token offset for this block
-    context_idx = pid_kv_block * CHUNK_K
-
-    # Load physical block ID from block table
-    physical_block_id = tl.load(
-        block_table + pid_batch * max_num_blocks + pid_kv_block
-    )
-
-    # KV validity mask (last block may be partial)
-    kv_offsets = tl.arange(0, CHUNK_K)
-    mask_kv = (context_idx + kv_offsets) < context_length
-
-    # Causal mask: kv_pos <= query_pos
-    causal_mask = (
-        (context_idx + kv_offsets) <= (context_length - next_n + pid_next_n)
-    )
-    combined_mask = mask_kv & causal_mask
-
-    # Accumulator for the head-reduced output: [CHUNK_K] in FP32
-    acc = tl.zeros([CHUNK_K], dtype=tl.float32)
-
-    # D-range for chunked loading
-    d_range = tl.arange(0, BLOCK_D)
-
-    # Base pointer for Q for this (batch, next_n) element
-    q_base = (Q_buffer
-              + pid_batch * stride_q_batch
-              + pid_next_n * stride_q_next_n)
-
-    # Base pointer for weights for this (batch, next_n) element
-    w_base = weights + (pid_batch * next_n + pid_next_n) * stride_w_row
-
-    # Process heads in groups of 8 - load KV once per D-chunk, reuse for 8
-    for hg_start in range(0, NUM_HEADS, 8):
-        # Per-head score accumulators: [CHUNK_K] each
-        s0 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s1 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s2 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s3 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s4 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s5 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s6 = tl.zeros([CHUNK_K], dtype=tl.float32)
-        s7 = tl.zeros([CHUNK_K], dtype=tl.float32)
-
-        # D-chunked dot product
-        for d_start in range(0, HEAD_DIM, BLOCK_D):
-            d_offs = d_start + d_range
-
-            # Load KV chunk: [CHUNK_K, BLOCK_D] - ONCE, reused for 8 heads
-            kv_ptrs = (KV_buffer
-                       + physical_block_id * stride_kv_blk
-                       + kv_offsets[:, None] * stride_kv_tok
-                       + d_offs[None, :])
-            kv_tile = tl.load(
-                kv_ptrs, mask=mask_kv[:, None], other=0.0
-            )  # [CHUNK_K, BLOCK_D]
-
-            # Load Q for each of 8 heads: [BLOCK_D] per head (decode=1 token)
-            q0 = tl.load(q_base + (hg_start + 0) * stride_q_heads + d_offs)
-            q1 = tl.load(q_base + (hg_start + 1) * stride_q_heads + d_offs)
-            q2 = tl.load(q_base + (hg_start + 2) * stride_q_heads + d_offs)
-            q3 = tl.load(q_base + (hg_start + 3) * stride_q_heads + d_offs)
-            q4 = tl.load(q_base + (hg_start + 4) * stride_q_heads + d_offs)
-            q5 = tl.load(q_base + (hg_start + 5) * stride_q_heads + d_offs)
-            q6 = tl.load(q_base + (hg_start + 6) * stride_q_heads + d_offs)
-            q7 = tl.load(q_base + (hg_start + 7) * stride_q_heads + d_offs)
-
-            # Dot products: kv_tile[CHUNK_K, BLOCK_D] * q[BLOCK_D] ? [CHUNK_K]
-            s0 += tl.sum(
-                kv_tile * q0[None, :].to(kv_tile.dtype), axis=1
-            )
-            s1 += tl.sum(
-                kv_tile * q1[None, :].to(kv_tile.dtype), axis=1
-            )
-            s2 += tl.sum(
-                kv_tile * q2[None, :].to(kv_tile.dtype), axis=1
-            )
-            s3 += tl.sum(
-                kv_tile * q3[None, :].to(kv_tile.dtype), axis=1
-            )
-            s4 += tl.sum(
-                kv_tile * q4[None, :].to(kv_tile.dtype), axis=1
-            )
-            s5 += tl.sum(
-                kv_tile * q5[None, :].to(kv_tile.dtype), axis=1
-            )
-            s6 += tl.sum(
-                kv_tile * q6[None, :].to(kv_tile.dtype), axis=1
-            )
-            s7 += tl.sum(
-                kv_tile * q7[None, :].to(kv_tile.dtype), axis=1
-            )
-
-        # ReLU + weight multiply + accumulate for all 8 heads
-        w0 = tl.load(w_base + (hg_start + 0))
-        w1 = tl.load(w_base + (hg_start + 1))
-        w2 = tl.load(w_base + (hg_start + 2))
-        w3 = tl.load(w_base + (hg_start + 3))
-        w4 = tl.load(w_base + (hg_start + 4))
-        w5 = tl.load(w_base + (hg_start + 5))
-        w6 = tl.load(w_base + (hg_start + 6))
-        w7 = tl.load(w_base + (hg_start + 7))
-
-        acc += tl.maximum(s0, 0.0) * w0
-        acc += tl.maximum(s1, 0.0) * w1
-        acc += tl.maximum(s2, 0.0) * w2
-        acc += tl.maximum(s3, 0.0) * w3
-        acc += tl.maximum(s4, 0.0) * w4
-        acc += tl.maximum(s5, 0.0) * w5
-        acc += tl.maximum(s6, 0.0) * w6
-        acc += tl.maximum(s7, 0.0) * w7
-
-    # Apply causal mask
-    acc = tl.where(combined_mask, acc, float("-inf"))
-
-    # Store output: [CHUNK_K] ? output[pid_bn, context_idx:context_idx+CHUNK_K]
-    out_ptrs = (Out_buffer
-                + (pid_batch * next_n + pid_next_n) * stride_out_row
-                + context_idx + kv_offsets)
-    tl.store(out_ptrs, acc, mask=mask_kv)
-
-
-# Optimized decode kernel v2: in-kernel head reduction + D-chunking + 2D grid
-def deepgemm_fp16_paged_mqa_logits_stage1(
-    q: torch.Tensor,           # [Batch, NextN, Heads, Dim] (--dtype)
-    kv_cache: torch.Tensor,    # [NumBlocks, BlockSize, 1, Dim] (FP16)
-    weights: torch.Tensor,     # [Batch * NextN, Heads] (FP32)
-    out_qk: torch.Tensor,      # Output: [Batch*NextN, max_model_len] FP32
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor, # [Batch, MaxNumBlocks] int32
-    max_model_len: int,
-    # MI50 TUNED DEFAULTS:
-    num_warps: int = 4,         # Sweet spot for register usage on gfx906.
-    num_stages: int = 1,        # Essential for stability (avoids LDS crashes)
-    BLOCK_D: int = 32,          # D-chunk size; 32 is optimal on MI50 gfx906
-):
-    block_size = kv_cache.size(1)
-    assert block_size == 64, (
-        f"Kernel requires BlockSize ({block_size}) == 64"
-    )
-
-    batch_size, next_n, heads, hidden_dim = q.size()
-    _, max_num_blocks = block_tables.size()
-
-    assert heads % 8 == 0, f"NUM_HEADS ({heads}) must be divisible by 8"
-
-    # Grid: (max_kv_blocks, batch_size * next_n)
-    grid = (max_num_blocks, batch_size * next_n)
-
-    _deepgemm_fp16_paged_mqa_logits_stage1[grid](
-        batch_size, next_n,
-        q,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        kv_cache,
-        kv_cache.stride(0), kv_cache.stride(1),
-        context_lens,
-        block_tables,
-        weights,
-        weights.stride(0),
-        out_qk,
-        out_qk.stride(0),
-        max_num_blocks,
-        NUM_HEADS=heads,
-        BLOCK_D=BLOCK_D,
-        HEAD_DIM=hidden_dim,
-        CHUNK_K=block_size,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-
-
-# Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
-def fp16_paged_mqa_logits_torch(
-    q: torch.Tensor, # --dtype
-    kv_cache: torch.Tensor, # fp16
-    weights: torch.Tensor, # fp32
-    context_lens: torch.Tensor, # int32
-    block_tables: torch.Tensor, # int32
-    max_model_len: int,
-):
-
-    batch_size, next_n, heads, dim = q.size()
-    num_block, block_size, _, dim = kv_cache.size()
-    logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
-    context_lens = context_lens.tolist()
-    
-    is_context_lens_2d = False # assumed to never be 2d
-   
-    for i in range(batch_size):
-        context_len = context_lens[i]
-        q_offsets = torch.full((next_n, ), context_len, device='cuda', dtype=torch.int32) if is_context_lens_2d \
-                    else torch.arange(context_len - next_n, context_len, device='cuda')
-        
-        weight_slice = (
-            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+    if _ON_GFX950:
+        _cp_gather_indexer_quant_cache_gfx950_kernel[grid](
+            *kernel_args,
+            cu_seqlen.shape[0] - 1,
+            block_table.shape[1],
+            num_blocks,
         )
-        
-        num_blocks = (context_len + block_size - 1) // block_size
-        block_idxs = block_tables[i][:num_blocks]
-        kv_slice = kv_cache[block_idxs]                 # [num_blocks, block_size, kv_heads, dim]
-        kx = kv_slice.permute(2, 3, 0, 1).reshape(kv_slice.size(2), dim, -1)    # [kv_heads, dim, total_tokens]
-        qx = q[i].transpose(0, 1)                       # q[i]: [next_n, heads, dim] -> [heads, next_n, dim]
-        s = torch.matmul(qx.to(torch.float16) if qx.dtype == torch.float32 else qx, kx).float()       # [heads, next_n, dim] @ [1, dim, total_tokens] -> [heads, next_n, total_tokens] in fp32 here
-
-        total_len = num_blocks * block_size
-        k_offsets = torch.arange(0, total_len, device=q.device)
-        mask = (k_offsets[None, :] < context_len) & (k_offsets[None, :] <= q_offsets[:, None])
-        s = torch.where(mask[None, :, :], s, float('-inf'))     # mask shape: [1, next_n, total_tokens]
-        s = torch.relu(s) * weight_slice[..., None]             # weight_slice: [heads, next_n] -> [heads, next_n, 1]
-        s = s.sum(dim=0)                                        # [next_n, total_tokens]
-        logits[i * next_n:(i + 1) * next_n, :total_len] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float('-inf'))
-
-    return logits
+    else:
+        _cp_gather_indexer_quant_cache_kernel[grid](
+            *kernel_args,
+            num_tokens,
+            cu_seqlen.shape[0] - 1,
+            block_table.shape[1],
+            num_blocks,
+        )
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
@@ -640,9 +625,9 @@ def paged_mqa_logits_module():
     return None
 
 
-def rocm_paged_mqa_logits(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
+def rocm_fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
@@ -652,12 +637,11 @@ def rocm_paged_mqa_logits(
     """Compute FP8 MQA logits using paged KV-cache.
 
     Args:
-        q: Query tensor of shape [B, next_n, H, D]. Casted to
-            `torch.float8_e4m3fn` by caller, or --dtype fp16/fp32.
-        kv_cache: Paged KV-cache in packed FP8+scale layout with shape
+        q_fp8: Query tensor of shape [B, next_n, H, D]. Casted to
+            `torch.float8_e4m3fn` by caller.
+        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
             [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. The last
             4 bytes per (block,pos) store the `float` dequant scale.
-            Or FP16 : [num_blocks, block_size, 1, D].
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
         context_lens: Tensor of shape [B], dtype int32; effective context length
             for each batch element.
@@ -671,14 +655,14 @@ def rocm_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    batch_size, next_n, heads, _ = q.shape
     from vllm._aiter_ops import rocm_aiter_ops
 
     aiter_paged_mqa_logits_module = None
     # if rocm_aiter_ops.is_enabled():
-    block_size = kv_cache.shape[1]
+    batch_size, next_n = q_fp8.shape[:2]
+    block_size = kv_cache_fp8.shape[1]
 
-    if rocm_aiter_ops.is_enabled():
+    if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
@@ -686,13 +670,13 @@ def rocm_paged_mqa_logits(
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
+            batch_size, next_n, heads, _ = q_fp8.shape
             (out_logits,) = current_workspace_manager().get_simultaneous(
                 ((batch_size * next_n, max_model_len), torch.float32),
             )
-            out_logits.fill_(float("-inf"))
             deepgemm_fp8_paged_mqa_logits(
-                q,
-                kv_cache,
+                q_fp8,
+                kv_cache_fp8,
                 weights,
                 out_logits,
                 context_lens,
@@ -704,49 +688,17 @@ def rocm_paged_mqa_logits(
                 WavePerEU=2,
             )
             return out_logits
-    
-    if envs.VLLM_ROCM_MLA_SPARSE_FP16_TRITON:
-        # Output is already head-reduced: [B*N, max_model_len]
-        out_qk = torch.full(
-            (batch_size * next_n, max_model_len),
-            float("-inf"),
-            device="cuda",
-            dtype=torch.float32,
-        )
-        deepgemm_fp16_paged_mqa_logits_stage1(
-            q,
-            kv_cache,
-            weights,
-            out_qk,
-            context_lens,
-            block_tables,
-            max_model_len,
-        )
-        return out_qk
-    elif envs.VLLM_ROCM_MLA_SPARSE_FP16:
-        return fp16_paged_mqa_logits_torch(q, kv_cache, weights, context_lens, block_tables, max_model_len)
-
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    aiter_paged_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
-        aiter_paged_mqa_logits_module = paged_mqa_logits_module()
-
-    if aiter_paged_mqa_logits_module is not None:
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
-        out_qk = torch.full(
-            (heads, batch_size * next_n, max_model_len),
-            float("-inf"),
-            device="cuda",
-            dtype=torch.float32,
+        batch_size, next_n, heads, _ = q_fp8.shape
+        (out_qk,) = current_workspace_manager().get_simultaneous(
+            ((heads, batch_size * next_n, max_model_len), torch.float32),
         )
-        # TODO: 1. Replace _stage1 and out_qk.sum with another fused variant;
-        #       2. Remove ChunkQ when AITER PR #2891 merged
+        out_qk.fill_(float("-inf"))
         deepgemm_fp8_paged_mqa_logits_stage1(
-            q,
-            kv_cache,
+            q_fp8,
+            kv_cache_fp8,
             weights,
             out_qk,
             context_lens,
@@ -757,369 +709,7 @@ def rocm_paged_mqa_logits(
         return out_qk.sum(dim=0)
     else:
         return fp8_paged_mqa_logits_torch(
-            q, kv_cache, weights, context_lens, block_tables, max_model_len
-        )
-
-# Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
-def fp16_mqa_logits_torch(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-) -> torch.Tensor:
-    """Compute MQA logits for a single sequence without KV paging.
-
-    Args:
-        q: Query tensor of shape [M, H, D]. --dtype
-        kv: `kv` has shape [N, D] with dtype `torch.float16` 
-        weights: weights of shape [M, H], dtype `torch.float32`.
-        cu_seqlen_ks: Start indices (inclusive) for valid K per query position,
-            shape [M], dtype int32.
-        cu_seqlen_ke: End indices (exclusive) for valid K per query position,
-            shape [M], dtype int32.
-
-    Returns:
-        Logits tensor of shape [M, N], dtype `torch.float32`.
-    """
-    if q.dtype != torch.float16:
-        q = q.half()
-    
-    seq_len_kv = kv.shape[0]
-    num_q, num_heads, _ = q.shape
-
-
-    # 1. Pre-allocate output
-    final_logits = torch.full(
-        (num_q, seq_len_kv), 
-        float("-inf"), 
-        device=q.device, 
-        dtype=torch.float32
-    )
-
-    # 2. Prepare Mask (Broadcasting later)
-    mask_lo = (torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None])
-    mask_hi = (torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None])
-    mask = mask_lo & mask_hi
-
-    # Accumulator
-    weighted_sum = torch.zeros((num_q, seq_len_kv), device=q.device, dtype=torch.float32)
-
-    # Permute for easier slicing: [H, M, D]
-    q_per_head = q.permute(1, 0, 2) 
-    weights_per_head = weights.t() # [H, M]
-    k_t = kv.t() # [D, N]
-
-    # 3. Chunked Loop
-    # 4 (VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE) * 512 tokens (batch size) * 2 (peak factor) * 32k (max context) * 4 bytes (fp32) ~= 0.5 GB memory peak / GPU.
-    # num_heads = 128 for Deepseek V3.2 , so 32 (=128/4) loop iterations if VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE = 4
-
-    for i in range(0, num_heads, envs.VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE):
-        end = min(i + envs.VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE, num_heads)
-        
-        # Slice the chunk: Shape [Chunk_Size, M, D]
-        q_chunk = q_per_head[i:end] 
-        w_chunk = weights_per_head[i:end].unsqueeze(-1) # [Chunk, M, 1]
-
-        # Matmul: [Chunk, M, D] @ [D, N] -> [Chunk, M, N]
-        # This is the heavy lifting.
-        score_chunk = torch.matmul(q_chunk, k_t).float()
-        score_chunk = torch.relu(score_chunk)
-        
-        # Weighted sum: Sum over the chunk dimension (dim 0)
-        # [Chunk, M, N] * [Chunk, M, 1] -> [Chunk, M, N] -> Sum -> [M, N]
-        chunk_sum = (score_chunk * w_chunk).sum(dim=0)
-        weighted_sum.add_(chunk_sum)
-        
-        # Free tensor immediately to reduce memory pressure before next chunk
-        del score_chunk
-        del chunk_sum
-
-    # 4. Final Masking
-    final_logits = torch.where(mask, weighted_sum, final_logits)
-    return final_logits
-
-
-# ============================================================================
-# Triton FP16 MQA Logits Kernels (optimized for MI50 gfx906)
-# Activated by: VLLM_ROCM_MLA_SPARSE_FP16_TRITON=1
-#
-# v2: Basic 2D grid + D-chunking. Best for small KV (e.g. 18000/10).
-# v4: HEAD_GROUP=8 - loads KV once per 8 heads. Best for standard/large.
-# Auto-dispatcher picks the best variant based on seq_len_kv.
-# ============================================================================
-
-
-@triton.jit
-def _fp16_mqa_logits_v2_kernel(
-    Q_ptr, KV_ptr, weights_ptr, cu_start_ptr, cu_end_ptr, logits_ptr,
-    seq_len, seq_len_kv,
-    NUM_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,
-    stride_q_s: tl.int64, stride_q_h: tl.constexpr, stride_q_d: tl.constexpr,
-    stride_kv_s: tl.int64, stride_kv_d: tl.constexpr,
-    stride_w_s: tl.int64, stride_w_h: tl.constexpr,
-    stride_logits_s: tl.int64, stride_logits_k: tl.int64,
-    BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    """2D-parallel kernel: each program handles one (Q_block, KV_block) tile.
-    Inner loops: heads * D-chunks. Best for small KV dimensions."""
-    pid_q = tl.program_id(0)
-    pid_kv = tl.program_id(1)
-    start_q = pid_q * BLOCK_Q
-    start_kv = pid_kv * BLOCK_KV
-
-    offs_q = start_q + tl.arange(0, BLOCK_Q)
-    offs_kv = start_kv + tl.arange(0, BLOCK_KV)
-    mask_q = offs_q < seq_len
-    mask_kv = offs_kv < seq_len_kv
-
-    qs_starts = tl.load(cu_start_ptr + offs_q, mask=mask_q, other=0)
-    qs_ends = tl.load(cu_end_ptr + offs_q, mask=mask_q, other=0)
-
-    max_end = tl.max(qs_ends, axis=0)
-    min_start = tl.min(qs_starts, axis=0)
-    if start_kv >= max_end or start_kv + BLOCK_KV <= min_start:
-        return
-
-    acc = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-    d_range = tl.arange(0, BLOCK_D)
-
-    for h in range(NUM_HEADS):
-        score = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        for d_start in range(0, HEAD_SIZE, BLOCK_D):
-            d_offs = d_start + d_range
-            q_ptrs = (Q_ptr + offs_q[:, None] * stride_q_s
-                      + h * stride_q_h + d_offs[None, :] * stride_q_d)
-            q_tile = tl.load(q_ptrs, mask=mask_q[:, None], other=0.0)
-
-            kv_ptrs = (KV_ptr + offs_kv[:, None] * stride_kv_s
-                       + d_offs[None, :] * stride_kv_d)
-            kv_tile = tl.load(kv_ptrs, mask=mask_kv[:, None], other=0.0)
-
-            score = tl.dot(q_tile, tl.trans(kv_tile), acc=score)
-
-        score = tl.maximum(score, 0.0)
-        w = tl.load(weights_ptr + offs_q * stride_w_s + h * stride_w_h,
-                    mask=mask_q, other=0.0)
-        acc += score * w[:, None]
-
-    in_window = ((offs_kv[None, :] >= qs_starts[:, None]) &
-                 (offs_kv[None, :] < qs_ends[:, None]))
-    logits_ptrs = (logits_ptr + offs_q[:, None] * stride_logits_s
-                   + offs_kv[None, :] * stride_logits_k)
-    final_mask = mask_q[:, None] & mask_kv[None, :] & in_window
-    tl.store(logits_ptrs, acc, mask=final_mask)
-
-
-@triton.jit
-def _fp16_mqa_logits_v4_kernel(
-    Q_ptr, KV_ptr, weights_ptr, cu_start_ptr, cu_end_ptr, logits_ptr,
-    seq_len, seq_len_kv,
-    NUM_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,
-    stride_q_s: tl.int64, stride_q_h: tl.constexpr, stride_q_d: tl.constexpr,
-    stride_kv_s: tl.int64, stride_kv_d: tl.constexpr,
-    stride_w_s: tl.int64, stride_w_h: tl.constexpr,
-    stride_logits_s: tl.int64, stride_logits_k: tl.int64,
-    BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr, BLOCK_D: tl.constexpr,
-):
-    """2D-parallel kernel with HEAD_GROUP=8: loads KV once per 8 heads.
-    Best for standard/large configs. Requires NUM_HEADS % 8 == 0."""
-    pid_q = tl.program_id(0)
-    pid_kv = tl.program_id(1)
-    start_q = pid_q * BLOCK_Q
-    start_kv = pid_kv * BLOCK_KV
-
-    offs_q = start_q + tl.arange(0, BLOCK_Q)
-    offs_kv = start_kv + tl.arange(0, BLOCK_KV)
-    mask_q = offs_q < seq_len
-    mask_kv = offs_kv < seq_len_kv
-
-    qs_starts = tl.load(cu_start_ptr + offs_q, mask=mask_q, other=0)
-    qs_ends = tl.load(cu_end_ptr + offs_q, mask=mask_q, other=0)
-
-    max_end = tl.max(qs_ends, axis=0)
-    min_start = tl.min(qs_starts, axis=0)
-    if start_kv >= max_end or start_kv + BLOCK_KV <= min_start:
-        return
-
-    acc = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-    d_range = tl.arange(0, BLOCK_D)
-
-    # Process 8 heads per KV load cycle
-    for hg_start in range(0, NUM_HEADS, 8):
-        s0 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s1 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s2 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s3 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s4 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s5 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s6 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-        s7 = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-
-        for d_start in range(0, HEAD_SIZE, BLOCK_D):
-            d_offs = d_start + d_range
-
-            # Load KV ONCE per D-chunk (shared across 8 heads)
-            kv_ptrs = (KV_ptr + offs_kv[:, None] * stride_kv_s
-                       + d_offs[None, :] * stride_kv_d)
-            kv_tile = tl.load(kv_ptrs, mask=mask_kv[:, None], other=0.0)
-            kv_t = tl.trans(kv_tile)
-
-            # 8 Q loads + dot products
-            q_base = (Q_ptr + offs_q[:, None] * stride_q_s
-                      + d_offs[None, :] * stride_q_d)
-
-            q0 = tl.load(q_base + (hg_start + 0) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s0 = tl.dot(q0, kv_t, acc=s0)
-
-            q1 = tl.load(q_base + (hg_start + 1) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s1 = tl.dot(q1, kv_t, acc=s1)
-
-            q2 = tl.load(q_base + (hg_start + 2) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s2 = tl.dot(q2, kv_t, acc=s2)
-
-            q3 = tl.load(q_base + (hg_start + 3) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s3 = tl.dot(q3, kv_t, acc=s3)
-
-            q4 = tl.load(q_base + (hg_start + 4) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s4 = tl.dot(q4, kv_t, acc=s4)
-
-            q5 = tl.load(q_base + (hg_start + 5) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s5 = tl.dot(q5, kv_t, acc=s5)
-
-            q6 = tl.load(q_base + (hg_start + 6) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s6 = tl.dot(q6, kv_t, acc=s6)
-
-            q7 = tl.load(q_base + (hg_start + 7) * stride_q_h,
-                         mask=mask_q[:, None], other=0.0)
-            s7 = tl.dot(q7, kv_t, acc=s7)
-
-        # ReLU + weighted accumulate for all 8 heads
-        w_base = weights_ptr + offs_q * stride_w_s
-
-        s0 = tl.maximum(s0, 0.0)
-        w0 = tl.load(w_base + (hg_start + 0) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s0 * w0[:, None]
-
-        s1 = tl.maximum(s1, 0.0)
-        w1 = tl.load(w_base + (hg_start + 1) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s1 * w1[:, None]
-
-        s2 = tl.maximum(s2, 0.0)
-        w2 = tl.load(w_base + (hg_start + 2) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s2 * w2[:, None]
-
-        s3 = tl.maximum(s3, 0.0)
-        w3 = tl.load(w_base + (hg_start + 3) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s3 * w3[:, None]
-
-        s4 = tl.maximum(s4, 0.0)
-        w4 = tl.load(w_base + (hg_start + 4) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s4 * w4[:, None]
-
-        s5 = tl.maximum(s5, 0.0)
-        w5 = tl.load(w_base + (hg_start + 5) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s5 * w5[:, None]
-
-        s6 = tl.maximum(s6, 0.0)
-        w6 = tl.load(w_base + (hg_start + 6) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s6 * w6[:, None]
-
-        s7 = tl.maximum(s7, 0.0)
-        w7 = tl.load(w_base + (hg_start + 7) * stride_w_h,
-                     mask=mask_q, other=0.0)
-        acc += s7 * w7[:, None]
-
-    # Causal mask + store
-    in_window = ((offs_kv[None, :] >= qs_starts[:, None]) &
-                 (offs_kv[None, :] < qs_ends[:, None]))
-    logits_ptrs = (logits_ptr + offs_q[:, None] * stride_logits_s
-                   + offs_kv[None, :] * stride_logits_k)
-    final_mask = mask_q[:, None] & mask_kv[None, :] & in_window
-    tl.store(logits_ptrs, acc, mask=final_mask)
-
-
-def _launch_fp16_mqa_logits_kernel(kernel, Q, KV, weights, cu_starts, cu_ends,
-                                   BLOCK_Q=32, BLOCK_KV=64, BLOCK_D=64):
-    """Common launcher for fp16 MQA logits Triton kernels."""
-    seq_len, num_heads, head_size = Q.shape
-    seq_len_kv = KV.shape[0]
-
-    logits = torch.full(
-        (seq_len, seq_len_kv), fill_value=-float("inf"),
-        dtype=torch.float32, device=Q.device,
-    )
-
-    grid = (triton.cdiv(seq_len, BLOCK_Q), triton.cdiv(seq_len_kv, BLOCK_KV))
-
-    kernel[grid](
-        Q_ptr=Q, KV_ptr=KV, weights_ptr=weights,
-        cu_start_ptr=cu_starts, cu_end_ptr=cu_ends, logits_ptr=logits,
-        seq_len=seq_len, seq_len_kv=seq_len_kv,
-        NUM_HEADS=num_heads, HEAD_SIZE=head_size,
-        stride_q_s=Q.stride(0), stride_q_h=Q.stride(1),
-        stride_q_d=Q.stride(2),
-        stride_kv_s=KV.stride(0), stride_kv_d=KV.stride(1),
-        stride_w_s=weights.stride(0), stride_w_h=weights.stride(1),
-        stride_logits_s=logits.stride(0), stride_logits_k=logits.stride(1),
-        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
-        num_warps=4, num_stages=1, waves_per_eu=1,
-    )
-    return logits
-
-
-def fp16_mqa_logits_triton(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-) -> torch.Tensor:
-    """Triton FP16 MQA logits with auto-dispatch.
-
-    Uses v2 (basic 2D grid) for small KV, v4 (HEAD_GROUP=8) for standard/large.
-    Up to 2.3x faster than the torch chunked reference on MI50 gfx906.
-
-    Args:
-        q: Query tensor [M, H, D], dtype float16 or float32 (auto-casted).
-        kv: KV tensor [N, D], dtype float16.
-        weights: [M, H], dtype float32.
-        cu_seqlen_ks: Start indices [M], dtype int32.
-        cu_seqlen_ke: End indices [M], dtype int32.
-
-    Returns:
-        Logits [M, N], dtype float32.
-    """
-    if q.dtype != torch.float16:
-        q = q.half()
-
-    seq_len_kv = kv.shape[0]
-    num_heads = q.shape[1]
-
-    # Auto-dispatch: v2 for tiny KV, v4 for everything else
-    if seq_len_kv <= 64 or num_heads % 8 != 0:
-        return _launch_fp16_mqa_logits_kernel(
-            _fp16_mqa_logits_v2_kernel, q, kv, weights,
-            cu_seqlen_ks, cu_seqlen_ke,
-        )
-    else:
-        return _launch_fp16_mqa_logits_kernel(
-            _fp16_mqa_logits_v4_kernel, q, kv, weights,
-            cu_seqlen_ks, cu_seqlen_ke,
+            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )
 
 
@@ -1158,11 +748,17 @@ def fp8_mqa_logits_torch(
         torch.arange(0, seq_len_kv, device=device)[None, :] >= cu_seqlen_ks[:, None]
     )
     mask_hi = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
+        torch.arange(0, seq_len_kv, device=device)[None, :] < cu_seqlen_ke[:, None]
     )
     mask = mask_lo & mask_hi
 
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
+    # ``score`` is [H, M, N]; ``scale`` is the per-KV-token scale, which
+    # vLLM callers hand us as ``[N, 1]`` (a ``[N, 4]`` uint8 buffer cast
+    # to fp32). PyTorch right-aligns dimensions for broadcasting, so a
+    # naked ``score * scale`` would align ``scale``'s leading dim with
+    # ``score``'s M dim and raise a shape mismatch. Flatten to ``[N]`` so
+    # broadcasting lines up with the last dim of ``score``.
+    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     logits = logits.masked_fill(~mask, float("-inf"))
 
@@ -1186,8 +782,7 @@ def mqa_logits_module():
     return None
 
 
-
-def rocm_mqa_logits(
+def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -1198,10 +793,10 @@ def rocm_mqa_logits(
 
     Args:
         q: Query tensor of shape [M, H, D]. Casted to
-            `torch.float8_e4m3fn` by caller, or --dtype fp16/fp32.
+            `torch.float8_e4m3fn` by caller.
         kv: Tuple `(k_fp8, k_scales)` where `k_fp8` has shape [N, D] with
             dtype `torch.float8_e4m3fn` and `k_scales` has shape [N] (or
-            [N, 1]) with dtype `torch.float32`. Or FP16 ([N, D])
+            [N, 1]) with dtype `torch.float32`.
         weights: weights of shape [M, H], dtype `torch.float32`.
         cu_seqlen_ks: Start indices (inclusive) for valid K per query position,
             shape [M], dtype int32.
@@ -1212,67 +807,177 @@ def rocm_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
 
-    if envs.VLLM_ROCM_MLA_SPARSE_FP16:
-        if envs.VLLM_ROCM_MLA_SPARSE_FP16_TRITON:
-            # Triton kernel: 2D grid + D-chunking + HEAD_GROUP=8
-            # Up to 2.3x faster than torch, uses much less VRAM
-            return fp16_mqa_logits_triton(
-                q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
-        return fp16_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
-
-    # TODO(ganyi): Temporarily workaround, will remove the module check and reference
-    # path after aiter merge this kernel into main
     from vllm._aiter_ops import rocm_aiter_ops
 
+    k_fp8, scale = kv
+
+    if _ON_GFX942 and rocm_aiter_ops.is_enabled():
+        from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+
+        return flydsl_fp8_mqa_logits(
+            q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
+
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
         aiter_mqa_logits_module = mqa_logits_module()
 
     if aiter_mqa_logits_module is not None:
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
-        k_fp8, scale = kv
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
     else:
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
-def _topk_indices_torch(
+# Programs along the column axis of the decode mask grid. The shared kernel in
+# model_executor/kernels/attention/dsa/candidate_blocks.py launches one program
+# per 1024-column tile, which is 1024 of them per row at max_model_len 1048576
+# with only the first few doing work. This is a fixed count that strides
+# instead, measured on gfx950; it is not a portable choice, which is why this
+# variant lives here rather than replacing the shared one.
+_MASK_GRID_COLS = 128
+# Columns each program handles per iteration. Work stops at the tile boundary
+# containing a row's end rather than at the end itself; the overshoot is
+# masked the same way the shared kernel masks it, so it costs a tile and
+# changes nothing.
+_MASK_TILE = 1024
+
+
+@triton.jit(do_not_specialize=["width", "nblocks"])
+def _mask_candidates_strided_kernel(
+    logits,
+    starts,
+    ends,
+    flags,
+    stride_row,
+    stride_col,
+    stride_start,
+    stride_end,
+    width,
+    nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
+    step = tl.num_programs(1) * TILE
+    tile_start = tl.program_id(1) * TILE
+    # The shared kernel also sanitizes columns at or past `end`. Nothing reads
+    # them: top_k_per_row_decode bounds its scan by the same row ends passed
+    # here, and persistent_topk/cooperative_topk clamp by the same lengths.
+    # Stopping at `end` is what makes the cost track the live context rather
+    # than max_model_len.
+    while tile_start < end:
+        cols = tile_start + tl.arange(0, TILE)
+        valid = (cols >= start) & (cols < end) & (cols < width)
+        block = (cols - start) // BLOCK_SIZE
+        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+        tl.store(
+            logits + row * stride_row + cols * stride_col,
+            -float("inf"),
+            (cols < width) & ~(valid & keep),
+        )
+        tile_start += step
+
+
+def _apply_candidate_mask_strided(
     logits: torch.Tensor,
-    topk_tokens: int,
-    row_starts: torch.Tensor | None = None,
-) -> torch.Tensor:
-    k = min(topk_tokens, logits.shape[-1])
-    values, indices = torch.topk(logits, k=k, dim=-1)
-    indices = indices.to(torch.int32)
-    indices = torch.where(
-        values == float("-inf"),
-        torch.full_like(indices, -1, dtype=torch.int32),
-        indices,
+    row_ks: torch.Tensor | None,
+    row_ke: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    block_size: int,
+    row_repeat: int = 1,
+) -> None:
+    """ROCm decode variant of ``apply_candidate_mask``.
+
+    Same masking semantics over ``[0, end)``, but the grid is sized by a fixed
+    program count rather than by the logits width. Only worth using where the
+    width is the ``max_model_len`` workspace and the live context is far
+    shorter, i.e. the paged decode path below; the prefill chunks pass
+    chunk-sized logits and stay on the shared kernel.
+    """
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        _candidate_flags_kernel,
     )
-    if row_starts is not None:
-        # Match the CUDA top_k_per_row_prefill contract: indices are local to
-        # each row's valid [row_start, row_end) range, not columns in the
-        # concatenated chunk logits matrix.
-        starts = row_starts.to(dtype=torch.int32).view(-1, 1)
-        indices = torch.where(indices < 0, indices, indices - starts)
-    if k == topk_tokens:
-        return indices
-    padded = torch.full(
-        (logits.shape[0], topk_tokens),
-        -1,
-        dtype=torch.int32,
-        device=logits.device,
+
+    rows, width = logits.shape
+    if not rows or not width:
+        return
+    nblocks = triton.cdiv(width, block_size)
+    flags = torch.empty((rows, nblocks + 1), device=logits.device, dtype=torch.uint8)
+    start_stride = row_ks.stride(0) if row_ks is not None else 0
+    _candidate_flags_kernel[(rows,)](
+        candidate_blocks,
+        row_ks,
+        flags,
+        *candidate_blocks.stride(),
+        start_stride,
+        width,
+        nblocks,
+        block_size,
+        candidate_blocks.shape[1],
+        row_ks is not None,
+        row_repeat,
     )
-    padded[:, :k] = indices
-    return padded
+    # Derived from width, which is a tensor shape, so the grid stays static and
+    # a FULL cudagraph capture remains valid across replays; only the loop trip
+    # count inside the kernel is data-dependent. The min keeps narrow widths
+    # from launching programs that would only fall through.
+    grid_cols = min(_MASK_GRID_COLS, triton.cdiv(width, _MASK_TILE))
+    _mask_candidates_strided_kernel[(rows, grid_cols)](
+        logits,
+        row_ks,
+        row_ke,
+        flags,
+        *logits.stride(),
+        start_stride,
+        row_ke.stride(0),
+        width,
+        nblocks,
+        block_size,
+        row_ks is not None,
+        row_repeat,
+        _MASK_TILE,
+    )
+
+
+def _max_decode_logits_rows(num_batched_tokens: int) -> int:
+    """Upper bound on decode rows the paged-MQA logits buffer can ever hold.
+
+    ``rocm_fp8_paged_mqa_logits`` sizes its workspace as
+    ``(batch_size * next_n, max_model_len)``. ``batch_size`` is bounded by
+    ``max_num_seqs`` and ``next_n`` by ``1 + num_speculative_tokens``, which is
+    far tighter than ``max_num_batched_tokens`` -- 192 vs 16384 for a typical
+    32-seq DSpark-5 deployment. The loose bound is harmless at short contexts
+    but scales with ``max_model_len``, so at the model's full context it asks
+    for tens of TiB and the engine cannot start. Take whichever valid bound is
+    smaller; the workspace is locked after profiling, so it must not be under-
+    estimated.
+    """
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return num_batched_tokens
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+    if not max_num_seqs:
+        return num_batched_tokens
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_spec = getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    return min(num_batched_tokens, max_num_seqs * (1 + num_spec))
 
 
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
     kv_cache: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -1282,8 +987,11 @@ def rocm_aiter_sparse_attn_indexer_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
-    # profile run - workspace reservation is done by the caller
     return topk_indices_buffer
 
 
@@ -1292,8 +1000,8 @@ def rocm_aiter_sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
     kv_cache: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -1303,12 +1011,15 @@ def rocm_aiter_sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
-    attn_metadata = get_forward_context().attn_metadata
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
-    use_fp16 = envs.VLLM_ROCM_MLA_SPARSE_FP16
-    from vllm import _custom_ops as ops
     from vllm.utils.torch_utils import _resolve_layer_name
 
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
@@ -1323,26 +1034,21 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Prefill k_fp8 and k_scale buffers, used by
         # rocm_aiter_sparse_attn_indexer's prefill path
-        if use_fp16:
-            workspace_manager.get_simultaneous(
-                ((total_seq_lens, head_dim), torch.float16),
-            )
-        else:
-            workspace_manager.get_simultaneous(
-                ((total_seq_lens, head_dim), fp8_dtype),
-                ((total_seq_lens, 4), torch.uint8),
-            )
+        workspace_manager.get_simultaneous(
+            ((total_seq_lens, head_dim), fp8_dtype),
+            ((total_seq_lens, 4), torch.uint8),
+        )
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
-        # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
+        decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
         if _ON_GFX942 or _ON_GFX950:
             workspace_manager.get_simultaneous(
-                ((hidden_states.shape[0], max_model_len), torch.float32),
+                ((decode_rows, max_model_len), torch.float32),
             )
         else:
             workspace_manager.get_simultaneous(
                 (
-                    (q.shape[1], hidden_states.shape[0], max_model_len),
+                    (q_fp8.shape[1], decode_rows, max_model_len),
                     torch.float32,
                 ),
             )
@@ -1360,7 +1066,7 @@ def rocm_aiter_sparse_attn_indexer(
             hidden_states,
             k_cache_prefix,
             kv_cache,
-            q,
+            q_fp8,
             k,
             weights,
             quant_block_size,
@@ -1371,6 +1077,10 @@ def rocm_aiter_sparse_attn_indexer(
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert,
+            compress_ratio,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
@@ -1380,6 +1090,7 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
+    topk_indices_buffer[: hidden_states.shape[0]] = -1
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
@@ -1390,107 +1101,96 @@ def rocm_aiter_sparse_attn_indexer(
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
     if not skip_k_cache_insert:
-        if use_fp16:
-            ops.indexer_k_cache_fp16(k, kv_cache, slot_mapping)
-        elif _ON_GFX942:
-            ops.indexer_k_quant_and_cache(
-                k,
-                kv_cache,
-                slot_mapping,
-                quant_block_size,
-                scale_fmt,
-            )
-        else:
-            indexer_k_quant_and_cache_triton(
-                k,
-                kv_cache,
-                slot_mapping,
-                quant_block_size,
-                scale_fmt,
-            )
+        indexer_k_quant_and_cache_triton(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+        )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
 
         workspace_manager = current_workspace_manager()
-        if use_fp16:
-            (k_fp16_full,) = workspace_manager.get_simultaneous(
-                ((total_seq_lens, head_dim), torch.float16),
-            )
-        else:
-            k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
-                ((total_seq_lens, head_dim), fp8_dtype),
-                ((total_seq_lens, 4), torch.uint8),
-            )
+        k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
+            ((total_seq_lens, head_dim), fp8_dtype),
+            ((total_seq_lens, 4), torch.uint8),
+        )
         for chunk in prefill_metadata.chunks:
-            if use_fp16:
-                k_fp16 = k_fp16_full[: chunk.total_seq_lens]
-                ops.cp_gather_indexer_k_cache_fp16(
-                    kv_cache,
-                    k_fp16,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
+            k_fp8 = k_fp8_full[: chunk.total_seq_lens]
+            k_scale = k_scale_full[: chunk.total_seq_lens]
+            cp_gather_indexer_k_quant_cache_triton(
+                kv_cache,
+                k_fp8,
+                k_scale,
+                chunk.block_table,
+                chunk.cu_seq_lens,
+                token_to_seq=chunk.token_to_seq,
+            )
+            logits = rocm_fp8_mqa_logits(
+                q_fp8[chunk.token_start : chunk.token_end],
+                (k_fp8, k_scale.view(torch.float32)),
+                weights[chunk.token_start : chunk.token_end],
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+            )
+            if candidate_blocks is not None:
+                from vllm.model_executor.layers.sparse_attn_indexer import (
+                    _apply_candidate_mask,
+                    _select_candidate_blocks,
                 )
-                logits = rocm_mqa_logits(
-                    q[chunk.token_start : chunk.token_end],
-                    k_fp16,
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
-            elif _ON_GFX942:
-                k_fp8 = k_fp8_full[: chunk.total_seq_lens]
-                k_scale = k_scale_full[: chunk.total_seq_lens]
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
-                logits = rocm_mqa_logits(
-                    q[chunk.token_start : chunk.token_end],
-                    (k_fp8, k_scale.view(torch.float32)),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
-            else:
-                k_fp8 = k_fp8_full[: chunk.total_seq_lens]
-                k_scale = k_scale_full[: chunk.total_seq_lens]
-                cp_gather_indexer_k_quant_cache_triton(
-                    kv_cache,
-                    k_fp8,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                    token_to_seq=chunk.token_to_seq,
-                )
-                logits = rocm_mqa_logits(
-                    q[chunk.token_start : chunk.token_end],
-                    (k_fp8, k_scale.view(torch.float32)),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
+
+                chunk_candidates = candidate_blocks[chunk.token_start : chunk.token_end]
+                if candidate_write:
+                    _select_candidate_blocks(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates.shape[1],
+                        candidate_block_size,
+                        chunk_candidates,
+                    )
+                else:
+                    _apply_candidate_mask(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates,
+                        candidate_block_size,
+                    )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
             num_rows = logits.shape[0]
 
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
+            aiter_topk_kernel = _get_aiter_top_k_kernel(
+                is_prefill=True,
+                compress_ratio=compress_ratio,
+                num_rows=num_rows,
             )
+            if aiter_topk_kernel is not None:
+                _launch_aiter_top_k_per_row_prefill(
+                    aiter_topk_kernel,
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    topk_tokens,
+                )
+            else:
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -1504,21 +1204,21 @@ def rocm_aiter_sparse_attn_indexer(
             # decode_threshold since we unstrictly split
             # prefill and decode by decode_threshold
             # (currently set to 1 + speculative tokens)
-            padded_q_decode_tokens = pack_seq_triton(
-                q[:num_decode_tokens], decode_lens
+            padded_q_fp8_decode_tokens = pack_seq_triton(
+                q_fp8[:num_decode_tokens], decode_lens
             )
         else:
-            padded_q_decode_tokens = q[:num_decode_tokens].reshape(
-                decode_lens.shape[0], -1, *q.shape[1:]
+            padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+                decode_lens.shape[0], -1, *q_fp8.shape[1:]
             )
         # TODO: move and optimize below logic with triton kernels
-        batch_size = padded_q_decode_tokens.shape[0]
-        next_n = padded_q_decode_tokens.shape[1]
+        batch_size = padded_q_fp8_decode_tokens.shape[0]
+        next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
-        logits = rocm_paged_mqa_logits(
-            padded_q_decode_tokens,
+        logits = rocm_fp8_paged_mqa_logits(
+            padded_q_fp8_decode_tokens,
             kv_cache,
             weights[:num_padded_tokens],
             decode_metadata.seq_lens,
@@ -1527,19 +1227,72 @@ def rocm_aiter_sparse_attn_indexer(
             max_model_len=max_model_len,
         )
 
+        if candidate_blocks is not None:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                _select_candidate_blocks,
+            )
+
+            num_rows = logits.shape[0]
+            visible = decode_metadata.seq_lens.reshape(-1)
+            if visible.numel() != num_rows:
+                visible = visible.repeat_interleave(next_n)
+            visible = visible[:num_rows].to(torch.int64)
+            row_starts = torch.zeros_like(visible)
+            decode_candidates = candidate_blocks[:num_rows]
+            if candidate_write:
+                _select_candidate_blocks(
+                    logits,
+                    row_starts,
+                    visible,
+                    decode_candidates.shape[1],
+                    candidate_block_size,
+                    decode_candidates,
+                )
+            else:
+                _apply_candidate_mask_strided(
+                    logits,
+                    row_starts,
+                    visible,
+                    decode_candidates,
+                    candidate_block_size,
+                )
+
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
+        # FULL graphs are not keyed by context length, so use a replay-safe
+        # upper bound when choosing the captured kernel.
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            max_compressed_seq_len = max_model_len
+        else:
+            max_compressed_seq_len = layer_attn_metadata.max_seq_len // compress_ratio
+        aiter_topk_kernel = _get_aiter_top_k_kernel(
+            is_prefill=False,
+            compress_ratio=compress_ratio,
+            num_rows=num_rows,
+            max_valid_seq_len=max_compressed_seq_len,
+            num_columns=logits.shape[1],
+            topk_tokens=topk_tokens,
         )
+        if aiter_topk_kernel is not None:
+            _launch_aiter_top_k_per_row_decode(
+                aiter_topk_kernel,
+                logits,
+                decode_metadata.seq_lens,
+                topk_indices,
+                topk_tokens,
+            )
+        else:
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -1562,6 +1315,10 @@ def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
         )
 
         return _upcast_e8m0_to_fp32(scale).contiguous()
+    if scale.dtype == torch.uint8:
+        # MXFP8 parameters preserve E8M0 scales as their raw exponent bytes.
+        # They are biased exponents, not numeric uint8 scale values.
+        return torch.exp2(scale.to(torch.int16).to(torch.float32) - 127.0)
     return scale.to(torch.float32)
 
 
@@ -1686,14 +1443,25 @@ def _get_cached_wo_a_bf16(
     cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
     if cached is not None:
         return cached
-    if hasattr(wo_a, "weight_scale_inv"):
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        get_fp8_block_weight_scale,
+    )
+
+    wo_a_scale_param = get_fp8_block_weight_scale(wo_a)
+    if wo_a_scale_param is None:
+        # ModelOpt MXFP8 stores the multiplicative E8M0 scale without the
+        # historical ``_inv`` suffix.
+        wo_a_scale_param = getattr(wo_a, "weight_scale", None)
+    # Emulated MXFP8 kernels can replace the original one-byte weight with an
+    # already-dequantized BF16 tensor while retaining the scale attribute for
+    # metadata. Applying that retained scale again would double-dequantize the
+    # weight. Block scaling is only valid while the one-byte FP8 storage remains.
+    if wo_a_scale_param is not None and wo_a.weight.element_size() == 1:
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32
         )
         wo_a_scale = _expand_2d_block_scales(
-            wo_a.weight_scale_inv.view(
-                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
-            ),
+            wo_a_scale_param.view(n_local_groups, -1, wo_a_scale_param.shape[-1]),
             o_lora_rank,
             hidden_dim,
         )
@@ -1736,15 +1504,31 @@ _DSV4_SPARSE_NOPE_DIM = 448
 _DSV4_SPARSE_ROPE_DIM = 64
 
 
+def _validate_sparse_dims(
+    head_dim: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    op_name: str,
+) -> None:
+    assert head_dim > 0, f"{op_name} expected a positive head_dim, got {head_dim}"
+    assert nope_head_dim > 0, (
+        f"{op_name} expected a positive NoPE dimension, got {nope_head_dim}"
+    )
+    assert rope_head_dim >= 0, (
+        f"{op_name} expected a non-negative RoPE dimension, got {rope_head_dim}"
+    )
+    assert head_dim == nope_head_dim + rope_head_dim, (
+        f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
+    )
+
+
 def _validate_dsv4_sparse_dims(
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
     op_name: str,
 ) -> None:
-    assert head_dim == nope_head_dim + rope_head_dim, (
-        f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
-    )
+    _validate_sparse_dims(head_dim, nope_head_dim, rope_head_dim, op_name)
     assert (
         nope_head_dim == _DSV4_SPARSE_NOPE_DIM
         and rope_head_dim == _DSV4_SPARSE_ROPE_DIM
@@ -1837,6 +1621,12 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
+def _sparse_kv_row_offset(slot, stride):
+    # A global token slot fits in int32, but its byte/element offset may not.
+    return slot.to(tl.int64) * stride
+
+
+@triton.jit
 def _sparse_attn_prefill_ragged_kernel(
     q_ptr,
     kv_ptr,
@@ -1888,21 +1678,27 @@ def _sparse_attn_prefill_ragged_kernel(
     kv_len = kv_end - kv_start
 
     k_offsets = tl.arange(0, BLOCK_K)
+    slot = tl.load(
+        kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=-1
+    )
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < num_kv)
         safe_slot = tl.where(valid, slot, 0)
 
         kv = tl.load(
             kv_ptr
-            + safe_slot[:, None] * kv_stride_n
+            + _sparse_kv_row_offset(safe_slot[:, None], kv_stride_n)
             + dim_offsets[None, :] * kv_stride_d,
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )
-        kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
+
+        next_k_pos = k_start + BLOCK_K + k_offsets
+        slot = tl.load(
+            kv_indices_ptr + kv_start + next_k_pos, mask=next_k_pos < kv_len, other=-1
+        )
 
         scores = tl.dot(q, tl.trans(kv)) * scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
@@ -1946,6 +1742,90 @@ def _sparse_attn_prefill_ragged_kernel(
 
 
 @triton.jit
+def _decode_e8m0_scales_triton(encoded_scales):
+    scale_bits = encoded_scales.to(tl.int32) << 23
+    scale_bits = tl.where(encoded_scales == 0, 1 << 22, scale_bits)
+    return scale_bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _load_fp8_ds_mla_gfx950_nope_exact_chunk(
+    token_data_ptr,
+    token_scale_ptr,
+    valid,
+    CHUNK_START: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+):
+    offsets = CHUNK_START + tl.arange(0, CHUNK_SIZE)
+    x_uint8 = tl.load(
+        token_data_ptr[:, None] + offsets[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    scale_offsets = CHUNK_START // 64 + tl.arange(0, CHUNK_SIZE // 64)
+    encoded_scales = tl.load(
+        token_scale_ptr[:, None] + scale_offsets[None, :],
+        mask=valid[:, None],
+        other=127,
+    )
+    scales = _decode_e8m0_scales_triton(encoded_scales)
+    scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, CHUNK_SIZE // 64, 64))
+    scales = tl.reshape(scales, (BLOCK_K, CHUNK_SIZE))
+    if IS_FNUZ:
+        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+    else:
+        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    value = (x_f32 * scales).to(tl.bfloat16)
+    zero = tl.zeros((BLOCK_K, CHUNK_SIZE), dtype=tl.bfloat16)
+    return tl.where(valid[:, None], value, zero)
+
+
+@triton.jit
+def _load_fp8_ds_mla_gfx950_tail128(
+    token_data_ptr,
+    token_scale_ptr,
+    valid,
+    NOPE_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+):
+    tail_offsets = 384 + tl.arange(0, 128)
+    nope_mask = tail_offsets < NOPE_DIM
+    x_uint8 = tl.load(
+        token_data_ptr[:, None] + tail_offsets[None, :],
+        mask=valid[:, None] & nope_mask[None, :],
+        other=0,
+    )
+    scale_offsets = 6 + tl.arange(0, 2)
+    scale_mask = scale_offsets < NOPE_DIM // 64
+    encoded_scales = tl.load(
+        token_scale_ptr[:, None] + scale_offsets[None, :],
+        mask=valid[:, None] & scale_mask[None, :],
+        other=127,
+    )
+    scales = _decode_e8m0_scales_triton(encoded_scales)
+    scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 2, 64))
+    scales = tl.reshape(scales, (BLOCK_K, 128))
+    if IS_FNUZ:
+        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+    else:
+        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    nope = (x_f32 * scales).to(tl.bfloat16)
+
+    rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    rope = tl.load(
+        rope_ptr[:, None] + (tail_offsets[None, :] - NOPE_DIM),
+        mask=valid[:, None] & ~nope_mask[None, :],
+        other=0.0,
+    )
+    value = tl.where(nope_mask[None, :], nope, rope)
+    zero = tl.zeros((BLOCK_K, 128), dtype=tl.bfloat16)
+    return tl.where(valid[:, None], value, zero)
+
+
+@triton.jit
 def _sparse_attn_decode_ragged_kernel(
     q_ptr,
     main_cache_ptr,
@@ -1973,7 +1853,10 @@ def _sparse_attn_decode_ragged_kernel(
     NOPE_DIM: tl.constexpr,
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
-    IS_FNUZ: tl.constexpr,
+    # SWA K-cache (main): C++ encoder writes FNUZ on gfx942, OCP on gfx950.
+    # Compressed K-cache (extra): Triton encoder writes OCP everywhere.
+    IS_FNUZ_MAIN: tl.constexpr,
+    IS_FNUZ_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -2030,8 +1913,8 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ:
-            x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+        if IS_FNUZ_MAIN:
+            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
@@ -2098,8 +1981,8 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ:
-                x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+            if IS_FNUZ_EXTRA:
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
@@ -2209,7 +2092,12 @@ def _sparse_attn_decode_partial_kernel(
     NOPE_DIM: tl.constexpr,
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
-    IS_FNUZ: tl.constexpr,
+    # `main_cache` is the SWA K-cache (written by the C++ encoder, FNUZ on
+    # gfx942 / OCP on gfx950). `extra_cache` is the compressed K-cache
+    # (Triton encoder, OCP on every platform). Reading both with the same
+    # `IS_FNUZ` would decode one of them with the wrong FNUZ/OCP scale ratio.
+    IS_FNUZ_MAIN: tl.constexpr,
+    IS_FNUZ_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
@@ -2275,8 +2163,8 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ:
-            x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+        if IS_FNUZ_MAIN:
+            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
@@ -2346,8 +2234,8 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ:
-                x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+            if IS_FNUZ_EXTRA:
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
@@ -2412,6 +2300,407 @@ def _sparse_attn_decode_partial_kernel(
 
 
 @triton.jit
+def _sparse_attn_decode_gfx950_partial_loaded_tile(
+    q_combined,
+    cache_ptr,
+    slot,
+    valid,
+    cache_stride0,
+    scale: tl.constexpr,
+    head_mask,
+    m_i,
+    l_i,
+    acc_nope_0a,
+    acc_nope_0b,
+    acc_nope_1,
+    acc_tail,
+    BLOCK_SIZE: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+    TRUST_EXTRA_CACHE_NAN_FREE: tl.constexpr,
+):
+    safe_slot = tl.where(valid, slot, 0)
+    block_idx = safe_slot // BLOCK_SIZE
+    pos_in_block = safe_slot % BLOCK_SIZE
+    cache_block_ptr = cache_ptr + block_idx.to(tl.int64) * cache_stride0
+    token_data_ptr = cache_block_ptr + pos_in_block * 576
+    token_scale_ptr = cache_block_ptr + BLOCK_SIZE * 576 + pos_in_block * 8
+    k_nope_0a = _load_fp8_ds_mla_gfx950_nope_exact_chunk(
+        token_data_ptr,
+        token_scale_ptr,
+        valid,
+        0,
+        128,
+        BLOCK_K,
+        IS_FNUZ,
+    )
+    k_nope_0b = _load_fp8_ds_mla_gfx950_nope_exact_chunk(
+        token_data_ptr,
+        token_scale_ptr,
+        valid,
+        128,
+        128,
+        BLOCK_K,
+        IS_FNUZ,
+    )
+    k_nope_1 = _load_fp8_ds_mla_gfx950_nope_exact_chunk(
+        token_data_ptr,
+        token_scale_ptr,
+        valid,
+        256,
+        128,
+        BLOCK_K,
+        IS_FNUZ,
+    )
+    k_tail = _load_fp8_ds_mla_gfx950_tail128(
+        token_data_ptr,
+        token_scale_ptr,
+        valid,
+        NOPE_DIM,
+        BLOCK_K,
+        IS_FNUZ,
+    )
+    if not TRUST_EXTRA_CACHE_NAN_FREE:
+        zero = tl.zeros((BLOCK_K, 128), dtype=tl.bfloat16)
+        k_nope_0a = tl.where(k_nope_0a == k_nope_0a, k_nope_0a, zero)
+        k_nope_0b = tl.where(k_nope_0b == k_nope_0b, k_nope_0b, zero)
+        k_nope_1 = tl.where(k_nope_1 == k_nope_1, k_nope_1, zero)
+        k_tail = tl.where(k_tail == k_tail, k_tail, zero)
+    k_nope_0 = tl.cat(k_nope_0a, k_nope_0b, dim=1)
+    k_tail_256 = tl.cat(k_nope_1, k_tail, dim=1)
+    k_combined = tl.cat(k_nope_0, k_tail_256, dim=1)
+
+    scores = tl.dot(q_combined, tl.trans(k_combined))
+    scores *= scale * 1.4426950408889634
+    scores = tl.where(
+        head_mask[:, None] & valid[None, :],
+        scores,
+        -3.4028234663852886e38,
+    )
+    m_block = tl.max(scores, axis=1)
+    m_new = tl.maximum(m_i, m_block)
+    alpha = tl.exp2(m_i - m_new)
+    p = tl.exp2(scores - m_new[:, None])
+    p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+    l_new = l_i * alpha + tl.sum(p, axis=1)
+    p_bf16 = p.to(k_nope_0a.dtype)
+    acc_nope_0a = acc_nope_0a * alpha[:, None] + tl.dot(p_bf16, k_nope_0a)
+    acc_nope_0b = acc_nope_0b * alpha[:, None] + tl.dot(p_bf16, k_nope_0b)
+    acc_nope_1 = acc_nope_1 * alpha[:, None] + tl.dot(p_bf16, k_nope_1)
+    acc_tail = acc_tail * alpha[:, None] + tl.dot(p_bf16, k_tail)
+    return (
+        m_new,
+        l_new,
+        acc_nope_0a,
+        acc_nope_0b,
+        acc_nope_1,
+        acc_tail,
+    )
+
+
+@triton.jit
+def _sparse_attn_decode_gfx950_partial_kernel(
+    q_ptr,
+    main_cache_ptr,
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    q_stride0: tl.constexpr,
+    q_stride1: tl.constexpr,
+    main_cache_stride0: tl.constexpr,
+    extra_cache_stride0: tl.constexpr,
+    main_num_rows,
+    extra_num_rows,
+    MAIN_BLOCK_SIZE: tl.constexpr,
+    EXTRA_BLOCK_SIZE: tl.constexpr,
+    scale: tl.constexpr,
+    num_heads: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ_MAIN: tl.constexpr,
+    IS_FNUZ_EXTRA: tl.constexpr,
+    TRUST_EXTRA_CACHE_NAN_FREE: tl.constexpr,
+    ADAPTIVE_SPLITS: tl.constexpr,
+    ONE_WAVE_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    split_id = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    tl.static_assert(NOPE_DIM == 448)
+    tl.static_assert(ROPE_DIM == 64)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    if num_heads % BLOCK_H == 0:
+        head_mask = tl.full((BLOCK_H,), True, tl.int1)
+    else:
+        head_mask = head_offsets < num_heads
+    neg_large = -3.4028234663852886e38
+
+    if ADAPTIVE_SPLITS:
+        main_start = tl.load(main_indptr_ptr + query_idx)
+        main_end = tl.load(main_indptr_ptr + query_idx + 1)
+        main_len = main_end - main_start
+        if HAS_EXTRA:
+            extra_start = tl.load(extra_indptr_ptr + query_idx)
+            extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+            extra_len = extra_end - extra_start
+        else:
+            extra_start = 0
+            extra_len = 0
+        split4_span: tl.constexpr = 4 * BLOCK_K
+        split4_iters = (main_len + split4_span - 1) // split4_span
+        split4_iters += (extra_len + split4_span - 1) // split4_span
+        use_four_splits = split4_iters <= 3
+        work_splits = NUM_SPLITS
+        if ONE_WAVE_SPLITS > 4 and ONE_WAVE_SPLITS < NUM_SPLITS:
+            one_wave_span: tl.constexpr = ONE_WAVE_SPLITS * BLOCK_K
+            one_wave_iters = (main_len + one_wave_span - 1) // one_wave_span
+            one_wave_iters += (extra_len + one_wave_span - 1) // one_wave_span
+            work_splits = tl.where(one_wave_iters <= 3, ONE_WAVE_SPLITS, work_splits)
+        work_splits = tl.where(use_four_splits, 4, work_splits)
+        if split_id >= work_splits:
+            pm_base = (query_idx * NUM_SPLITS + split_id) * num_heads + head_offsets
+            tl.store(part_m_ptr + pm_base, neg_large, mask=head_mask)
+            tl.store(part_l_ptr + pm_base, 0.0, mask=head_mask)
+            return
+    else:
+        work_splits = NUM_SPLITS
+
+    nope_offsets_0a = tl.arange(0, 128)
+    nope_offsets_0b = 128 + tl.arange(0, 128)
+    nope_offsets_0 = tl.arange(0, 256)
+    tail_offsets = 256 + tl.arange(0, 256)
+    nope_offsets_1 = 256 + tl.arange(0, 128)
+    tail_offsets_128 = 384 + tl.arange(0, 128)
+
+    q_row_ptr = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+    q_nope_0 = tl.load(
+        q_row_ptr + nope_offsets_0[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+    q_tail = tl.load(
+        q_row_ptr + tail_offsets[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+    q_combined = tl.cat(q_nope_0, q_tail, dim=1)
+
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_nope_0a = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    acc_nope_0b = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    acc_nope_1 = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    acc_tail = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    if not ADAPTIVE_SPLITS:
+        main_start = tl.load(main_indptr_ptr + query_idx)
+        main_end = tl.load(main_indptr_ptr + query_idx + 1)
+        main_len = main_end - main_start
+    main_chunk = (main_len + work_splits - 1) // work_splits
+    main_lo = split_id * main_chunk
+    main_hi = tl.minimum(main_lo + main_chunk, main_len)
+
+    for k_start in tl.range(
+        main_lo,
+        main_hi,
+        BLOCK_K,
+        num_stages=NUM_STAGES,
+    ):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < main_hi
+        slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < main_num_rows)
+        (
+            m_i,
+            l_i,
+            acc_nope_0a,
+            acc_nope_0b,
+            acc_nope_1,
+            acc_tail,
+        ) = _sparse_attn_decode_gfx950_partial_loaded_tile(
+            q_combined,
+            main_cache_ptr,
+            slot,
+            valid,
+            main_cache_stride0,
+            scale,
+            head_mask,
+            m_i,
+            l_i,
+            acc_nope_0a,
+            acc_nope_0b,
+            acc_nope_1,
+            acc_tail,
+            MAIN_BLOCK_SIZE,
+            NOPE_DIM,
+            BLOCK_K,
+            IS_FNUZ_MAIN,
+            False,
+        )
+
+    if HAS_EXTRA:
+        if not ADAPTIVE_SPLITS:
+            extra_start = tl.load(extra_indptr_ptr + query_idx)
+            extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+            extra_len = extra_end - extra_start
+        extra_chunk = (extra_len + work_splits - 1) // work_splits
+        extra_lo = split_id * extra_chunk
+        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+
+        outer_block_k: tl.constexpr = 2 * BLOCK_K
+        outer_k_offsets = tl.arange(0, outer_block_k)
+        extra_hi_full = (
+            extra_lo + ((extra_hi - extra_lo) // outer_block_k) * outer_block_k
+        )
+        for k_start in tl.range(
+            extra_lo,
+            extra_hi_full,
+            outer_block_k,
+            num_stages=NUM_STAGES,
+        ):
+            slot = tl.load(extra_indices_ptr + extra_start + k_start + outer_k_offsets)
+            valid = (slot >= 0) & (slot < extra_num_rows)
+            slot_pairs = tl.trans(tl.reshape(slot, (2, BLOCK_K)))
+            valid_pairs = tl.trans(tl.reshape(valid, (2, BLOCK_K)))
+            slot_lo, slot_hi = tl.split(slot_pairs)
+            valid_lo, valid_hi = tl.split(valid_pairs)
+            (
+                m_i,
+                l_i,
+                acc_nope_0a,
+                acc_nope_0b,
+                acc_nope_1,
+                acc_tail,
+            ) = _sparse_attn_decode_gfx950_partial_loaded_tile(
+                q_combined,
+                extra_cache_ptr,
+                slot_lo,
+                valid_lo,
+                extra_cache_stride0,
+                scale,
+                head_mask,
+                m_i,
+                l_i,
+                acc_nope_0a,
+                acc_nope_0b,
+                acc_nope_1,
+                acc_tail,
+                EXTRA_BLOCK_SIZE,
+                NOPE_DIM,
+                BLOCK_K,
+                IS_FNUZ_EXTRA,
+                TRUST_EXTRA_CACHE_NAN_FREE,
+            )
+            (
+                m_i,
+                l_i,
+                acc_nope_0a,
+                acc_nope_0b,
+                acc_nope_1,
+                acc_tail,
+            ) = _sparse_attn_decode_gfx950_partial_loaded_tile(
+                q_combined,
+                extra_cache_ptr,
+                slot_hi,
+                valid_hi,
+                extra_cache_stride0,
+                scale,
+                head_mask,
+                m_i,
+                l_i,
+                acc_nope_0a,
+                acc_nope_0b,
+                acc_nope_1,
+                acc_tail,
+                EXTRA_BLOCK_SIZE,
+                NOPE_DIM,
+                BLOCK_K,
+                IS_FNUZ_EXTRA,
+                TRUST_EXTRA_CACHE_NAN_FREE,
+            )
+        for tail_idx in tl.static_range(2):
+            tail_start = extra_hi_full + tail_idx * BLOCK_K
+            if tail_start < extra_hi:
+                k_pos = tail_start + k_offsets
+                in_range = k_pos < extra_hi
+                slot = tl.load(
+                    extra_indices_ptr + extra_start + k_pos,
+                    mask=in_range,
+                    other=-1,
+                )
+                valid = in_range & (slot >= 0) & (slot < extra_num_rows)
+                (
+                    m_i,
+                    l_i,
+                    acc_nope_0a,
+                    acc_nope_0b,
+                    acc_nope_1,
+                    acc_tail,
+                ) = _sparse_attn_decode_gfx950_partial_loaded_tile(
+                    q_combined,
+                    extra_cache_ptr,
+                    slot,
+                    valid,
+                    extra_cache_stride0,
+                    scale,
+                    head_mask,
+                    m_i,
+                    l_i,
+                    acc_nope_0a,
+                    acc_nope_0b,
+                    acc_nope_1,
+                    acc_tail,
+                    EXTRA_BLOCK_SIZE,
+                    NOPE_DIM,
+                    BLOCK_K,
+                    IS_FNUZ_EXTRA,
+                    TRUST_EXTRA_CACHE_NAN_FREE,
+                )
+
+    pm_base = (query_idx * NUM_SPLITS + split_id) * num_heads + head_offsets
+    m_store = tl.where(l_i > 0.0, m_i * 0.6931471805599453, neg_large)
+    tl.store(part_m_ptr + pm_base, m_store, mask=head_mask)
+    tl.store(part_l_ptr + pm_base, l_i, mask=head_mask)
+    acc_base = part_acc_ptr + (
+        (query_idx * NUM_SPLITS + split_id) * num_heads + head_offsets[:, None]
+    ) * (NOPE_DIM + ROPE_DIM)
+    tl.store(
+        acc_base + nope_offsets_0a[None, :],
+        acc_nope_0a,
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        acc_base + nope_offsets_0b[None, :],
+        acc_nope_0b,
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        acc_base + nope_offsets_1[None, :],
+        acc_nope_1,
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        acc_base + tail_offsets_128[None, :],
+        acc_tail,
+        mask=head_mask[:, None],
+    )
+
+
+@triton.jit
 def _sparse_attn_decode_reduce_kernel(
     part_m_ptr,
     part_l_ptr,
@@ -2427,6 +2716,7 @@ def _sparse_attn_decode_reduce_kernel(
     pa_stride_h,
     num_heads,
     HAS_ATTN_SINK: tl.constexpr,
+    ADAPTIVE_SPLITS: tl.constexpr,
     COMB_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
@@ -2495,17 +2785,27 @@ def _sparse_attn_decode_reduce_kernel(
             other=neg_large,
         )
         w_s = tl.exp(m_s - m_final)
+        if ADAPTIVE_SPLITS:
+            active_split = m_s > neg_large
+            w_s = tl.where(head_mask & active_split, w_s, 0.0)
         acc_base = (
             part_acc_ptr
             + query_idx * pa_stride0
             + s * pa_stride_s
             + head_offsets[:, None] * pa_stride_h
         )
-        acc_s = tl.load(
-            acc_base + comb_offsets[None, :],
-            mask=head_mask[:, None],
-            other=0.0,
-        )
+        if ADAPTIVE_SPLITS:
+            acc_s = tl.load(
+                acc_base + comb_offsets[None, :],
+                mask=head_mask[:, None] & active_split[:, None],
+                other=0.0,
+            )
+        else:
+            acc_s = tl.load(
+                acc_base + comb_offsets[None, :],
+                mask=head_mask[:, None],
+                other=0.0,
+            )
         acc += w_s[:, None] * acc_s
 
     out = tl.where(l_final[:, None] > 0.0, acc / denom[:, None], 0.0)
@@ -2548,7 +2848,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     assert indptr.numel() == num_queries + 1, (
         f"expected indptr shape [{num_queries + 1}], got {indptr.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
@@ -2558,7 +2858,8 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    num_warps = 4
+    out = torch.empty_like(q)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -2582,7 +2883,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        num_warps=8,
+        num_warps=num_warps,
     )
     return out
 
@@ -2614,6 +2915,66 @@ def _rocm_sparse_attn_prefill_triton(
         nope_head_dim=nope_head_dim,
         rope_head_dim=rope_head_dim,
     )
+
+
+def _can_use_aiter_sparse_prefill_opus(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    output: torch.Tensor,
+    on_gfx950: bool = _ON_GFX950,
+) -> bool:
+    return (
+        on_gfx950
+        and q.shape[0] >= _GFX950_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES
+        and q.is_cuda
+        and output.shape == q.shape
+        and kv.shape[-1] == q.shape[-1]
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and kv.dtype == q.dtype
+        and output.dtype == q.dtype
+        and kv.device == q.device
+        and output.device == q.device
+        and q.stride(-1) == 1
+        and kv.stride(-1) == 1
+        and output.stride() == q.stride()
+        and attn_sink is not None
+        and attn_sink.shape == (q.shape[1],)
+        and attn_sink.dtype == torch.float32
+        and attn_sink.device == q.device
+    )
+
+
+def _rocm_sparse_attn_prefill_ragged_aiter_opus(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+) -> bool:
+    pa_sparse_prefill_opus = _get_aiter_sparse_prefill_opus()
+    if pa_sparse_prefill_opus is None:
+        return False
+
+    indices = _as_int32_contiguous_1d(indices)
+    indptr = _as_int32_contiguous_1d(indptr)
+    empty_indices = indices[:0]
+    empty_indptr = torch.zeros_like(indptr)
+    pa_sparse_prefill_opus(
+        q,
+        kv,
+        indices,
+        indptr,
+        kv[:1],
+        empty_indices,
+        empty_indptr,
+        attn_sink.contiguous(),
+        float(scale),
+        out=output,
+    )
+    return True
 
 
 @functools.lru_cache
@@ -2711,6 +3072,49 @@ def _decode_num_splits(
     return best_splits
 
 
+def _decode_gfx950_num_splits(
+    num_queries: int,
+    heads_blocks: int,
+    avg_main_len: float = 0.0,
+    avg_extra_len: float = 0.0,
+    block_k: int = 32,
+) -> int:
+    base = max(1, num_queries * heads_blocks)
+    cu = max(1, _decode_cu_count())
+    target_workgroups = 2 * cu
+    num_splits = min(
+        32,
+        max(
+            1,
+            math.ceil(target_workgroups / base),
+        ),
+    )
+    if (
+        base >= 16
+        and num_splits > 4
+        and _decode_partial_iters(avg_main_len, avg_extra_len, 4, block_k) <= 3
+    ):
+        return 4
+    if 16 <= base < 64:
+        one_wave_splits = max(1, cu // base)
+        one_wave_iters = _decode_partial_iters(
+            avg_main_len, avg_extra_len, one_wave_splits, block_k
+        )
+        target_waves = 1 if one_wave_iters <= 9 else 2
+        num_splits = min(num_splits, max(1, target_waves * cu // base))
+    if base >= 16 and num_splits > 1:
+        target_waves = (base * num_splits + cu - 1) // cu
+        target_iters = _decode_partial_iters(
+            avg_main_len, avg_extra_len, num_splits, block_k
+        )
+        for splits in range(1, num_splits):
+            waves = (base * splits + cu - 1) // cu
+            iters = _decode_partial_iters(avg_main_len, avg_extra_len, splits, block_k)
+            if waves == target_waves and iters == target_iters:
+                return splits
+    return num_splits
+
+
 def _rocm_sparse_attn_decode_ragged_triton(
     q: torch.Tensor,
     main_cache: torch.Tensor,
@@ -2723,6 +3127,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    extra_cache_nan_free: bool = False,
+    adaptive_splits: bool = False,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -2763,6 +3170,10 @@ def _rocm_sparse_attn_decode_ragged_triton(
         and extra_indices is not None
         and extra_indptr is not None
     )
+    assert not extra_cache_nan_free or (_ON_GFX950 and has_extra), (
+        "extra_cache_nan_free requires a gfx950 compressed cache with trusted "
+        "canonical-writer provenance"
+    )
     if has_extra:
         assert extra_cache is not None
         assert extra_indices is not None
@@ -2784,13 +3195,22 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     block_h = 16
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert out.shape == q.shape, f"expected out shape {q.shape}, got {out.shape}"
+        assert out.device == q.device, (
+            f"expected out on device {q.device}, got {out.device}"
+        )
+        assert out.dtype == torch.bfloat16, (
+            f"expected out dtype {torch.bfloat16}, got {out.dtype}"
+        )
     heads_blocks = triton.cdiv(num_heads, block_h)
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
 
-    if not _ON_GFX950:  # Fallback path for un-tuned architectures.
+    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2819,7 +3239,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
             NOPE_DIM=nope_head_dim,
             NOPE_BLOCK=nope_block,
             ROPE_DIM=rope_head_dim,
-            IS_FNUZ=is_fnuz,
+            IS_FNUZ_MAIN=is_fnuz,
+            IS_FNUZ_EXTRA=False,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             num_warps=8,
@@ -2827,14 +3248,35 @@ def _rocm_sparse_attn_decode_ragged_triton(
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
-    # Average per-query segment lengths, read sync-free from the ragged index
-    # sizes, let the split heuristic avoid over-splitting
-    # main_indices/extra_indices are flat [nnz] int32.
-    inv_q = 1.0 / max(1, num_queries)
-    avg_main_len = main_indices.numel() * inv_q
-    avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
-    num_splits = _decode_num_splits(
-        num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
+    if _ON_GFX950:
+        inv_q = 1.0 / max(1, num_queries)
+        avg_main_len = main_indices.numel() * inv_q
+        avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
+        num_splits = _decode_gfx950_num_splits(
+            num_queries,
+            heads_blocks,
+            avg_main_len,
+            avg_extra_len,
+            block_k,
+        )
+    else:
+        # Average per-query segment lengths, read sync-free from the ragged
+        # index sizes, let the split heuristic avoid over-splitting.
+        inv_q = 1.0 / max(1, num_queries)
+        avg_main_len = main_indices.numel() * inv_q
+        avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
+        num_splits = _decode_num_splits(
+            num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
+        )
+
+    base_workgroups = num_queries * heads_blocks
+    adaptive_splits = (
+        _ON_GFX950 and adaptive_splits and base_workgroups >= 16 and num_splits > 4
+    )
+    one_wave_splits = (
+        max(1, _decode_cu_count() // base_workgroups)
+        if adaptive_splits and 16 <= base_workgroups < 64
+        else num_splits
     )
 
     part_m = torch.empty(
@@ -2847,45 +3289,90 @@ def _rocm_sparse_attn_decode_ragged_triton(
         device=q.device,
     )
 
-    _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](
-        q,
-        main_cache,
-        main_indices,
-        main_indptr,
-        extra_cache,
-        extra_indices,
-        extra_indptr,
-        part_m,
-        part_l,
-        part_acc,
-        q.stride(0),
-        q.stride(1),
-        main_cache.stride(0),
-        extra_cache.stride(0),
-        part_m.stride(0),
-        part_m.stride(1),
-        part_acc.stride(0),
-        part_acc.stride(1),
-        part_acc.stride(2),
-        main_cache.shape[0] * main_cache.shape[1],
-        extra_cache.shape[0] * extra_cache.shape[1],
-        main_cache.shape[1],
-        extra_cache.shape[1],
-        scale,
-        num_heads,
-        HAS_EXTRA=has_extra,
-        NOPE_DIM=nope_head_dim,
-        NOPE_BLOCK=nope_block,
-        ROPE_DIM=rope_head_dim,
-        IS_FNUZ=is_fnuz,
-        BLOCK_H=block_h,
-        BLOCK_K=block_k,
-        NUM_SPLITS=num_splits,
-        NUM_STAGES=1,
-        num_warps=4,
-    )
+    if _ON_GFX950:
+        _sparse_attn_decode_gfx950_partial_kernel[
+            (num_queries, num_splits, heads_blocks)
+        ](
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            extra_cache,
+            extra_indices,
+            extra_indptr,
+            part_m,
+            part_l,
+            part_acc,
+            q.stride(0),
+            q.stride(1),
+            main_cache.stride(0),
+            extra_cache.stride(0),
+            main_cache.shape[0] * main_cache.shape[1],
+            extra_cache.shape[0] * extra_cache.shape[1],
+            main_cache.shape[1],
+            extra_cache.shape[1],
+            scale,
+            num_heads,
+            HAS_EXTRA=has_extra,
+            NOPE_DIM=nope_head_dim,
+            ROPE_DIM=rope_head_dim,
+            IS_FNUZ_MAIN=is_fnuz,
+            IS_FNUZ_EXTRA=False,
+            TRUST_EXTRA_CACHE_NAN_FREE=extra_cache_nan_free,
+            ADAPTIVE_SPLITS=adaptive_splits,
+            ONE_WAVE_SPLITS=one_wave_splits,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            NUM_SPLITS=num_splits,
+            NUM_STAGES=1,
+            num_warps=4,
+            waves_per_eu=0,
+        )
+    else:
+        _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            extra_cache,
+            extra_indices,
+            extra_indptr,
+            part_m,
+            part_l,
+            part_acc,
+            q.stride(0),
+            q.stride(1),
+            main_cache.stride(0),
+            extra_cache.stride(0),
+            part_m.stride(0),
+            part_m.stride(1),
+            part_acc.stride(0),
+            part_acc.stride(1),
+            part_acc.stride(2),
+            main_cache.shape[0] * main_cache.shape[1],
+            extra_cache.shape[0] * extra_cache.shape[1],
+            main_cache.shape[1],
+            extra_cache.shape[1],
+            scale,
+            num_heads,
+            HAS_EXTRA=has_extra,
+            NOPE_DIM=nope_head_dim,
+            NOPE_BLOCK=nope_block,
+            ROPE_DIM=rope_head_dim,
+            # main_cache = swa_k_cache (C++ encoder, FNUZ on gfx942 / OCP on gfx950).
+            # extra_cache = compressed kv_cache (Triton encoder, OCP everywhere).
+            # Reading both with a single IS_FNUZ would decode one of them with the
+            # wrong FNUZ/OCP scale ratio (~1.87×).
+            IS_FNUZ_MAIN=is_fnuz,
+            IS_FNUZ_EXTRA=False,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            NUM_SPLITS=num_splits,
+            NUM_STAGES=1,
+            num_warps=4,
+        )
 
-    _sparse_attn_decode_reduce_kernel[(num_queries, heads_blocks)](
+    _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
         part_m,
         part_l,
         part_acc,
@@ -2900,8 +3387,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
         part_acc.stride(2),
         num_heads,
         HAS_ATTN_SINK=has_attn_sink,
+        ADAPTIVE_SPLITS=adaptive_splits,
         COMB_DIM=comb_dim,
-        BLOCK_H=block_h,
+        BLOCK_H=1,
         NUM_SPLITS=num_splits,
         SPLITS_PAD=triton.next_power_of_2(num_splits),
         num_warps=4,
@@ -2925,6 +3413,9 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    extra_cache_nan_free: bool = False,
+    adaptive_splits: bool = False,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -2960,13 +3451,16 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
+        out=out,
+        extra_cache_nan_free=extra_cache_nan_free,
+        adaptive_splits=adaptive_splits,
     )
 
 
 def rocm_sparse_attn_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
-    indices: torch.Tensor,
+    indices: torch.Tensor | None,
     topk_length: torch.Tensor | None,
     scale: float,
     head_dim: int,
@@ -2980,12 +3474,39 @@ def rocm_sparse_attn_prefill(
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
         "rocm_sparse_attn_prefill",
     )
+    opus_attn_sink = None if attn_sink is None else attn_sink[: q.shape[1]]
+    if (
+        _can_use_aiter_sparse_prefill_opus(q, kv.squeeze(1), opus_attn_sink, output)
+        and _get_aiter_sparse_prefill_opus() is not None
+    ):
+        if ragged_indices is None or ragged_indptr is None:
+            assert indices is not None
+            indices_2d = indices.reshape(indices.shape[0], -1)
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                indices_2d,
+                topk_length
+                if topk_length is not None
+                else (indices_2d >= 0).sum(dim=-1, dtype=torch.int32),
+                num_rows=kv.shape[0],
+            )
+        assert opus_attn_sink is not None
+        if _rocm_sparse_attn_prefill_ragged_aiter_opus(
+            q=q,
+            kv=kv.squeeze(1),
+            indices=ragged_indices,
+            indptr=ragged_indptr,
+            scale=scale,
+            attn_sink=opus_attn_sink,
+            output=output,
+        ):
+            return
+
     if ragged_indices is not None and ragged_indptr is not None:
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
@@ -2998,6 +3519,7 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
         )
     else:
+        assert indices is not None
         indices_2d = indices.reshape(indices.shape[0], -1)
         output_chunk = _rocm_sparse_attn_prefill_triton(
             q=q,
@@ -3009,7 +3531,7 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
         )
-    output.copy_(output_chunk.to(output.dtype))
+    output.copy_(output_chunk[..., : output.shape[-1]].to(output.dtype))
 
 
 def rocm_sparse_attn_decode(
@@ -3031,6 +3553,8 @@ def rocm_sparse_attn_decode(
     nope_head_dim: int,
     rope_head_dim: int,
     output: torch.Tensor,
+    extra_cache_nan_free: bool = False,
+    adaptive_splits: bool = False,
 ) -> None:
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -3060,6 +3584,7 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
+    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,
@@ -3076,5 +3601,9 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
+        out=direct_out,
+        extra_cache_nan_free=extra_cache_nan_free,
+        adaptive_splits=adaptive_splits,
     )
-    output.copy_(attn_out.to(output.dtype))
+    if direct_out is None:
+        output.copy_(attn_out.to(output.dtype))

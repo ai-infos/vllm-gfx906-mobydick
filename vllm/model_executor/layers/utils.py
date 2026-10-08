@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright Kevin Read <me@kevin-read.com>
 """Utility methods for model layers."""
 
+import functools
+import os
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -11,20 +15,16 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.triton_utils import tl
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import (
+    flashinfer_bf16_mm,
+    is_flashinfer_cutedsl_bf16_gemm_supported,
+)
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-MOE_LAYER_ROUTER_GATE_SUFFIXES = {
-    "gate",
-    "router",
-    "router_gate",
-    "shared_expert_gate",
-    "expert_gate",
-}
 
 def get_autotune_config():
     return [
@@ -192,7 +192,31 @@ def triton_matmul_kernel(
 
 def triton_matmul(a, b):
     # Check constraints.
-    assert a.shape[1] == b.shape[1], "Incompatible dimensions" # NOTE(gfx906): b.shape inv
+    # 2026-09-15 (DFL2-1): two assumptions asserted here at model warmup for the DFlash2
+    # drafter's projections (x=(2, 7, 5120), weight=(256, 5120)):
+    #   1. activations may be >2-D — flatten the leading dims and restore them on the way
+    #      out (the "n <= 16 and bias is None" branch passes the raw x);
+    #   2. the weight may arrive as [K, N] (upstream's convention) where this kernel wants
+    #      [N, K] (see the `b.shape inv` note below) — transpose that case, and keep the
+    #      assert for genuinely incompatible shapes.
+    # PERF NOTE: this generic fp16 kernel (waves_per_eu=1) is the *fallback* for shapes the
+    # gfx906 skinny/GEMV family does not cover; the DFlash2 draft shapes land here — see
+    # ROADMAP DFL2-7.
+    a_shape = a.shape
+    if a.dim() > 2:
+        a = a.reshape(-1, a.size(-1))
+    if a.shape[1] != b.shape[1] and a.shape[1] == b.shape[0]:
+        logger.warning_once(
+            "triton_matmul: weight passed as [K, N] (a=%s, b=%s); transposing for the "
+            "gfx906 kernel. The kernel's native layout is [N, K].",
+            tuple(a.shape),
+            tuple(b.shape),
+        )
+        b = b.t().contiguous()
+    assert a.shape[1] == b.shape[1], (
+        f"Incompatible dimensions: a={tuple(a.shape)} b={tuple(b.shape)}"
+        " (gfx906 kernel expects b as [N, K])"
+    )
     assert a.dtype == b.dtype, "Matrices A and B must have the same dtype (assuming fp16)"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
@@ -212,12 +236,164 @@ def triton_matmul(a, b):
         c.stride(0), c.stride(1),  #
         **launch_kwargs,
     )
-    return c
+    return c if len(a_shape) == 2 else c.reshape(*a_shape[:-1], N)
 
-def is_layer_moe_router_gate(prefix: str) -> bool:
-    if not prefix:
-        return False
-    return prefix.rsplit(".", 1)[-1] in MOE_LAYER_ROUTER_GATE_SUFFIXES
+
+def _llmm1_tiny_m(weight: torch.Tensor, x_view: torch.Tensor) -> torch.Tensor | None:
+    """ops.LLMM1 requires weight rows % 4 == 0; zero-pad tiny m and slice
+    the result back.
+
+    Returns None for fp32 operands (e.g. a force_fp32_compute router gate
+    on ROCm, where GateLinear stores fp32 weights and casts x to match) so
+    the caller falls back to the triton/torch path; ops.LLMM1 only accepts
+    fp16/bf16.
+
+    gfx906: the custom row-parallel W16A16 GEMV (dense_gemv_gfx906) beats
+    LLMM1 rpb=4 on K=2048 rows with N==256 (router, -17%) or N>=2048
+    (in_proj/qkv/LM-head, -6..-23%); see
+    benchmarks/kernels/gfx906/bench_dense_gemv_gfx906.py. Varying shapes
+    (o_proj K=4096, gate_up 1024, N=64) stay on LLMM1; the shared-expert
+    down_proj [2048, 512] goes to the GEMV (kchunk=512, RPT=2; 5.6-5.7 us
+    vs 6.7-7.7 us LLMM1 rpb4, measured), while the shared gate_up
+    [1024, 2048] is a measured GEMV loss (8.0 vs 7.3 us) and stays on
+    LLMM1. The GEMV is measured only on gfx906 (MI50) and is gated to it;
+    other ROCm targets fall through to LLMM1.
+
+    m==1 (the Qwen3-Next shared-expert gate [1, K]) also goes to the GEMV
+    (RPT=1): the LLMM1 route zero-pads the *constant* weight to [4, K]
+    every call (a fill + copy per layer per step); GEMV RPT=1 is 4.7x
+    faster in isolation and bit-equal at N=1, K=2048 (measured, see
+    docs/gfx906/DEVLOG-moe-opt.md).
+    """
+    if weight.dtype not in (torch.float16, torch.bfloat16) or x_view.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+
+    m = weight.shape[0]
+    from vllm.platforms.rocm import on_gfx906
+
+    gemv_ok = (
+        on_gfx906()
+        and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
+        and weight.dtype == torch.float16
+        and x_view.dtype == torch.float16
+        and weight.is_contiguous()
+    )
+    if gemv_ok:
+        if weight.shape[1] == 2048 and (m == 1 or m == 256 or m >= 2048):
+            return ops.dense_gemv_gfx906(weight, x_view, 2048)
+        # Shared-expert down_proj (dense fp16): 5.6-5.7 us GEMV vs
+        # 6.7-7.7 us LLMM1 rpb4 at kchunk=512/RPT=2 (measured).
+        # Kill switch: VLLM_GFX906_DOWN_GEMV=0 (the outputs are not
+        # bit-equal to LLMM1 — different accumulation order).
+        if (
+            weight.shape[1] == 512
+            and m == 2048
+            and os.environ.get("VLLM_GFX906_DOWN_GEMV", "1") != "0"
+        ):
+            return ops.dense_gemv_gfx906(weight, x_view, 512)
+    if m % 4 == 0:
+        return ops.LLMM1(weight, x_view, 4)
+    out = ops.LLMM1(torch.nn.functional.pad(weight, (0, 0, 0, 4 - m)), x_view, 4)
+    return out[:, :m]
+
+
+def _gfx906_spec_gemv_m4(
+    weight: torch.Tensor, x_view: torch.Tensor
+) -> torch.Tensor | None:
+    """M=2..16 W16A16 dense GEMM via the row-parallel GEMV-family kernel
+    (spec decode L1' for M=2..4; W4 skinny M=5..16, both default on -- the M=5..16
+    rail measured +14.5 % on 35B N=8 and +6.1 % on 27B N=8 in
+    DEVLOG-fp16-skinny.md; VLLM_GFX906_SKINNY_M16=0 is the kill switch; see
+    csrc/rocm/dense_gemv_gfx906.cu).
+
+    The triton_matmul skinny fallback is weight-bound and M-invariant on
+    MI50 (bench_fp16_skinny_m.py: 174 us at M=1..16 for the 3072x5120
+    shape, ~7x off the HBM floor); the GEMV-family kernel keeps the M=1
+    weight-read speed at M=2..4 (bench_fp16_m4.py) and extends it to
+    M=5..16 (W4). Returns None when the shape is unsupported so the
+    caller falls back to the triton path.
+    """
+    from vllm.platforms.rocm import on_gfx906
+
+    if not (
+        on_gfx906()
+        and os.environ.get("VLLM_GFX906_SPEC_GEMM", "1") != "0"
+        and weight.dtype == torch.float16
+        and x_view.dtype == torch.float16
+        and weight.is_contiguous()
+    ):
+        return None
+    m, k = weight.shape  # m = output rows
+    n = x_view.shape[0]  # tokens
+    # Mirror the kernel's RPT env so a non-matching RPT falls back to
+    # triton instead of tripping the launcher's TORCH_CHECK mid-serving.
+    rpt = 2
+    v = os.environ.get("VLLM_GFX906_GEMVM_RPT")
+    if v in ("2", "4"):
+        rpt = int(v)
+    # W4 skinny M=5..16 (gated; see csrc/rocm/dense_gemv_gfx906.cu).
+    # Measured model: this kernel is x-L2-re-read bound at
+    # ~M*B/1.6 TB/s (B = N*K*2 weight bytes) while triton is
+    # ~B/0.2 TB/s on the big shapes (plus a ~100 us floor on small
+    # ones) - crossover at M ~= 7.4, size-independent. Gate: M<=7
+    # everywhere, M=8 to <=32 MB, M>=9 to <=10 MB (small-shape
+    # triton-floor regime).
+    m16 = os.environ.get("VLLM_GFX906_SKINNY_M16", "1") != "0"
+    if rpt == 4:
+        m16 = False  # the m16 kernel is RPT=1
+    if m16 and 5 <= n <= 16:
+        mb = m * k * 2
+        if not (n <= 7 or (n == 8 and mb <= 32 * 1024 * 1024) or
+                mb <= 10 * 1024 * 1024):
+            m16 = False
+    if not (
+        ((2 <= n <= 4) or (m16 and 5 <= n <= 16)) and k % 8 == 0
+        and m % rpt == 0
+    ):
+        return None
+    # Keep the tuned hipBLAS special case (m==5120, 2048<=k<=2304, n=2..16)
+    # below untouched.
+    if m == 5120 and 2048 <= k <= 2304:
+        return None
+    if k % 1024 != 0 and k % 512 != 0:
+        return None
+    kchunk = 2048 if k % 2048 == 0 else (1024 if k % 1024 == 0 else 512)
+    return ops.dense_gemv_m4_gfx906(weight, x_view.contiguous(), kchunk)
+
+
+def _gfx906_gemv_long_k(
+    weight: torch.Tensor, x_view: torch.Tensor
+) -> torch.Tensor | None:
+    """Long-K M=1 GEMVs the LLMM1 route does not cover (gfx906 only).
+
+    The LLMM1 skinny-GEMV route is capped at K<=8192, so without this the
+    Qwen3.5-27B down_proj ([5120, 17408], n==1) and the Qwen3.5 MTP drafter
+    fc ([5120, 10240], n==1) fall to triton_matmul (~794 us and ~544 us
+    respectively). The K-split GEMV runs down_proj in 223.8 us (kchunk=1024,
+    100.2% of the HBM floor, bench
+    benchmarks/kernels/gfx906/bench_dense_gemv_k5120.py) and fc in 148.7 us
+    (kchunk=2048, 705 GB/s). Returns None for unmeasured shapes so the
+    caller can fall back to the triton path.
+    """
+    from vllm.platforms.rocm import on_gfx906
+
+    if not (
+        on_gfx906()
+        and os.environ.get("VLLM_GFX906_DENSE_GEMV", "1") != "0"
+        and weight.dtype == torch.float16
+        and x_view.dtype == torch.float16
+        and weight.is_contiguous()
+        and weight.shape[0] == 5120
+    ):
+        return None
+    if weight.shape[1] == 17408:
+        return ops.dense_gemv_gfx906(weight, x_view, 1024)
+    if weight.shape[1] == 10240:
+        return ops.dense_gemv_gfx906(weight, x_view, 2048)
+    return None
 
 
 def get_token_bin_counts_and_mask(
@@ -287,6 +463,144 @@ def default_unquantized_gemm(
     return torch.nn.functional.linear(x, weight, bias)
 
 
+_FlashInferBf16RuntimeCheck = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor | None], bool
+]
+
+
+@dataclass(frozen=True)
+class _FlashInferBf16Backend:
+    flashinfer_backend: str
+    is_supported: Callable[[], bool]
+    can_implement: _FlashInferBf16RuntimeCheck
+
+
+def _can_use_flashinfer_cutedsl_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> bool:
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    ):
+        return False
+    if x.ndim < 1 or weight.ndim != 2:
+        return False
+    if (
+        not x.is_cuda
+        or not weight.is_cuda
+        or x.device != weight.device
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return False
+
+    k = x.shape[-1]
+    n = weight.shape[0]
+    if (
+        k <= 0
+        or n <= 0
+        or weight.shape[1] != k
+        or k % 128 != 0
+        or x.data_ptr() % 32 != 0
+        or weight.data_ptr() % 32 != 0
+    ):
+        return False
+
+    m = x.numel() // k
+    if not 1 <= m <= 32:
+        return False
+    return bias is None or (
+        bias.is_cuda
+        and bias.device == x.device
+        and bias.dtype == torch.bfloat16
+        and bias.ndim == 1
+        and bias.shape[0] == n
+        and bias.is_contiguous()
+    )
+
+
+_FLASHINFER_BF16_BACKENDS = {
+    "flashinfer_cutedsl": _FlashInferBf16Backend(
+        flashinfer_backend="cute-dsl",
+        is_supported=is_flashinfer_cutedsl_bf16_gemm_supported,
+        can_implement=_can_use_flashinfer_cutedsl_bf16,
+    ),
+}
+
+
+def _get_flashinfer_bf16_backend(vllm_backend: str) -> _FlashInferBf16Backend:
+    backend_spec = _FLASHINFER_BF16_BACKENDS.get(vllm_backend)
+    if backend_spec is None:
+        supported = ", ".join(sorted(_FLASHINFER_BF16_BACKENDS))
+        raise ValueError(
+            f"Unsupported vLLM FlashInfer BF16 backend {vllm_backend!r}; "
+            f"supported backends: {supported}"
+        )
+    return backend_spec
+
+
+def cuda_flashinfer_bf16_gemm_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    pdl: bool,
+    vllm_backend: str,
+) -> torch.Tensor:
+    backend_spec = _get_flashinfer_bf16_backend(vllm_backend)
+    if not backend_spec.can_implement(x, weight, bias):
+        return torch.nn.functional.linear(x, weight, bias)
+
+    k = x.shape[-1]
+    n = weight.shape[0]
+    x_2d = x.view(-1, k)
+    out_2d = flashinfer_bf16_mm(
+        x_2d,
+        weight.t(),
+        bias,
+        pdl,
+        backend_spec.flashinfer_backend,
+    )
+    return out_2d.view(*x.shape[:-1], n)
+
+
+def cuda_flashinfer_bf16_gemm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    pdl: bool,
+    vllm_backend: str,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+def cuda_flashinfer_bf16_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    vllm_backend: str,
+    pdl: bool,
+) -> torch.Tensor:
+    return torch.ops.vllm.cuda_flashinfer_bf16_gemm(
+        x,
+        weight,
+        bias,
+        pdl,
+        vllm_backend,
+    )
+
+
+direct_register_custom_op(
+    op_name="cuda_flashinfer_bf16_gemm",
+    op_func=cuda_flashinfer_bf16_gemm_impl,
+    fake_impl=cuda_flashinfer_bf16_gemm_fake,
+)
+
+
 def use_aiter_triton_gemm(n, m, k, dtype):
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()
@@ -308,34 +622,69 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, bool]:
+    """Pick the K-shard split for wvSplitKrc and say whether the shape fits.
+
+    Mirrors wvSplitKrc() in csrc/rocm/skinny_gemms.cu, which is also where the
+    shard cap is explained. Both must pick the same chunkk or the workspace
+    check here bounds the wrong k_rnd.
+
+    Returns:
+        The CHUNKK the kernel will dispatch with, and whether the CU budget and
+        split-K workspace admit the shape at all.
+    """
+    # Next ^2 of n
+    N_p2 = 1 << (n - 1).bit_length()
+    # How many of 4 waves in a group can work on same 16 Ms at same time?
+    # This reduces the Ms each group works on, i.e. increasing the CUs needed.
+    GrpsShrB = min(N_p2 // 16, 4)
+    # With 64 Ms per CU (each of 4 SIMDs working on a 16x16 tile), and each
+    # working on a 512-shard of K, how many CUs would we need?
+    CuNeeded = ((m + 64 - 1) // 64) * ((k + 512 - 1) // 512) * GrpsShrB
+
+    CHUNKK2_MAX_SHARDS = 11
+    shards_chunkk2 = (k + 256 - 1) // 256  # 256-wide shards
+    chunkk = (
+        2
+        if (
+            N_p2 != 16
+            and CuNeeded * 2 <= cu_count
+            and shards_chunkk2 <= CHUNKK2_MAX_SHARDS
+        )
+        else 1
+    )
+
+    # Deterministic reduction stores one fp32 partial per (M, N, k-shard); all
+    # of them must fit the split-K workspace.
+    k_rnd = (k + 512 // chunkk - 1) // (512 // chunkk)
+    fits = N_p2 * m * k_rnd <= 128 * 1024 * 12 and CuNeeded <= cu_count
+    return chunkk, fits
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx906, on_gfx950
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx906,
+        on_gfx950,
+        on_gfx1250,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
 
+    cu_count = 0
     if not on_gfx906():
         cu_count = num_compute_units()
 
-        # Next ^2 of n
-        N_p2 = 1 << (n - 1).bit_length()
-        # With 64 Ms per CU (each of 4 SIMDs working on a 16x16 tile),
-        # and each working on a 512-shard of K, how many CUs would we need?
-        rndup_cus = ((m + 64 - 1) // 64) * ((k + 512 - 1) // 512)
-        # How many of 4 waves in a group can work on same 16 Ms at same time?
-        # This reduces the Ms each group works on, i.e. increasing the number of CUs
-        # needed.
-        GrpsShrB = min(N_p2 // 16, 4)
-        # Given the above, how many CUs would we need?
-        CuNeeded = rndup_cus * GrpsShrB
-        # candidate for atomic reduce count splitk?
-        fits_wvsplitkrc = (
-            N_p2 * m * ((k + 512 - 1) // 512)
-        ) <= 128 * 1024 * 12  # deterministic
-        fits_wvsplitkrc &= CuNeeded <= cu_count
+        _, fits_wvsplitkrc = wvsplitkrc_dispatch(n, k, m, cu_count)
+
+        skinny_operands_compatible = weight.is_contiguous() and (
+            bias is None or bias.is_contiguous()
+        )
 
         use_skinny_reduce_counting = (
             envs.VLLM_ROCM_USE_SKINNY_GEMM
@@ -348,13 +697,19 @@ def rocm_unquantized_gemm_impl(
                 and k > 512
                 and m % 16 == 0
                 and fits_wvsplitkrc
-                and weight.is_contiguous()
+                and skinny_operands_compatible
             )
         )
-        if use_skinny_reduce_counting:
-            return ops.wvSplitKrc(x, weight, cu_count, bias)
 
-        if use_aiter_triton_gemm(n, m, k, x.dtype):
+        if use_skinny_reduce_counting:
+            x_view = x.reshape(-1, x.size(-1)).contiguous()
+            return ops.wvSplitKrc(x_view, weight, cu_count, bias)
+
+        # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
+        # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
+        # partial last tile). Some whitelisted shapes have K=2880 (e.g. gpt-oss-120b
+        # hidden), so skip aiter there and fall back to the torch GEMM path below.
+        if use_aiter_triton_gemm(n, m, k, x.dtype) and not (on_gfx1250() and k % 256 != 0):
             from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
             return gemm_a16w16(x, weight, bias)
@@ -364,26 +719,68 @@ def rocm_unquantized_gemm_impl(
         and (on_gfx9() or on_gfx1x() or on_gfx906())
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0
+        and (weight.is_contiguous() and (bias is None or bias.is_contiguous()))
     )
 
-    if not use_skinny:
-        return torch.nn.functional.linear(x, weight, bias)
+    if use_skinny:
+        # The skinny kernels assume contiguous K elements. A shape-preserving
+        # reshape can retain a transposed activation's non-contiguous strides.
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
+        # wvSplitK targets CDNA/RDNA matrix cores and is not supported on
+        # gfx906 (GCN5/Vega20); exclude it here so small batches fall through
+        # to the Triton skinny-GEMM path below, matching the pre-main behavior.
+        if m > 8 and 0 < n <= 5 and not on_gfx906():
+            cu_count = num_compute_units()
+            out = ops.wvSplitK(weight, x_view, cu_count, bias)
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+        elif (
+            (m % 4 == 0 or m < 4)
+            and n == 1
+            and bias is None
+            and (k <= 8192 or (on_gfx906() and k in (10240, 17408)))
+        ):
+            if k <= 8192:
+                out = _llmm1_tiny_m(weight, x_view)
+            else:
+                out = _gfx906_gemv_long_k(weight, x_view)
+            if out is not None:
+                return out.reshape(*x.shape[:-1], weight.shape[0])
+            return triton_matmul(x_view, weight)
 
     x_view = x.reshape(-1, x.size(-1))
     # Prefer skinny GEMV kernel
     if (
-        m % 4 == 0
+        (m % 4 == 0 or m < 4)
         and n == 1
-        and k <= 8192
         and bias is None
+        and (k <= 8192 or (on_gfx906() and k in (10240, 17408)))
     ):
-        out = ops.LLMM1(weight, x_view, 4)
-        return out.reshape(*x.shape[:-1], weight.shape[0])
+        # fp32 single-token GEMV (e.g. force_fp32_compute router gates):
+        # hipBLAS sgemv is ~15x faster than the fp32 triton/sgemm skinny
+        # paths on gfx906 (8 vs 118-142 us at the [128, 2688] gate shape);
+        # the fp16 GEMV family rejects fp32 operands.
+        if x_view.dtype == torch.float32:
+            return torch.mv(weight, x_view[0]).reshape(
+                *x.shape[:-1], weight.shape[0]
+            )
+        if k <= 8192:
+            out = _llmm1_tiny_m(weight, x_view)
+        else:
+            out = _gfx906_gemv_long_k(weight, x_view)
+        if out is not None:
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+        return triton_matmul(
+            x if x.is_contiguous() else x.contiguous(), weight
+        )
     elif m > 8 and 0 < n <= 4 and (on_gfx9() or on_gfx1x()):
-        out = ops.wvSplitK(weight, x_view, cu_count, bias) # matrix cores not supported by gfx906 so excluded here
+        out = ops.wvSplitK(weight, x_view, cu_count, bias)  # matrix cores not supported by gfx906 so excluded here
         return out.reshape(*x.shape[:-1], weight.shape[0])
     # low batch size, use triton matmul
     elif n <= 16 and bias is None:
+        # M=2..4 (spec decode draft steps): GEMV-family skinny kernel
+        out = _gfx906_spec_gemv_m4(weight, x_view)
+        if out is not None:
+            return out.reshape(*x.shape[:-1], weight.shape[0])
         # gfx906 / MI50:
         # For Qwen3.6 TP=8 MLP down projection, the shape is typically:
         #   x:      [n, 2176]
@@ -402,8 +799,6 @@ def rocm_unquantized_gemm_impl(
 
     # otherwise, use native torch
     return torch.nn.functional.linear(x, weight, bias)
-
-
 def rocm_unquantized_gemm_fake(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -426,13 +821,73 @@ direct_register_custom_op(
 )
 
 
+@functools.cache
+def warmup_rocm_skinny_gemm_workspaces(device: torch.device) -> None:
+    """Eagerly allocate wvSplitKrc's per-device split-K workspace pool.
+
+    wvSplitKrc partitions one per-device allocation into ``kWvSlots`` slots
+    (csrc/rocm/skinny_gemms.cu) and hands each stream one on first use, so that
+    two streams never share the split-K partials and counters.
+
+    The pool is otherwise created lazily on the first qualifying GEMM
+    (csrc/rocm/skinny_gemms.cu), which can be the first real request — after
+    the KV cache backing buffer exists. If it landed in that segment's rounding
+    tail, it would pin the entire segment at engine shutdown; it could also land
+    inside a cudagraph capture, where it would be taken from the graph's private
+    pool and its zero-fill would become a replayed graph node.
+    """
+    from vllm.platforms.rocm import on_gfx950
+
+    if not on_gfx950():
+        return
+    try:
+        x = torch.zeros(16, 1024, dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(32, 1024, dtype=torch.bfloat16, device=device)
+        ops.wvSplitKrc(x, weight, num_compute_units())
+    except Exception:
+        logger.debug("wvSplitKrc workspace warmup failed", exc_info=True)
+
+
+# Above this weight size, oneDNN's onednn_mm consistently matches or beats
+# the SGL AMX kernel once M grows past decode-sized batches, and is within
+# noise of it at decode-sized M -- so larger weights default to oneDNN
+# rather than SGL. 1 MiB comfortably covers MoE router/gate weights (e.g.
+# (2048, 128) .. (2880, 32) bf16/fp16, 180-720 KiB) while staying well below
+# any dense qkv/o_proj/gate_up/down/lm_head projection in practice. This
+# threshold is derived from bf16/fp16 unquantized dense-GEMM benchmarks only,
+# so it does not apply to the int8 scaled_mm path below.
+_CPU_SGL_GEMM_MAX_WEIGHT_BYTES = 1 * 1024 * 1024
+
+
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
-    return (
-        torch.cpu._is_amx_tile_supported()
-        and (dtype in (torch.bfloat16, torch.int8))
-        and k % 32 == 0
-        and n % 16 == 0
-    )
+    if not torch.cpu._is_amx_tile_supported() or dtype not in (
+        torch.bfloat16,
+        torch.float16,
+        torch.int8,
+    ):
+        return False
+    if dtype == torch.float16 and not torch.cpu._is_amx_fp16_supported():
+        # AMX-BF16/INT8 (amx_tile) and AMX-FP16 are separate CPU ISA
+        # extensions -- e.g. Sapphire/Emerald Rapids expose the former but
+        # not the latter -- and can_use_brgemm<at::Half> (gemm.h) always
+        # attempts brgemm for fp16 regardless of M, so this needs its own
+        # capability check rather than piggybacking on amx_tile.
+        return False
+    if dtype == torch.int8:
+        # int8_scaled_mm_with_quant requires the packed weight to stay int8
+        # (gemm_int8.cpp); convert_weight_packed's N < TILE_N fallback
+        # returns a float32 tensor instead (gemm.cpp), which would trip
+        # that check, so N must be a full TILE_N tile here.
+        return k % 32 == 0 and n % 16 == 0
+    if n * k * dtype.itemsize > _CPU_SGL_GEMM_MAX_WEIGHT_BYTES:
+        return False
+    if n < 16:
+        # convert_weight_packed transposes to fp32 instead of VNNI-packing
+        # when N < TILE_N (gemm.cpp), and weight_packed_linear detects that
+        # (via the packed weight's dtype) and routes to its fp32/brgemm
+        # fallback kernel -- no N/K alignment required in that regime.
+        return True
+    return k % 32 == 0 and n % 16 == 0
 
 
 def dispatch_cpu_unquantized_gemm(
@@ -444,17 +899,30 @@ def dispatch_cpu_unquantized_gemm(
         layer.cpu_linear = torch.nn.functional.linear
         return
 
+    # Skip CPU GEMM dispatch for non-2D weights (e.g. MoE 3D expert weights).
+    # These layers are handled by their own specialized methods.
     if layer.weight.ndim != 2:
         # this is not a linear layer
-        # For now it should be a causal_conv1d op
-        if torch.cpu._is_amx_tile_supported():
+        # For now it should be a causal_conv1d op or MoE 3D expert weights
+        # The C++ causal_conv1d kernels use VDPBF16PS (no AMX tiles), so the
+        # VNNI weight prepack applies to any AVX-512BF16 CPU, not just AMX
+        # (e.g. AMD Zen5/Turin).
+        if torch.cpu._is_avx512_bf16_supported() and hasattr(
+            ops, "causal_conv1d_weight_pack"
+        ):
             # prepack conv weight
-            layer.weight.data = ops.causal_conv1d_weight_pack(
+            unpacked = (
                 layer.weight.view(
                     layer.weight.size(0),
                     layer.weight.size(2),
                 )
+                .contiguous()
+                .clone()
             )
+            # Stash the un-packed (dim, width) weight so the speculative-decode
+            # GDN path (which uses torch conv, not the C++ kernel) can use it.
+            layer._cpu_unpacked_conv_weight = unpacked
+            layer.weight.data = ops.causal_conv1d_weight_pack(unpacked)
         return
 
     N, K = layer.weight.size()
@@ -482,21 +950,38 @@ def dispatch_cpu_unquantized_gemm(
         )
         if remove_weight:
             layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        logger.debug_once(
+            "CPU unquantized GEMM dispatch: using zentorch_linear_unary (prepacked=%s)",
+            is_prepacked,
+        )
         return
 
-    if envs.VLLM_CPU_SGL_KERNEL and check_cpu_sgl_kernel(N, K, dtype):
+    # Small weights (e.g. MoE router/gate projections, where N is the expert
+    # count rather than a hidden-size-scaled dimension) never reach oneDNN's
+    # compute-bound regime, no matter how large the batch gets: SGL's lower
+    # per-call dispatch overhead wins consistently across the full measured
+    # M range. Larger dense projections (qkv/o_proj/gate_up/down/lm_head)
+    # cross over to favoring oneDNN once batch size grows past decode-sized
+    # M, so they keep using oneDNN below.
+    if check_cpu_sgl_kernel(N, K, dtype):
+        # For small size GEMM, packed_weight might be float32
         packed_weight = torch.ops._C.convert_weight_packed(layer.weight)
         if getattr(layer, "bias", None) is not None:
-            bias_f32 = layer.bias.to(torch.float32)
-        else:
-            bias_f32 = None
-        layer.cpu_linear = lambda x, weight, bias: torch.ops._C.weight_packed_linear(
-            x, packed_weight, bias_f32 if bias is not None else None, True
+            layer.bias.data = layer.bias.to(torch.float32)
+        layer.cpu_linear = lambda x, weight, bias: ops.weight_packed_linear_cpu(
+            x,
+            packed_weight,
+            N,
+            bias,
         )
         if remove_weight:
             layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        logger.debug_once(
+            "CPU unquantized GEMM dispatch: using sgl-kernel weight_packed_linear"
+        )
         return
-    elif (
+
+    if (
         ops._supports_onednn
         and current_platform.get_cpu_architecture() != CpuArchEnum.POWERPC
     ):
@@ -506,6 +991,7 @@ def dispatch_cpu_unquantized_gemm(
             layer.cpu_linear = lambda x, weight, bias: ops.onednn_mm(handler, x, bias)
             if remove_weight:
                 layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+            logger.debug_once("CPU unquantized GEMM dispatch: using oneDNN onednn_mm")
             return
         except RuntimeError as e:
             logger.warning_once(
@@ -516,6 +1002,9 @@ def dispatch_cpu_unquantized_gemm(
     # fallback case
     layer.cpu_linear = lambda x, weight, bias: torch.nn.functional.linear(
         x, weight, bias
+    )
+    logger.debug_once(
+        "CPU unquantized GEMM dispatch: using torch.nn.functional.linear (fallback)"
     )
 
 
@@ -528,10 +1017,36 @@ def cpu_unquantized_gemm(
     return layer.cpu_linear(x, weight, bias)
 
 
-def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
+def dispatch_unquantized_gemm(
+    linear_backend: str = "auto",
+) -> Callable[..., torch.Tensor]:
     if current_platform.is_rocm():
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
-    else:
+    elif not current_platform.is_cuda():
         return default_unquantized_gemm
+
+    backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
+    if backend_spec is None:
+        return default_unquantized_gemm
+
+    if not backend_spec.is_supported():
+        logger.warning_once(
+            "--linear-backend=%s requested FlashInfer mm_bf16 backend %r, "
+            "but it is unavailable on the current hardware or environment; "
+            "using automatic selection for unquantized linear layers.",
+            linear_backend,
+            backend_spec.flashinfer_backend,
+        )
+        return default_unquantized_gemm
+
+    logger.info_once(
+        "Using FlashInfer %s for eligible unquantized BF16 GEMMs.",
+        backend_spec.flashinfer_backend,
+    )
+    return functools.partial(
+        cuda_flashinfer_bf16_gemm,
+        vllm_backend=linear_backend,
+        pdl=current_platform.is_arch_support_pdl(),
+    )

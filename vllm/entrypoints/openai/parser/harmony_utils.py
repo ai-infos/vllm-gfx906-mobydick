@@ -13,6 +13,7 @@ from openai_harmony import (
     HarmonyEncodingName,
     Message,
     ReasoningEffort,
+    RenderConversationConfig,
     Role,
     StreamableParser,
     SystemContent,
@@ -23,6 +24,7 @@ from openai_harmony import (
 
 from vllm import envs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -122,9 +124,10 @@ def get_system_message(
     if reasoning_effort is not None:
         if reasoning_effort not in REASONING_EFFORT:
             supported_values = ", ".join(REASONING_EFFORT)
-            raise ValueError(
+            raise VLLMValidationError(
                 f"reasoning_effort={reasoning_effort!r} is not supported by "
-                f"Harmony. Supported values are: {supported_values}."
+                f"Harmony. Supported values are: {supported_values}.",
+                parameter="reasoning_effort",
             )
         sys_msg_content = sys_msg_content.with_reasoning_effort(
             REASONING_EFFORT[reasoning_effort]
@@ -180,7 +183,10 @@ def get_developer_message(
             elif tool.type == "function":
                 function_tools.append(tool)
             else:
-                raise ValueError(f"tool type {tool.type} not supported")
+                raise VLLMValidationError(
+                    f"tool type {tool.type!r} is not supported.",
+                    parameter="tools",
+                )
         if function_tools:
             function_tool_descriptions = [
                 create_tool_definition(tool) for tool in function_tools
@@ -220,7 +226,6 @@ def parse_chat_inputs_to_harmony_messages(chat_msgs: list) -> list[Message]:
     for chat_msg in chat_msgs:
         msgs.extend(parse_chat_input_to_harmony_message(chat_msg, tool_id_names))
 
-    msgs = auto_drop_analysis_messages(msgs)
     return msgs
 
 
@@ -297,7 +302,10 @@ def extract_instructions_from_messages(
         elif hasattr(first_message, "model_dump"):
             first_message = first_message.model_dump(exclude_none=True)
         else:
-            raise ValueError(f"Unknown message type: {type(first_message)}")
+            raise VLLMValidationError(
+                f"Unknown message type: {type(first_message)}",
+                parameter="input",
+            )
 
     if first_message.get("role") not in (
         "system",
@@ -447,9 +455,12 @@ def parse_chat_input_to_harmony_message(
 
 
 def render_for_completion(messages: list[Message]) -> list[int]:
+    messages = auto_drop_analysis_messages(messages)
     conversation = Conversation.from_messages(messages)
     token_ids = get_encoding().render_conversation_for_completion(
-        conversation, Role.ASSISTANT
+        conversation,
+        Role.ASSISTANT,
+        config=RenderConversationConfig(auto_drop_analysis=False),
     )
     return token_ids
 

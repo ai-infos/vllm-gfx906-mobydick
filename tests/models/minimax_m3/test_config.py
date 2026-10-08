@@ -53,11 +53,11 @@ def test_minimax_m3_indexer_cache_uses_float16_spec_dtype():
 
 def test_minimax_m3_indexer_triton_impl_accepts_float16():
     assert (
-        select_indexer_impl_cls(indexer_kv_dtype="float16")
+        select_indexer_impl_cls(topk_blocks=16, indexer_kv_dtype="float16")
         is MiniMaxM3IndexerTritonImpl
     )
     assert (
-        select_indexer_impl_cls(indexer_kv_dtype="fp16")
+        select_indexer_impl_cls(topk_blocks=16, indexer_kv_dtype="fp16")
         is MiniMaxM3IndexerTritonImpl
     )
 
@@ -65,7 +65,6 @@ def test_minimax_m3_indexer_triton_impl_accepts_float16():
 def test_minimax_m3_backends_advertise_float16_kv_cache():
     assert "float16" in MiniMaxM3SparseBackend.supported_kv_cache_dtypes
     assert "float16" in MiniMaxM3IndexerBackend.supported_kv_cache_dtypes
-
 
 
 class _FakeModule(torch.nn.Module):
@@ -117,27 +116,59 @@ def test_minimax_m3_platform_sparse_attention_passes_indexer_dtype():
             cache_config=CacheConfig(cache_dtype="float16", block_size=128),
         )
 
-        with (
-            set_current_vllm_config(vllm_config),
+        # The amd and nvidia sparse-attention classes diverged (split indexer
+        # projections + the AITER selector vs the fused QKV projection), so
+        # patch only the names each module actually exposes.
+        patches = [
             patch.object(
                 module, "get_tensor_model_parallel_world_size", return_value=1
             ),
-            patch.object(module, "MinimaxM3QKVParallelLinearWithIndexer", _FakeModule),
             patch.object(module, "RowParallelLinear", _FakeModule),
             patch.object(module, "MiniMAXGemmaRMSNorm", _FakeModule),
-            patch.object(module, "_build_rotary_emb", return_value=SimpleNamespace()),
-            patch.object(module, "select_main_impl_cls", return_value=_FakeImpl),
+            patch.object(
+                module,
+                "select_main_backend_and_impl_cls",
+                return_value=(object, _FakeImpl),
+            ),
             patch.object(module, "MiniMaxM3Indexer", side_effect=make_indexer),
+        ]
+        # amd builds the rotary with `_build_rotary_emb`, nvidia with `get_rope`.
+        for fn_name in ("_build_rotary_emb", "get_rope"):
+            if hasattr(module, fn_name):
+                patches.append(
+                    patch.object(module, fn_name, return_value=SimpleNamespace())
+                )
+        for cls_name in (
+            "QKVParallelLinear",
+            "ReplicatedLinear",
+            "MinimaxM3QKVParallelLinearWithIndexer",
         ):
-            module.MiniMaxM3SparseAttention(
-                config=_make_sparse_text_config(),
-                layer_id=3,
-                prefix=f"{module_name}.layers.3.self_attn",
-                cache_config=vllm_config.cache_config,
+            if hasattr(module, cls_name):
+                patches.append(patch.object(module, cls_name, _FakeModule))
+        if hasattr(module, "select_aiter_indexer_impl_cls"):
+            patches.append(
+                patch.object(module, "select_aiter_indexer_impl_cls", return_value=None)
+            )
+        if hasattr(module, "get_tensor_model_parallel_rank"):
+            patches.append(
+                patch.object(module, "get_tensor_model_parallel_rank", return_value=0)
             )
 
-        assert indexer_kwargs[0]["indexer_kv_dtype"] == "float16"
+        with set_current_vllm_config(vllm_config):
+            for p in patches:
+                p.start()
+            try:
+                module.MiniMaxM3SparseAttention(
+                    config=_make_sparse_text_config(),
+                    layer_id=3,
+                    prefix=f"{module_name}.layers.3.self_attn",
+                    cache_config=vllm_config.cache_config,
+                )
+            finally:
+                for p in patches:
+                    p.stop()
 
+        assert indexer_kwargs[0]["indexer_kv_dtype"] == "float16"
 
 
 class _MiniMaxM3ProcessingInfoForTest(MiniMaxM3VLProcessingInfo):
@@ -168,3 +199,40 @@ def test_minimax_m3_video_zero_limit_disables_video_budget():
 
     assert info.allowed_mm_limits["image"] == 1
     assert info.allowed_mm_limits["video"] == 0
+
+
+def test_minimax_m3_gfx906_routes_to_triton_not_cdna_aiter():
+    """gfx906 must take the generic gfx906-safe paths, never the CDNA/AITER ones.
+
+    The 0.30.0 merge took upstream's selector (`select_main_backend_and_impl_cls`
+    / `select_aiter_indexer_impl_cls`), which are gfx942/gfx950-gated. This pins
+    that the MI50 still lands on `MiniMaxM3SparseBackend` + the Triton impl and
+    on the `common.ops` sparse-attn kernels (which carry the gfx906 LDS-safe
+    launch kwargs) rather than `amd.ops`.
+    """
+    from vllm.models.minimax_m3.common import sparse_attention as sa_module
+    from vllm.models.minimax_m3.common.ops import sparse_attn as common_attn
+    from vllm.models.minimax_m3.common.sparse_attention import (
+        MiniMaxM3SparseTritonImpl,
+        select_main_backend_and_impl_cls,
+    )
+    from vllm.platforms import current_platform
+    from vllm.platforms.rocm import on_gfx906
+
+    if not (current_platform.is_rocm() and on_gfx906()):
+        import pytest
+
+        pytest.skip("gfx906-only routing gate")
+
+    backend, impl_cls = select_main_backend_and_impl_cls(
+        topk_blocks=16, kv_cache_dtype="float16", num_kv_heads=1
+    )
+    assert backend is MiniMaxM3SparseBackend
+    assert impl_cls is MiniMaxM3SparseTritonImpl
+
+    # The attend symbols must come from common.ops (LDS-safe on MI50), not amd.ops.
+    assert sa_module.minimax_m3_sparse_attn is common_attn.minimax_m3_sparse_attn
+    assert (
+        sa_module.minimax_m3_sparse_attn.__module__
+        == "vllm.models.minimax_m3.common.ops.sparse_attn"
+    )
