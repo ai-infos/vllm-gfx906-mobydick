@@ -702,5 +702,32 @@ def test_gfx906_moe_gemm_m1_shape_gate(layout):
         assert rel < 1e-1, f"shape-gate fallback gemm2 ({name}) too far: maxrel={rel:.2e}"
 
 
+@pytest.mark.parametrize("block_size", [0, -1, 3])
+def test_gfx906_moe_rejects_invalid_block_size_before_launch(block_size):
+    from vllm import _custom_ops as ops
+    from vllm.platforms.rocm import on_gfx906
+
+    if not on_gfx906():
+        pytest.skip("Requires the gfx906 native operator")
+    device = "cuda"
+    with pytest.raises(RuntimeError, match="block_size_m must be"):
+        ops.moe_gptq_gemm_gfx906(
+            torch.zeros(1, 128, dtype=torch.float16, device=device),
+            torch.zeros(1, 8, dtype=torch.float16, device=device),
+            torch.zeros(1, 16, 8, dtype=torch.int32, device=device),
+            torch.ones(1, 1, 8, dtype=torch.float16, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            torch.empty(0, dtype=torch.float32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.ones(1, dtype=torch.int32, device=device),
+            1,
+            block_size,
+            False,
+            0,
+            0,
+        )
+
+
 if __name__ == "__main__":
     print("run via pytest")

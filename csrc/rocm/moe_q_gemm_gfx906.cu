@@ -853,6 +853,24 @@ void moe_gptq_gemm_gfx906(torch::Tensor a, torch::Tensor c,
   // Used as a divisor inside the kernels (token_id / top_k): a zero would
   // be on-device UB, so fail on the host instead.
   TORCH_CHECK(top_k > 0, "moe_gptq_gemm_gfx906: top_k must be positive");
+  TORCH_CHECK(block_size_m == 1 || block_size_m == 2 || block_size_m == 4 ||
+                  block_size_m == 8 || block_size_m == 16,
+              "moe_gptq_gemm_gfx906: block_size_m must be 1, 2, 4, 8 or 16");
+  TORCH_CHECK(
+      sorted_token_ids.dim() == 1 &&
+          sorted_token_ids.size(0) % block_size_m == 0,
+      "moe_gptq_gemm_gfx906: sorted token rows must contain full blocks");
+  TORCH_CHECK(b_scales.size(0) == b_q_weight.size(0),
+              "moe_gptq_gemm_gfx906: scale expert count must match qweight");
+  if (has_zp) {
+    TORCH_CHECK(
+        b_qzeros.size(0) == b_q_weight.size(0) &&
+            b_qzeros.size(1) == b_scales.size(1),
+        "moe_gptq_gemm_gfx906: zero-point expert/group counts must match");
+  }
+  TORCH_CHECK(expert_ids.dim() == 1 &&
+                  expert_ids.size(0) >= sorted_token_ids.size(0) / block_size_m,
+              "moe_gptq_gemm_gfx906: expert ids must cover every token block");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   auto stream = at::cuda::getCurrentCUDAStream();

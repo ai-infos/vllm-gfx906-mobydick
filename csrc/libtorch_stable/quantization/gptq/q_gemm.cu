@@ -163,13 +163,8 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -297,13 +292,8 @@ __global__ void gemm_half_q_half_gptq_2bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -415,13 +405,8 @@ __global__ void gemm_half_q_half_gptq_3bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -540,13 +525,8 @@ __global__ void gemm_half_q_half_gptq_8bit_kernel(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 
@@ -1561,11 +1541,10 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
                   "groups");
   STD_TORCH_CHECK(a.size(1) % num_groups == 0, "Input size K = ", a.size(1),
                   " is not divisible by the number of groups = ", num_groups);
-  // gfx906: `empty` + the in-kernel zeroing at blockIdx.z == 0 replaces
-  // upstream's new_zeros (the gfx906 kernels are the only launch path that
-  // relies on it).
+  // Split-K CTAs have no global barrier: initialize before any atomic add.
   auto c = torch::stable::empty({a.size(0), b_q_weight.size(1)},
                                 a.scalar_type(), std::nullopt, a.device());
+  torch::stable::zero_(c);
   auto temp_dq =
       torch::stable::empty({b_q_weight.size(0) * 32 / bit, b_q_weight.size(1)},
                            a.scalar_type(), std::nullopt, a.device());

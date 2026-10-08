@@ -31,6 +31,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
     resolve_moe_use_td,
     warn_if_moe_use_td_ineffective,
 )
+from vllm.model_executor.layers.quantization.utils.gfx906_fp8 import (
+    decode_e4m3_to_fp16,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx906
 from vllm.triton_utils import tl, triton
@@ -359,6 +362,7 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     on_gfx906: tl.constexpr,
+    fp8_fnuz: tl.constexpr,
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
@@ -561,13 +565,7 @@ def fused_moe_kernel(
                         a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                     )
                 else:
-                    # Bitwise E4M3 -> FP16 dequant for B (b is already uint8)
-                    b_sign = (b & 0x80).to(tl.uint16) << 8
-                    b_exp = ((b & 0x78) >> 3).to(tl.uint16)
-                    b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
-                    b_mant = (b & 0x07).to(tl.uint16) << 7
-                    b_bits = b_sign | (b_exp << 10) | b_mant
-                    b = b_bits.to(tl.float16, bitcast=True)
+                    b = decode_e4m3_to_fp16(b, fp8_fnuz)
                 
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
                 if on_gfx906:
@@ -940,6 +938,7 @@ def invoke_fused_moe_triton_kernel(
         USE_TD=use_td,
         **config,
         on_gfx906=on_gfx906(),
+        fp8_fnuz=B.dtype == torch.float8_e4m3fnuz,
     )
 
 

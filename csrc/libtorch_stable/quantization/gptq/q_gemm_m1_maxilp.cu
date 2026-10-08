@@ -116,13 +116,8 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel_m1mi(
     }
   }
 
-  // Zero output
+  // Output is zeroed on the stream before the split-K launch.
   if (n >= size_n) return;
-
-  if (blockIdx.z == 0) {
-    for (int m = 0; m < m_count; m++)
-      *((uint64_t*)c_.item_ptr(offset_m + m, n)) = 0;
-  }
 
   __syncthreads();
 

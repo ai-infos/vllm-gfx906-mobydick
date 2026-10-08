@@ -1,0 +1,5 @@
+# Linux build entry points must remain executable by Bash from Windows checkouts.
+/build_and_push_docker.sh text eol=lf
+/build_rust.sh text eol=lf
+/docker/gfx906-build.env text eol=lf
+/docker/Dockerfile.gfx906 text eol=lf

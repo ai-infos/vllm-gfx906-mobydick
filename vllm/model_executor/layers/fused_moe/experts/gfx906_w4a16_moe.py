@@ -35,6 +35,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import current_platform
+from vllm.utils.gfx906 import fused_align_m1_supported
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import on_gfx906
@@ -56,13 +57,6 @@ def _has_gfx906_align_m1_op() -> bool:
     )
 
 
-# (E, topk) pairs the single-CTA fused align+sort kernel serves.
-_ALIGN_M1_SHAPES = {
-    (256, 8),  # Qwen3.5-35B (C1 stage 1)
-    (128, 6),  # Nemotron-3.5-Lightning (NH-5)
-}
-
-
 def _use_fused_align_m1(
     topk_ids: torch.Tensor,
     block_size_m: int,
@@ -73,28 +67,21 @@ def _use_fused_align_m1(
 
     One 128-thread CTA replaces the two-kernel generic chain
     (moe_align_block_size_kernel + count_and_sort_expert_tokens); outputs
-    are bit-equal to it for each (E, topk) in _ALIGN_M1_SHAPES at
+    are bit-equal to it for each (E, topk) in the supported shape set at
     block_size=1 (see docs/gfx906/DEVLOG-moe-c1-routing-fusion.md and
     DEVLOG-nemotron-h.md NH-5). Serving A/B (Qwen3.5-35B): +1.18% to
     +1.73% MoE decode t/s (207-301 us/step), so it is the default;
     VLLM_GFX906_ALIGN_M1=0 to opt out. V1 only -- see the REL30-1 note in the
     return below.
     """
-    return (
-        os.environ.get("VLLM_GFX906_ALIGN_M1", "1") == "1"
-        # REL30-1: under the V2 runner the align op's out-params come back
-        # uninitialized (the fused kernel's writes are not honoured on that
-        # compiled/captured path), so the M=1 GEMM indexes the expert tables
-        # with garbage ids. Only V1 -- which every serve recipe pins with
-        # VLLM_USE_V2_MODEL_RUNNER=0 -- may use it.
-        and envs.VLLM_USE_V2_MODEL_RUNNER is False
-        and _has_gfx906_align_m1_op()
-        and expert_map is None
-        and topk_ids.size(0) == 1
-        and block_size_m == 1
-        and (global_num_experts, topk_ids.size(1)) in _ALIGN_M1_SHAPES
-        and topk_ids.dtype == torch.int32
-    )
+    # REL30-1: the fused align returns uninitialized outputs under V2 capture.
+    return fused_align_m1_supported(
+        topk_ids,
+        block_size_m,
+        global_num_experts,
+        expert_map,
+        envs.VLLM_USE_V2_MODEL_RUNNER,
+    ) and _has_gfx906_align_m1_op()
 
 
 def _moe_align_block_size_fused_m1(
@@ -125,7 +112,8 @@ def _block_size_m_for(M: int, topk: int) -> int:
 
     `VLLM_GFX906_MOE_BM` pins the **mid bucket** (32 < em <= 512) for an A/B; the low
     (em <= 32, BM=1 + the M=1 gemm2 tile) and high (prefill, BM=8) buckets always keep
-    their choice, so the knob is inert by default and the A/B isolates one tile. The 2026-09-16 isolated sweep measured the
+    their choice, so the knob is inert by default and the A/B isolates one tile.
+    The 2026-09-16 isolated sweep measured the
     shipped mid bucket (BM=4) as the worst of the three at every production em — see
     benchmarks/kernels/gfx906/bench_moe_bm_sweep.py and the C2-BM>=2 note in
     docs/gfx906/DEVLOG-moe-c2v.md. A serving A/B is the gate for changing the default.

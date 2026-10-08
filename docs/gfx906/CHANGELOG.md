@@ -1,5 +1,16 @@
 # gfx906 changelog
 
+## 2026-10-08 (ai-infos v0.30.0 integration)
+
+`gfx906/v0.30.0.x` fast-forwards the existing fork to KIntegrated's pinned
+v0.30.0 reference, then fixes demonstrated attention, FP8 conversion, GPTQ
+initialization, native MoE validation, and local build defects. Optimized
+defaults and the explicit-V1 fused-align gate are retained. Inputs, complete
+change inventories, build pins, validation results, and GPU checks still
+required are recorded in [UPGRADE-0.30.0.x.md](UPGRADE-0.30.0.x.md).
+
+## Reference history
+
 This file records roadmap items that are complete, rejected, superseded, or
 otherwise closed. Active work, deferred work, and changes that are local but
 still need upstream merging remain in the roadmap files. Dates are landing or

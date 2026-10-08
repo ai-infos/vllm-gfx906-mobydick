@@ -51,11 +51,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Limit include scope to project_dir only
-    includes = [os.path.join(args.project_dir, "*")]
-
-    # Get absolute path for all source files.
-    extra_files = [os.path.abspath(s) for s in args.sources]
+    # Hipify must process the copied tree so quoted headers are converted too.
+    project_directory = os.path.abspath(args.project_dir)
+    output_directory = os.path.abspath(args.output_dir)
+    extra_files = []
+    for source in args.sources:
+        source_abs = os.path.abspath(source)
+        if os.path.commonpath([project_directory, source_abs]) == project_directory:
+            source_abs = os.path.join(
+                output_directory, os.path.relpath(source_abs, project_directory)
+            )
+        elif os.path.commonpath([output_directory, source_abs]) != output_directory:
+            raise ValueError(f"Source outside project directory: {source}")
+        extra_files.append(source_abs)
 
     # Copy sources from project directory to output directory.
     # The directory might already exist to hold object files so we ignore that.
@@ -65,14 +73,14 @@ if __name__ == "__main__":
         shutil.copytree(args.project_dir, args.output_dir, dirs_exist_ok=True)
 
     hipify_result = hipify(
-        project_directory=args.project_dir,
-        output_directory=args.output_dir,
+        project_directory=project_directory,
+        output_directory=output_directory,
         # Hipify resolves quoted includes next to the including file first; vLLM
         # uses paths relative to csrc/ (e.g. "libtorch_stable/torch_utils.h"
         # from quantization/w8a8/fp8/*.cu). Without an include root here, those
         # headers are never found and are not hipified or rewritten in dependents.
         header_include_dirs=["."],
-        includes=includes,
+        includes=[os.path.join(project_directory, "*")],
         extra_files=extra_files,
         show_detailed=True,
         is_pytorch_extension=True,
@@ -80,14 +88,13 @@ if __name__ == "__main__":
     )
 
     hipified_sources = []
-    for source in args.sources:
-        s_abs = os.path.abspath(source)
+    for s_abs in extra_files:
         if s_abs in hipify_result and hipify_result[s_abs].hipified_path is not None:
             path = hipify_result[s_abs].hipified_path
             # PyTorch skips writing when is_pytorch_extension and text unchanged;
             # hipified_path then stays *.cu. CMake expects *.hip under output_dir.
             if s_abs.endswith(".cu") and path.endswith(".cu"):
-                dest = _expected_hip_build_path(s_abs, args.output_dir)
+                dest = _expected_hip_build_path(s_abs, output_directory)
                 if os.path.normpath(path) != os.path.normpath(dest):
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     shutil.copy2(path, dest)

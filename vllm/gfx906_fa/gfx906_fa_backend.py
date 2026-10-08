@@ -21,10 +21,10 @@ VLLM_ATTENTION_BACKEND env var no longer gates this path):
     )
 
 The KV cache layout matches TritonAttentionBackend:
-    (num_blocks, 2, block_size, num_kv_heads, head_size)
+    (num_blocks, num_kv_heads, block_size, 2 * padded_head_size)
 so the backend can be switched without allocator changes.
 
-Decode (LEGACY=1, the default) gathers K/V from the paged fp16 cache
+Decode (LEGACY=1, the opt-in rollback) gathers K/V from the paged fp16 cache
 into contiguous fp16 buffers with a fused HIP gather kernel, quantizes
 K to Q8 on device, and runs the Q8 FA kernel.
 """
@@ -46,6 +46,18 @@ from vllm.gfx906_fa.gfx906_fa_paged import (  # noqa: E402
 )
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.gfx906 import (
+    batch_causal,
+)
+from vllm.utils.gfx906 import (
+    pad96_enabled as _pad96_enabled,  # noqa: F401 - retained for callers
+)
+from vllm.utils.gfx906 import (
+    pad_head_dim as _pad_head_dim,  # noqa: F401 - retained for callers
+)
+from vllm.utils.gfx906 import (
+    padded_head_size as _padded_head_size,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -83,118 +95,20 @@ class Gfx906FAMetadata:
     # Per-batch causality, taken from CommonAttentionMetadata.causal. False means a
     # bidirectional batch (a spec-decode drafter: DFlash assistants build their
     # layers with causal=False), which must not get the inline causal clip. A
-    # *tensor* causal (per-token masks, hybrid models) is not expressible here and
-    # is treated as causal with a one-time warning -- fail-closed to today's
-    # behaviour, which is what such a model gets now.
+    # Tensor causality is rejected by the metadata builder before execution.
     causal: bool = True
-
-
-# Kernel head dims the launcher instantiates (see csrc/gfx906_fa/gfx906_fa_launcher.cu).
-# 96 was added 2026-09-16 (FA-D96) for the ViT's 72 and the head_dim-96 text class; the
-# pad MAP stays on _FALLBACK_HEAD_DIMS until that item's real-model gates pass (see
-# _pad96_enabled), so this set is the kernel whitelist, not the default pad map.
-_INSTANTIATED_HEAD_DIMS = (64, 96, 128, 256)
-_FALLBACK_HEAD_DIMS = (64, 128, 256)
 
 
 _DEBUG_SHAPES = [0]  # GFX906_FA_DEBUG_SHAPES prints the first few calls
 
 
 def _batch_causal(common_attn_metadata) -> bool:
-    """Per-batch causality from CommonAttentionMetadata (`causal: bool | Tensor`).
-
-    False -> a fully bidirectional batch (no causal mask). This is the same contract
-    TRITON_ATTN and ROCM_ATTN honour for the bool form -- their kernels pass it straight
-    to their mask logic and clip nothing -- so serving it here is not a weaker claim than
-    the reference backends make. (The *window* differs: they symmetrize a causal sliding
-    window via `_maybe_symmetrize_window` while stage 1 of FA-NONCAUSAL drops it, i.e. a
-    superset mask; see DEVLOG-fa-noncausal.md and the acceptance guard noted there.)
-
-    Tensor -> per-token causality, which this kernel cannot express. Warn once and keep
-    the causal behaviour: that is exactly what such a batch got before this feature
-    existed (the impl never read causality), so it preserves the status quo instead of
-    making a silent new claim.
-    """
-    causal = getattr(common_attn_metadata, "causal", True)
-    if isinstance(causal, torch.Tensor):
-        logger.warning_once(
-            "GFX906_FA: per-token (tensor) causality is not supported by the "
-            "custom FA kernel; serving this batch as causal - the same behaviour "
-            "as before FA-NONCAUSAL. Use TRITON_ATTN if the model needs per-token "
-            "masks."
-        )
-        return True
-    return causal is not False
-
-
-def _pad_head_dim(head_size: int) -> int | None:
-    """Smallest servable kernel head dim that fits (None if none does).
-
-    Mirrors the ViT path (`gfx906_fa_mm_encoder.py`), which serves every head dim up to
-    256 by zero-padding to the next instantiated dim. Padding is exact here: padded Q
-    dims add 0 to the QK dot, padded K dims quantise to zero q8_0 blocks, padded V dims
-    add 0 to P*V, and the head-dim padding leaves the softmax denominator unchanged.
-    The cost is real (QK/PV work grows) but it replaces a fallback to ROCM_ATTN or
-    TRITON_ATTN, which loses the tuned kernel entirely.
-
-    96 is in the pad map since the FA-D96 gate (2026-09-16, default on): an exact 96 is
-    served natively and 72/80 pad onto 96 instead of 128. ``GFX906_FA_PAD96=0`` restores
-    the (64, 128, 256) map. See docs/gfx906/DEVLOG-fa-d96.md.
-    """
-    dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
-    for head_dim in dims:
-        if head_size <= head_dim:
-            return head_dim
-    return None
-
-
-def _pad96_enabled() -> bool:
-    """Whether the 96-wide kernel is used by the pad map (default ON since 2026-09-16).
-
-    Gated on two A-B-A serving runs, both same-boot and mclk-1000:
-
-    * **ViT (72 -> 96)**: image-prompt TTFT, dense 27B VL, 1024x1024 fresh image per
-      rep, encoder-cache control — pad128 **5.151** / pad96 **5.080** / pad128
-      **5.155** s (6 reps/arm; order control +0.08 %), i.e. **-1.46 %**. The 6-rep
-      distributions do not overlap (pad96 max 5.133 < pad128 min 5.127).
-    * **head_dim-96 text (Phi-3-mini, native 96)**: pp2048/tg256, 4 samples —
-      pad128 **36.164** / native96 **36.379** / pad128 **36.092** t/s, i.e. **+0.69 %**
-      (order control -0.2 %).
-
-    Both are far smaller than the -5 % the item estimated (the ViT attention is ~19 %
-    of TTFT and the kernel only removes ~12 % of that call), but they are consistent
-    and the class also gains a 25 % narrower KV row. Kernel outputs are bit-identical
-    between arms (the removed dims are the all-zero q8_0 block) and the FA suite plus
-    a dedicated D=96 test pin correctness on both entry points.
-    ``GFX906_FA_PAD96=0`` is the rollback to the (64, 128, 256) map.
-    """
-    return _os.environ.get("GFX906_FA_PAD96", "1") == "1"
-
-
-def _padded_head_size(head_size: int) -> int | None:
-    """``head_size`` as a servable dim, or None when it cannot be served.
-
-    Default ON since the Phi-3-mini gate (2026-09-16, FA-COVER-1 step 2): head_dim 96 went
-    from a silent fallback to CUSTOM at 36.41 t/s vs 28.62 (+27 %), with identical top-5
-    tokens and PPL within 0.11 % of the fallback arm (0 top-20 misses in both). The cost is
-    KV bytes: the row grows by the pad ratio, and ``GFX906_FA_PAD=0`` restores the old
-    behaviour (instantiated dims only). Instantiated dims are returned unchanged either way.
-
-    FA-D96 (2026-09-16) added 96 to the map (`_pad96_enabled`, default on): 96 is served
-    natively, 72/80 pad onto 96. ``GFX906_FA_PAD96=0`` restores (64, 128, 256), which is
-    what the pre-FA-D96 builds did.
-    """
-    if _os.environ.get("GFX906_FA_PAD", "1") != "1":
-        # No padding: only dims in the *active* map are servable. With the FA-D96 opt-in
-        # off that excludes 96 — the pre-FA-D96 semantics of this switch (Phi-3 falls
-        # back rather than being served by a dim the map does not carry).
-        dims = _INSTANTIATED_HEAD_DIMS if _pad96_enabled() else _FALLBACK_HEAD_DIMS
-        return head_size if head_size in dims else None
-    return _pad_head_dim(head_size)
+    """Resolve batch causality before cache updates or attention launches."""
+    return batch_causal(getattr(common_attn_metadata, "causal", True))
 
 
 def _resolve_legacy_mode() -> bool:
-    """Resolve ``GFX906_FA_LEGACY``: 1 = LEGACY inline-quantize read path, 0/unset = Q8 side-buffer.
+    """Resolve ``GFX906_FA_LEGACY``: 1 = inline quantization, 0/unset = Q8 cache.
 
     The side-buffer path was verified against 0.29's fused KV-cache content axis
     (#51718) on 2026-09-16: PPL 10.5472/10.5460 across runs vs LEGACY=1's 10.5472
@@ -371,12 +285,12 @@ class Gfx906FABackend(AttentionBackend):
     def customize_spec(cls, spec):
         """Widen the KV spec's head dims to the padded one when padding is opted in.
 
-        NOTE: both halves are set to the same padded width, which is what the impl's split
-        and its zero-padding assume; a model with genuinely asymmetric K/V head dims would
+        Both halves use the same padded width, as the split and zero-padding
+        assume; a model with asymmetric K/V head dims would
         need per-half padding here and in the impl.
 
         vLLM sizes the KV cache from this spec while the kernels are dispatched on the
-        padded dim, so the two must agree. With the real dim in the spec the layer allocates
+        padded dim, so the two must agree. With the real dim the layer allocates
         a 2*real-byte fused row, and splitting that at the padded dim leaves a remainder
         (Phi-3-mini: a 128 chunk plus a 64 remainder, which trips the Q8 row check).
         """
@@ -463,9 +377,8 @@ class Gfx906FABackend(AttentionBackend):
         acceptance is the guard for that approximation.
 
         The claim is the same one the reference backends make for this field (a bool
-        `causal=False` means "no causal clip"); what is *not* supported is its tensor form
-        (per-token causality), which `_batch_causal` warns about and serves as causal --
-        the pre-FA-NONCAUSAL behaviour.
+        `causal=False` means "no causal clip"). Tensor per-token causality is
+        rejected by `_batch_causal` before execution.
 
         Gate (2026-09-17): the official Muse-Glimmer DFlash assistant, TP=2, k=7, graphs
         ON -- mean acceptance length **3.12/3.18** (the same drafter through ROCM_ATTN
@@ -1150,9 +1063,8 @@ class Gfx906FAImpl(AttentionImpl):
     def _pad_last_dim(self, tensor: torch.Tensor) -> torch.Tensor:
         """Zero-pad the head dim of [.., D] (no-op when unpadded).
 
-        Exact for attention: padded Q adds 0 to the QK dot, padded K quantises to
-        zero q8_0 blocks, padded V adds 0 to P*V, and the pad is inside the head
-        dim so the softmax denominator is unchanged (as the ViT path documents).
+        Preserves unquantized attention with the original scale. Q8 rounding
+        can change when padding shares the final quantization group.
         """
         if self._head_pad == 0:
             return tensor
@@ -1313,7 +1225,7 @@ class Gfx906FAImpl(AttentionImpl):
             num_seqs=num_seqs,
             num_kv_heads=self.num_kv_heads,
             max_seqlen_k=attn_metadata.max_seq_len,
-            head_size=self.head_size,
+            head_size=self.padded_head_size,
             device=query.device,
             max_seqlen_q=attn_metadata.max_query_len,
             num_heads=self.num_heads,
@@ -1371,10 +1283,11 @@ def register() -> None:
     registering the backend elsewhere would make a broken backend
     selectable via VLLM_ATTENTION_BACKEND=CUSTOM.
     """
+    from vllm.gfx906_fa import ext
     from vllm.platforms import current_platform
     from vllm.platforms.rocm import on_gfx906
 
-    if not (current_platform.is_rocm() and on_gfx906()):
+    if ext is None or not (current_platform.is_rocm() and on_gfx906()):
         return
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,

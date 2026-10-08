@@ -210,6 +210,9 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 
 
 def _get_gcn_arch() -> str:
+    # Shared quantization modules also import these predicates on CPU/CUDA.
+    if torch.version.hip is None:
+        return ""
     try:
         arch = _query_gcn_arch_from_amdsmi()
         if _capability_from_gcn_arch(arch) is not None:
@@ -217,7 +220,11 @@ def _get_gcn_arch() -> str:
         logger.debug("amdsmi returned implausible GCN arch %r, falling back", arch)
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-    return torch.cuda.get_device_properties("cuda").gcnArchName
+    try:
+        return torch.cuda.get_device_properties("cuda").gcnArchName
+    except (RuntimeError, AssertionError) as e:
+        logger.warning("ROCm device architecture is unavailable: %s", e)
+        return ""
 
 
 # def _get_gcn_arch() -> str:
@@ -590,8 +597,8 @@ def _get_backend_priorities(
     backends = []
     # On gfx906 (MI50/MI60), the vendored custom Q8 FlashAttention kernels
     # (AttentionBackendEnum.CUSTOM) are the default for dense decoder
-    # attention. They only support fp16/half KV, no MLA/sparse, no sliding
-    # window, so validate_configuration keeps the fallback path for anything
+    # attention. They support fp16/half KV and causal windows, no MLA/sparse,
+    # so validate_configuration keeps the fallback path for anything
     # unsupported. Only include CUSTOM when it is actually registered (its
     # plugin entry point ran), otherwise it degrades to the stock backends.
     if on_gfx906() and not AttentionBackendEnum.CUSTOM.is_overridden():
@@ -644,7 +651,7 @@ class RocmPlatform(Platform):
 
     @property
     def supports_native_bf16(self) -> bool:
-        # gfx906 (CDNA1/Vega20) has no native bfloat16 instructions;
+        # gfx906 (Vega20) has no native bfloat16 instructions;
         # bf16 is emulated via fp32 and the gfx906 kernel stack is
         # fp16-only, so bf16 models should run in float16 there.
         return not _ON_GFX906

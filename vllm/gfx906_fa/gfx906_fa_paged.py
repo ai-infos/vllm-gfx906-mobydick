@@ -266,8 +266,8 @@ def _gather_kv(
     v_gathered = value_cache[bt]
 
     # Flatten block-dim: → [B, n_blocks*block_size, Hkv, D]
-    k_gathered = k_gathered.view(num_seqs, -1, num_kv_heads, head_size)
-    v_gathered = v_gathered.view(num_seqs, -1, num_kv_heads, head_size)
+    k_gathered = k_gathered.reshape(num_seqs, -1, num_kv_heads, head_size)
+    v_gathered = v_gathered.reshape(num_seqs, -1, num_kv_heads, head_size)
 
     # Обрезать до max_seqlen_k
     k_gathered = k_gathered[:, :max_seqlen_k].contiguous()

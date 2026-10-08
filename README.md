@@ -1,31 +1,27 @@
 ## Mini Install Guide for GFX906
 
-**0.30.0 line** — release snapshot [`RELEASE-0.30.0-final.md`](docs/gfx906/RELEASE-0.30.0-final.md)
-(the merged upstream 0.30.0 base; the 35B house bench is measured on the **V1**
-runner, which the serve recipes pin — `REL30-1` fixed, V2 is correct but ~2 %
-slower there). MI50/MI60 (gfx906) cards; single-GPU is the normal mode, TP=2 is
-supported for the dense models (see the TP=2 notes below).
+**Branch `gfx906/v0.30.0.x`** integrates the pinned
+[KIntegrated v0.30.0 reference](https://github.com/KIntegrated/vllm-gfx906-mobydick/tree/gfx906/v0.30.0)
+and preserves its gfx906 optimizations. See the
+[upgrade audit](docs/gfx906/UPGRADE-0.30.0.x.md) for inputs, fixes, validation,
+and unresolved runtime checks.
 
-- **Stack:** ROCm **7.14** with the **official AMD DKMS `amdgpu` driver (6.19.14)**
-  — *not* the stock Ubuntu driver. The DKMS driver is required for working TP=2
-  P2P: the stock driver stalls or hangs RCCL P2P/IPC on this dual-root-port
-  topology. On the 7.14 images do **not** set `HSA_OVERRIDE_GFX_VERSION` (7.14
-  targets gfx906 natively; the override belongs to the older 7.2.1 images).
-  Container images and the full environment notes:
-  [`docs/gfx906/running.md`](docs/gfx906/running.md).
-- **`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` is mandatory at import time.** The ROCm
-  platform aborts without upstream `flash_attn` installed, and the ViT attention
-  wrapper uses this env to select the Triton-AMD path. Still true on 0.29.0 even
-  though the LLM path runs the custom FA (see *Vision-tower attention* below).
-- **Build (editable venv, in-tree extensions):**
-  ```bash
-  uv venv --python 3.12 && source .venv/bin/activate
-  VLLM_VERSION_OVERRIDE=0.29.0 FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
-    TRITON_KERNELS_SRC_DIR=$PWD/.deps/triton_kernels-src/python/triton_kernels/triton_kernels \
-    MAX_JOBS=10 HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace
-  ```
-  (`running.md` §0/§0.1 has the venv and `.pth` details, the rebuild recipe, and
-  the `VLLM_GFX906_HIP_BLOCKING_SYNC` CPU-idle knob.)
+- **Primary build target:** Linux x86_64, Python 3.12, gfx906-native ROCm 7.14,
+  PyTorch 2.13.0, and source-built Triton 3.8.0. Immutable base-image and source
+  revisions are in [docker/gfx906-build.env](docker/gfx906-build.env).
+- **Build the selected checkout:** `bash build_and_push_docker.sh`. This creates
+  `aiinfos/vllm-gfx906-mobydick:v0.30.0.x-rocm7.14-pytorch2.13.0` locally;
+  publishing requires an explicit `--push`. No image from this branch has been
+  published or GPU-validated during this upgrade.
+- **Custom Q8 attention stays enabled**, with the reference's rollback switches.
+  Q8 Q/K and fp16 intermediates change numerical results; retaining the defaults
+  does not establish device correctness or model quality here.
+- **Attribution:** benchmark numbers and host-specific serving recipes below
+  are historical results from the KIntegrated reference, chiefly Kevin Read's
+  MI50/MI60 environment. They were not rerun for this branch. Its
+  [release review](docs/gfx906/RELEASE-0.30.0-final.md) pins V1 for the house bench
+  and documents the fused-align V2 graph-capture fault.
+
 - **Serving defaults:** MTP **k=3** spec decode plus a cudagraph capture ladder of
   multiples of `k+1` up to `max_num_seqs × (k+1)`; an undersized ladder silently
   collapses to B=1. Recipe + rule: `running.md` §1 and [`AGENTS.md`](AGENTS.md).
@@ -428,158 +424,35 @@ vllm serve <model> \
 Deep-dive recipes, docker images, and build instructions:
 [`docs/gfx906/running.md`](docs/gfx906/running.md).
 
-### 🐳 Using Pre-built Docker Image (Recommended)
+### Building this checkout
 
-If you have Docker and the AMD ROCm drivers/kernel modules installed on your host system, you can totally bypass the complex manual source-build installation by using our pre-built Docker image.
+Use Linux with Docker BuildKit and an x86_64 host. The build context is this
+checkout, including the vendored `csrc/gfx906_fa` extension; the helper never
+clones another vLLM branch to determine the contents.
 
 ```bash
-# Pull the latest image (or specify a tag instead of latest, e.g. v0.19.1rc0.x)
-docker pull aiinfos/vllm-gfx906-mobydick:latest
-
-# Run the container interactively (Make sure to pass ROCm devices into the container and have your models in host /home/ as we map /home:/home; feel free to edit the command below to a safer one, without priviledged and others)
-sudo docker run -it --name vllm-gfx906-mobydick -v /home:/home --network host --device=/dev/kfd --device=/dev/dri \
-  --group-add video --group-add $(getent group render | cut -d: -f3) \
-  --cap-add=SYS_ADMIN --volume /sys:/sys:ro --pid=host --privileged \
-  --ipc=host aiinfos/vllm-gfx906-mobydick:latest
+bash build_and_push_docker.sh
+# Reduce parallelism if necessary:
+MAX_JOBS=4 bash build_and_push_docker.sh my-gfx906-test
 ```
 
-Once inside the container, you are all set! You can immediately start serving models (see the Quickstart example below).
+See [the build and validation record](docs/gfx906/UPGRADE-0.30.0.x.md) for
+dependency pins, editable builds, package checks, and remaining GPU tests.
+The old ROCm 6.3.x / PyTorch 2.11 / Triton 3.6 combination is **unverified for
+this release**; the v0.30.0 API and build metadata target PyTorch 2.13.
 
----
+After a successful local build, an example GPU container invocation is:
 
-### 🛠️ Manual Build from Source
-
-If you prefer to build and install from source on your bare metal instead, follow the steps below:
-
-### ROCm 6.3.4 & amdgpu drivers
-
-```code
-# Get the script that adds the AMD repo for 24.04 (noble)
-wget https://repo.radeon.com/amdgpu-install/6.3.4/ubuntu/noble/amdgpu-install_6.3.60304-1_all.deb
-sudo apt install ./amdgpu-install_6.3.60304-1_all.deb
-
-# Install ROCm  6.3.4 including hip, rocblas, amdgpu-dkms etc (assuming the machine has already the advised compatible kernel 6.11)
-sudo amdgpu-install --usecase=rocm --rocmrelease=6.3.4    
-
-sudo usermod -aG render,video $USER
-
-# Verify ROCm installation
-rocm-smi --showproductname --showdriverversion
-rocminfo
-
-
-# Add iommu=pt if you later grow beyond two GPUs
-# ROCm’s NCCL-/RCCL-based frameworks can hang on multi-GPU rigs unless the IOMMU is put in pass-through mode
-# see https://rocm.docs.amd.com/projects/install-on-linux/en/docs-6.3.3/reference/install-faq.html#multi-gpu
-
-sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="iommu=pt /' /etc/default/grub
-sudo update-grub
-sudo reboot
-cat /proc/cmdline  # >>> to check: must return: "BOOT_IMAGE=... iommu=pt"
-
+```bash
+docker run --rm -it --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add "$(getent group render | cut -d: -f3)" \
+  --ipc=host -v "$PWD/models:/models:ro" \
+  aiinfos/vllm-gfx906-mobydick:v0.30.0.x-rocm7.14-pytorch2.13.0
 ```
 
-### vllm-gfx906-mobydick fork with its dependencies (python, torch, triton, flash-attn, etc)
-
-```code
-
-pyenv install 3.12.11
-pyenv virtualenv 3.12.11 venv312
-pyenv activate venv312
-
-# PYTORCH 2.11.0
-
-git clone --branch v2.11.0 --recursive https://github.com/pytorch/pytorch.git
-cd pytorch
-
-# Install Python Dependencies
-pip install -r requirements.txt
-pip install mkl-static mkl-include
-
-# Hipify the Source (Convert CUDA to ROCm code)
-python tools/amd_build/build_amd.py
-
-# Build the wheel and install
-export MAX_JOBS=96 # to be adjusted according to your setup to avoid OOM / freeze / crash
-export USE_ROCM=1
-export PYTORCH_ROCM_ARCH=gfx906
-export CMAKE_PREFIX_PATH="${VIRTUAL_ENV}:${CMAKE_PREFIX_PATH}"
-
-pip wheel --no-build-isolation -v -w dist -e . 2>&1 | tee build.log
-pip install ./dist/torch*.whl
-
-
-# TORCHVISION 0.26.0
-
-# Install dependencies
-sudo apt-get update && sudo apt-get install -y libpng-dev libjpeg-dev ffmpeg
-
-# Build and Install
-git clone --branch v0.26.0 https://github.com/pytorch/vision.git
-cd vision
-export FORCE_CUDA=1
-export USE_ROCM=1
-export PYTORCH_ROCM_ARCH=gfx906
-
-python setup.py install
-
-
-# TORCHAUDIO 2.11.0
-
-# Build and Install
-git clone --branch v2.11.0 https://github.com/pytorch/audio.git
-cd audio
-export PYTORCH_ROCM_ARCH=gfx906
-export USE_ROCM=1
-
-python setup.py install
-
-
-# TRITON 3.8.0 (stock upstream — gfx906 support is upstream since v3.8.0)
-
-# Since 0.29.0 the box runs *stock* Triton: upstream commit aa53dba7455
-# "[AMD] Add GCN5.1 / gfx906 target" (in v3.8.0) maps gfx906 to
-# ISAFamily::GCN5_1 with wave64, v_dot and DPP, so no patch is needed and the
-# old fork (ai-infos/triton-gfx906, v3.6.0 + 7 lines) is only a rollback option.
-# Validated on the dense 27B (FA suite 97/97, PPL 10.5472 vs 10.5516), MoE 35B
-# (57.97 vs 58.36 t/s), Nemotron (PPL 26.9937 vs 27.0066), Ornith (16.6664 vs
-# 16.7824) and serving ms/step parity; see docs/gfx906/RECON-triton-1.md.
-
-git clone --branch v3.8.0 https://github.com/triton-lang/triton.git
-cd triton
-pip install -r python/requirements.txt
-# Two build gotchas (both hit here, both recorded in the recon):
-#  - do NOT set TRITON_BUILD_WITH_CLANG_LLD=1: it asks for bare clang/clang++ on
-#    PATH and fails with a misleading "not a full path" error
-#  - the 3.8.0 prebuilt LLVM's exported targets request an install-RPATH relink
-#    the Ninja generator refuses; CMake's own suggestion clears it
-TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
-  TRITON_CODEGEN_BACKENDS="amd" pip wheel --no-build-isolation -w dist . 2>&1 | tee build.log
-pip install ./dist/triton-*.whl
-# NOTE: the published PyPI wheel (triton==3.8.0) segfaults on import on this box
-# (AMD backend and gfx906 are present in it; no missing libs) — build from source
-# as above, or test AMD's ROCm-index wheel
-# (triton==3.7.1+git0263a6a6.rocm7.14.0, what upstream's rock.txt pins).
-
-
-# FLASH-ATTENTION-GFX906 (triton backend)
-
-git clone https://github.com/ai-infos/flash-attention-gfx906.git
-cd flash-attention-gfx906
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
-
-# VLLM-GFX906-MOBYDICK main
-
-git clone https://github.com/ai-infos/vllm-gfx906-mobydick.git
-cd vllm-gfx906-mobydick
-pip install 'amdsmi>=6.3,<6.4'
-pip install -r requirements/rocm.txt
-pip wheel --no-build-isolation -v -w dist . 2>&1 | tee build.log
-pip install ./dist/vllm-*.whl
-
-# TRANSFORMERS (v5.7.0 or any other version <6 supporting your model)
-pip install transformers==5.7.0
-```
+Use the drivers and device access appropriate to your host. The reference's
+dual-GPU topology notes in `docs/gfx906/running.md` are historical environment
+evidence, not a driver-installation requirement established by this upgrade.
 
 ### Quickstart example (with Qwen3.5-0.8B)
 
@@ -666,7 +539,9 @@ Find the full list of supported models [here](https://docs.vllm.ai/en/latest/mod
 
 ## Getting Started
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+The upstream PyPI quickstart below is for official vLLM. For this gfx906
+branch, use the source build above. Upstream installs can use
+[`uv`](https://docs.astral.sh/uv/):
 
 ```bash
 uv pip install vllm

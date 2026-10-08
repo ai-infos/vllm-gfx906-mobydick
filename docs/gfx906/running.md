@@ -1,5 +1,11 @@
 # Running & building the gfx906 fork
 
+For `ai-infos` branch `gfx906/v0.30.0.x`, start with the
+[upgrade build and validation record](UPGRADE-0.30.0.x.md) and
+`bash build_and_push_docker.sh` from the checkout. Paths, driver observations,
+image tags, and measured results below describe the KIntegrated reference
+environment. They have not been reproduced on this branch.
+
 Quick reference so this doesn't have to be rediscovered. Two environments:
 the **local editable `.venv`** (canonical since 2026-08-16, §0) and the
 legacy **docker images** (§1–4). Hardware + toolchain selection + source
@@ -24,7 +30,7 @@ editable install of this repo; the compiled extensions live in-tree.
 
 - **Triton: stock upstream v3.8.0** (since 2026-09-15; upstream carries gfx906 as
   `ISAFamily::GCN5_1`, so the old ai-infos fork is only a rollback). Build recipe +
-  the two build gotchas and the PyPI-wheel caveat: `README.md` ("TRITON 3.8.0").
+  the two build gotchas and the PyPI-wheel caveat: [upgrade build record](UPGRADE-0.30.0.x.md).
   A fresh Triton *version* recompiles every Triton kernel it uses on first boot
   (~450 s with a cold cache) — one-time per version change.
 - **TP=2+ serving needs the HIP blocking-sync `.pth` shim, once per venv**
@@ -85,7 +91,7 @@ editable install of this repo; the compiled extensions live in-tree.
   # VLLM_VERSION_OVERRIDE: the branch tag `gfx906-main-pre-promotion` does not
   # parse as a version (setup.py's setuptools_scm step crashes on it); set it
   # to match the existing vllm/_version.py so the build proceeds.
-  export VLLM_VERSION_OVERRIDE=0.28.0rc2
+  export VLLM_VERSION_OVERRIDE="0.30.0+gfx906.$(git rev-parse --short=12 HEAD)"
   FETCHCONTENT_BASE_DIR=/tmp/vllm-deps \
   HIP_VISIBLE_DEVICES=0 .venv/bin/python setup.py build_ext --inplace
   ```

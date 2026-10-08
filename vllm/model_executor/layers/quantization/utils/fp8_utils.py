@@ -13,6 +13,9 @@ import torch
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.gfx906_fp8 import (
+    decode_e4m3_to_fp16,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_activation_quant,
     get_fp8_min_max,
@@ -793,6 +796,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     on_gfx906: tl.constexpr,
+    fp8_fnuz: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -825,13 +829,7 @@ def _w8a8_triton_block_scaled_mm(
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
         if on_gfx906:
-            # Bitwise E4M3 -> FP16 dequant for B (b is already uint8)
-            b_sign = (b & 0x80).to(tl.uint16) << 8
-            b_exp = ((b & 0x78) >> 3).to(tl.uint16)
-            b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
-            b_mant = (b & 0x07).to(tl.uint16) << 7
-            b_bits = b_sign | (b_exp << 10) | b_mant
-            b = b_bits.to(tl.float16, bitcast=True)
+            b = decode_e4m3_to_fp16(b, fp8_fnuz)
         
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -839,7 +837,11 @@ def _w8a8_triton_block_scaled_mm(
             a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * b_s[None, :] if on_gfx906 else tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        accumulator += (
+            tl.dot(a, b) * b_s[None, :]
+            if on_gfx906
+            else tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -987,7 +989,7 @@ def w8a8_triton_block_scaled_mm(
             "GFX906: bitwise FP8 dequant + triton matmul with A as fp16 "
             "in w8a8_triton_block_scaled_mm (FP8 linear layer)",
         )
-        if not A.dtype == torch.float16: # A can be fp32 or fp16
+        if A.dtype != torch.float16:  # A can be fp32 or fp16
             A = A.to(torch.float16)
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:
@@ -1038,7 +1040,7 @@ def w8a8_triton_block_scaled_mm(
 
     _w8a8_triton_block_scaled_mm[grid](
         A,
-        B.view(torch.uint8) if B.element_size() == 1 else B,
+        B.view(torch.uint8) if on_gfx906() and B.element_size() == 1 else B,
         C,
         As,
         Bs,
@@ -1059,6 +1061,7 @@ def w8a8_triton_block_scaled_mm(
         Bs.stride(0),
         **config,
         on_gfx906=on_gfx906(),
+        fp8_fnuz=B.dtype == torch.float8_e4m3fnuz,
     )
 
     return C

@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+# Build via build_and_push_docker.sh, which supplies the immutable inputs.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS base
+ARG UV_VERSION
+ARG UV_SHA256
+ADD --checksum=sha256:${UV_SHA256} https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv.tar.gz
+RUN tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv && rm /tmp/uv.tar.gz
+ENV VIRTUAL_ENV=/opt/vllm-venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV USE_ROCM=1 PYTORCH_ROCM_ARCH=gfx906 VLLM_TARGET_DEVICE=rocm
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+RUN uv venv --python 3.12 --system-site-packages "$VIRTUAL_ENV"
+RUN "$VIRTUAL_ENV/bin/python" -c "import torch; assert torch.__version__.split('.')[:2] == ['2', '13'], torch.__version__; assert torch.version.hip and torch.version.hip.startswith('7.14'), torch.version.hip; open('/opt/gfx906-constraints.txt', 'w').write('torch==' + torch.__version__ + '\ntriton==3.8.0\n')"
+ENV UV_CONSTRAINT=/opt/gfx906-constraints.txt
+
+FROM base AS build_base
+ARG MAX_JOBS=16
+ENV MAX_JOBS=${MAX_JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git curl ninja-build pkg-config protobuf-compiler \
+    libprotobuf-dev libdrm-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN uv pip install build ninja 'cmake>=3.26.1,<4' pybind11 packaging \
+    'setuptools>=77.0.3,<80.0.0' setuptools-scm setuptools-rust wheel jinja2 psutil einops
+
+FROM build_base AS build_triton
+ARG TRITON_REV
+RUN git init /src/triton && git -C /src/triton remote add origin https://github.com/triton-lang/triton.git \
+    && git -C /src/triton fetch --depth=1 origin "$TRITON_REV" && git -C /src/triton checkout --detach FETCH_HEAD
+WORKDIR /src/triton
+RUN uv pip install -r python/requirements.txt
+RUN TRITON_APPEND_CMAKE_ARGS="-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" TRITON_CODEGEN_BACKENDS=amd \
+    uv build --wheel --no-build-isolation --out-dir /wheels/triton
+
+FROM build_base AS build_flash_attn
+ARG FLASH_ATTN_REV
+COPY --from=build_triton /wheels/triton /wheels/triton
+RUN uv pip install --no-deps /wheels/triton/*.whl
+RUN git init /src/flash-attention && git -C /src/flash-attention remote add origin https://github.com/ai-infos/flash-attention-gfx906.git \
+    && git -C /src/flash-attention fetch --depth=1 origin "$FLASH_ATTN_REV" && git -C /src/flash-attention checkout --detach FETCH_HEAD \
+    && git -C /src/flash-attention submodule update --init --recursive
+WORKDIR /src/flash-attention
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE uv build --wheel --no-build-isolation --out-dir /wheels/flash-attn
+
+FROM build_flash_attn AS build_vllm
+RUN uv pip install --no-deps /wheels/flash-attn/*.whl
+WORKDIR /src/vllm
+COPY . .
+ARG VLLM_VERSION
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION} VLLM_RS_BUILD_VERSION=${VLLM_VERSION} VLLM_REQUIRE_RUST_FRONTEND=1
+RUN uv pip install -r requirements/rocm.txt
+RUN bash ./build_rust.sh
+RUN uv build --sdist --no-build-isolation --out-dir /wheels/vllm \
+    && uv build --wheel --no-build-isolation --out-dir /wheels/vllm
+RUN "$VIRTUAL_ENV/bin/python" -c "import glob, runpy, tarfile, zipfile; w=zipfile.ZipFile(glob.glob('/wheels/vllm/*.whl')[0]); names=w.namelist(); assert any(n.startswith('vllm/_gfx906_fa_C') and n.endswith('.so') for n in names); assert 'vllm/gfx906_fa/gfx906_fa_backend.py' in names; assert 'vllm/vllm-rs' in names; modules=runpy.run_path('tools/build_rust.py')['rust_py_extension_module_names'](); assert all(any(n.startswith('vllm/'+m+'.') and n.endswith('.so') for n in names) for m in modules); s=tarfile.open(glob.glob('/wheels/vllm/*.tar.gz')[0]); assert any(n.endswith('/csrc/gfx906_fa/kernel/fattn-q8.cuh') for n in s.getnames())"
+RUN uv pip freeze > /wheels/vllm/build-dependencies.txt
+
+FROM base AS final
+ARG VLLM_SOURCE_COMMIT
+ARG VLLM_VERSION
+ARG TRITON_REV
+ARG FLASH_ATTN_REV
+LABEL org.opencontainers.image.source="https://github.com/ai-infos/vllm-gfx906-mobydick" \
+    org.opencontainers.image.revision=${VLLM_SOURCE_COMMIT} \
+    org.opencontainers.image.version=${VLLM_VERSION} \
+    io.gfx906.triton.revision=${TRITON_REV} \
+    io.gfx906.flash-attention.revision=${FLASH_ATTN_REV}
+COPY --from=build_triton /wheels/triton /wheels/triton
+COPY --from=build_vllm /wheels /wheels
+RUN uv pip install /wheels/triton/*.whl /wheels/flash-attn/*.whl /wheels/vllm/*.whl \
+    && "$VIRTUAL_ENV/bin/python" -c "import torch, triton; from vllm import _gfx906_fa_C; assert torch.version.hip and triton.__version__ == '3.8.0'; print(_gfx906_fa_C.forward)" \
+    && mkdir -p /usr/share/vllm-gfx906 \
+    && cp /wheels/vllm/build-dependencies.txt /usr/share/vllm-gfx906/ \
+    && uv pip freeze > /usr/share/vllm-gfx906/runtime-dependencies.txt \
+    && rm -rf /wheels
+WORKDIR /workspace
+CMD ["/bin/bash"]

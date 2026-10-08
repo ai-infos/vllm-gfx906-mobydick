@@ -3121,7 +3121,9 @@ def test_vit_fallback_is_loud_and_explains_itself(monkeypatch, caplog):
 
     # ...and the selection path warns about it, loudly, with the reason inline
     with caplog.at_level(logging.WARNING):
-        backend = current_platform.get_vit_attn_backend(320, torch.float16, backend=None)
+        backend = current_platform.get_vit_attn_backend(
+            320, torch.float16, backend=None
+        )
     assert backend != AttentionBackendEnum.CUSTOM, backend
     msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("CUSTOM ViT attention UNAVAILABLE" in m for m in msgs), msgs
@@ -3131,7 +3133,7 @@ def test_vit_fallback_is_loud_and_explains_itself(monkeypatch, caplog):
 def test_vit_bidirectional_matches_sdpa():
     """VIT-1: the dense FA entry serves bidirectional ragged ViT attention.
 
-    Qwen3.5 ViT geometry: head_dim 72 (padded to 96 in-kernel since FA-D96), bidirectional,
+    Qwen3.5 ViT geometry: head_dim 72 (padded to 96 since FA-D96), bidirectional,
     cache-free, ragged batches. The second item is deliberately shorter than the
     padded length, so a wrong KV bound (kv_max) would attend padded KV rows and
     show up as a large error here.
@@ -3312,7 +3314,6 @@ def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
     g = HQ // HKV
     cu = torch.tensor([0, n1, n1 + n2], dtype=torch.int32, device=dev)
     seq_lens = torch.tensor([L1, L2], dtype=torch.int32, device=dev)
-    q_abs = torch.tensor([L1 - n1, L2 - n2], dtype=torch.int32, device=dev)
     num_tokens = n1 + n2
 
     # Per-seq block ranges: seq1 -> blocks [0, 128), seq2 -> [128, 384).
@@ -3327,7 +3328,6 @@ def test_forward_mixed_batch_pad_tile_clamp_and_host_cu():
                         dtype=torch.float16) * 0.5
     _kv_split(kv)[0].copy_(K_all.view(n_blocks, BLOCK, HKV, D))
     _write_v_fused(_kv_split(kv)[1], V_all)
-    K, V = K_all[:L1], V_all[:L1]          # seq1's own context
     # rectangular block table; padding slots (0) are never read because
     # kv_max = seq_len caps each row's walk at its own context.
     bt = torch.zeros(2, b2, dtype=torch.int32, device=dev)
@@ -3948,14 +3948,7 @@ def test_non_causal_batch_is_bidirectional_vs_torch_ref():
 
 
 def test_non_causal_causality_contract(monkeypatch):
-    """FA-NONCAUSAL: the bool contract is honoured, the tensor form is not claimed.
-
-    A bool `causal=False` means "no causal clip" -- the same contract TRITON_ATTN and
-    ROCM_ATTN honour for that field, so this backend may serve it. A *tensor* causal
-    (per-token masks) is not expressible in this kernel: it must keep the causal
-    behaviour it had before this feature (with a warning), not silently become
-    bidirectional over the whole sequence.
-    """
+    """Honor bool causality and reject unrepresentable per-token masks."""
     from types import SimpleNamespace
 
     from vllm.gfx906_fa.gfx906_fa_backend import Gfx906FABackend, _batch_causal
@@ -3968,9 +3961,8 @@ def test_non_causal_causality_contract(monkeypatch):
     assert _batch_causal(bidir) is False
     assert _batch_causal(causal) is True
     assert _batch_causal(missing) is True
-    # Per-token causality keeps the causal path (status quo), it does not become a
-    # full-bidirectional claim.
-    assert _batch_causal(per_token) is True
+    with pytest.raises(NotImplementedError, match="TRITON_ATTN"):
+        _batch_causal(per_token)
 
     # The class-level capability and its rollback.
     monkeypatch.delenv("GFX906_FA_NO_NONCAUSAL", raising=False)
