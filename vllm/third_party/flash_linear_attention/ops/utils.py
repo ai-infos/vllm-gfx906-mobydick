@@ -31,6 +31,15 @@ SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 FLA_CHUNK_SIZE = 64
 
 
+def gdn_readout_dtype(
+    activation_dtype: torch.dtype, state_dtype: torch.dtype
+) -> torch.dtype:
+    """Keep fp32-state readouts wide until normalization for fp16 activations."""
+    if activation_dtype == torch.float16 and state_dtype == torch.float32:
+        return torch.float32
+    return activation_dtype
+
+
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
     A decorator that caches the most recent results of a function with tensor inputs.

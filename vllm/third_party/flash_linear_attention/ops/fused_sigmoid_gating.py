@@ -11,6 +11,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .utils import gdn_readout_dtype
+
 
 @triton.heuristics(
     {
@@ -239,7 +241,8 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    # PR #22 / upstream #54146: avoid narrowing before RMSNormGated.
+    o = q.new_empty(NK, *v.shape, dtype=gdn_readout_dtype(q.dtype, initial_state.dtype))
     if inplace_final_state:
         final_state = initial_state
     else:

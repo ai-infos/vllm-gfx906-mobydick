@@ -58,7 +58,10 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
-from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+from vllm.third_party.flash_linear_attention.ops.utils import (
+    FLA_CHUNK_SIZE,
+    gdn_readout_dtype,
+)
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
@@ -847,6 +850,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         return self._forward_method(hidden_states)
 
+    def _core_attn_out_dtype(self, activation_dtype: torch.dtype) -> torch.dtype:
+        return gdn_readout_dtype(activation_dtype, self.get_state_dtype()[1])
+
     def _output_projection(
         self,
         core_attn_out: torch.Tensor,
@@ -860,7 +866,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = self.norm(core_attn_out, z).to(z.dtype)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output, _ = self.out_proj(core_attn_out)
@@ -872,6 +878,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         """ROCm forward using AITER Triton fused projection+attention when
         available, otherwise falling back to the generic CUDA path."""
+        if self._core_attn_out_dtype(hidden_states.dtype) != hidden_states.dtype:
+            return self.forward_cuda(hidden_states)
         if GDN_AITER_TRITON_AVAILABLE:
             num_tokens = hidden_states.size(0)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -988,7 +996,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out = torch.empty
         core_attn_out = core_attn_out(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
+            dtype=self._core_attn_out_dtype(hidden_states.dtype),
             device=hidden_states.device,
         )
 
@@ -1437,7 +1445,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
-                    : num_decode_tokens
+                    :num_decode_tokens
                 ],
                 validate_data=True,
             )
@@ -1635,11 +1643,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_non_spec.dtype,
-                device=core_attn_out_non_spec.device,
+                dtype=core_attn_out.dtype,
+                device=core_attn_out.device,
             )
-            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            merged_out.index_copy_(
+                1, spec_token_indx, core_attn_out_spec.to(merged_out.dtype)
+            )
+            merged_out.index_copy_(
+                1, non_spec_token_indx, core_attn_out_non_spec.to(merged_out.dtype)
+            )
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)

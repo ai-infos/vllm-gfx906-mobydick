@@ -3,13 +3,150 @@
 
 import os
 import shlex
+import shutil
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = REPO_ROOT / ".buildkite" / "scripts" / "docker-build-metadata-args.sh"
 ROCM_CI_BAKE = REPO_ROOT / ".buildkite" / "scripts" / "ci-bake-rocm.sh"
 ROCM_IMAGE_SMOKE = REPO_ROOT / ".buildkite" / "scripts" / "rocm" / "smoke-test-image.sh"
+
+
+@pytest.mark.parametrize("source", ["override", "git", "missing"])
+def test_rust_build_uses_source_version_without_requiring_git(
+    tmp_path: Path, source: str
+) -> None:
+    """Real setuptools must accept the Docker version and reject unknown versions."""
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    helper = tools / "build_rust.py"
+    shutil.copyfile(REPO_ROOT / "tools/build_rust.py", helper)
+    shutil.copyfile(REPO_ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    (tmp_path / "README.md").write_text("Rust build metadata regression fixture.\n")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("SETUPTOOLS_SCM_", "VCS_VERSIONING_"))
+        and key != "VLLM_RS_BUILD_VERSION"
+    }
+    version = "0.30.0+gfx906.abcdef123456" if source == "override" else "0.30.0"
+    if source == "override":
+        env["VLLM_RS_BUILD_VERSION"] = version
+    elif source == "git":
+        for args in (
+            ["init", "--quiet"],
+            ["add", "."],
+            ["commit", "--quiet", "--no-verify", "-m", "Build fixture"],
+            ["tag", "v0.30.0"],
+        ):
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    *args,
+                ],
+                cwd=tmp_path,
+                env=env,
+                check=True,
+                capture_output=True,
+            )
+    probe = """
+import os, runpy, sys
+from setuptools._distutils import core
+entry = runpy.run_path(sys.argv[1])
+sys.argv = [sys.argv[1], "--help"]
+entry["main"]()
+print("RUST_VERSION=" + os.environ["VLLM_RS_BUILD_VERSION"])
+print("PACKAGE_VERSION=" + core._setup_distribution.get_version())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(helper)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if source == "missing":
+        assert result.returncode != 0
+        assert "unable to detect version" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert f"RUST_VERSION={version}" in result.stdout
+        assert f"PACKAGE_VERSION={version}" in result.stdout
+
+
+def test_gfx906_resolution_retains_image_torch_and_resolves_other_dependencies(
+    tmp_path: Path,
+) -> None:
+    """The custom Torch build is unavailable on indexes, but supplied by the image."""
+    uv = os.environ.get("UV_BIN") or shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is required for the gfx906 dependency-resolution regression")
+        return
+    for name, requirements in (
+        (
+            "gfx906_probe",
+            ["torch>=2.10", "torchvision>=0.1", "torchaudio>=0.1", "other_probe==1.0"],
+        ),
+        ("other_probe", []),
+    ):
+        dist_info = f"{name}-1.0.dist-info"
+        with zipfile.ZipFile(tmp_path / f"{name}-1.0-py3-none-any.whl", "w") as wheel:
+            metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+            metadata += "".join(f"Requires-Dist: {req}\n" for req in requirements)
+            wheel.writestr(f"{dist_info}/METADATA", metadata)
+            wheel.writestr(
+                f"{dist_info}/WHEEL",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            wheel.writestr(f"{dist_info}/RECORD", "")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("torch==2.13.0+gfx906.20260802001858\n")
+    requirements_file = tmp_path / "requirements.in"
+    requirements_file.write_text("gfx906-probe==1.0\n")
+    excludes = tmp_path / "excludes.txt"
+    excludes.write_text((REPO_ROOT / "docker/gfx906-excludes.txt").read_text())
+    env = os.environ.copy()
+    for key in ("UV_CONSTRAINT", "UV_EXCLUDE", "UV_OVERRIDE"):
+        env.pop(key, None)
+    env["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
+    command = [
+        uv,
+        "--no-config",
+        "pip",
+        "compile",
+        "--python",
+        sys.executable,
+        "--no-index",
+        "--find-links",
+        str(tmp_path),
+        "--constraints",
+        str(constraints),
+        str(requirements_file),
+    ]
+    before = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert before.returncode != 0 and "no solution" in before.stderr.lower()
+    assert "torch" in before.stderr
+    after = subprocess.run(
+        command + ["--excludes", str(excludes)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert after.returncode == 0, after.stderr
+    assert "other-probe==1.0" in after.stdout
+    for name in ("torch", "torchvision", "torchaudio"):
+        assert not any(
+            line.startswith(f"{name}==") for line in after.stdout.splitlines()
+        )
 
 
 def run_helper(

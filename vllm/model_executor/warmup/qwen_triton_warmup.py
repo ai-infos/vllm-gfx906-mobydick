@@ -152,12 +152,14 @@ def _warm_gated_rms_norm_kernel(
     from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
         warmup_layer_norm_fwd,
     )
+    from vllm.third_party.flash_linear_attention.ops.utils import gdn_readout_dtype
 
     warmup_layer_norm_fwd(
         max_num_tokens=max_num_tokens,
         rows_per_token=config.hv,
         group_size=config.v,
-        x_dtype=x_dtype,
+        x_dtype=gdn_readout_dtype(x_dtype, config.state_dtype),
+        z_dtype=x_dtype,
         weight_dtype=config.norm_weight_dtype,
         device=device,
         norm_before_gate=config.norm_before_gate,

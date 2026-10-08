@@ -279,6 +279,7 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
         norm_before_gate: bool,
         is_rms_norm: bool,
         activation: str,
+        z_dtype: torch.dtype | None = None,
     ) -> list[CompileKey]:
         if max_num_tokens < 1 or rows_per_token < 1:
             return []
@@ -306,7 +307,7 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
                 y_dtype=x_dtype,
                 weight_dtype=weight_dtype,
                 bias_dtype=None,
-                z_dtype=x_dtype,
+                z_dtype=z_dtype if z_dtype is not None else x_dtype,
                 mean_dtype=None if is_rms_norm else torch.float32,
                 rstd_dtype=torch.float32,
                 x_aligned=True,
@@ -426,6 +427,7 @@ def warmup_layer_norm_fwd(
     norm_before_gate: bool,
     is_rms_norm: bool,
     activation: str,
+    z_dtype: torch.dtype | None = None,
 ) -> None:
     _LAYER_NORM_FWD_KERNEL.warmup(
         max_num_tokens=max_num_tokens,
@@ -437,6 +439,7 @@ def warmup_layer_norm_fwd(
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
         activation=activation,
+        z_dtype=z_dtype,
     )
 
 

@@ -12,6 +12,7 @@ from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     layer_norm_fwd,
     layernorm_fn,
     rms_norm_ref,
+    rmsnorm_fn,
 )
 from vllm.triton_utils import triton
 from vllm.utils.torch_utils import set_random_seed
@@ -81,6 +82,24 @@ def layer_norm_ref(
 
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="FLA normalization requires a GPU.",
+)
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_wide_readout_normalizes_with_fp16_gate_and_weights(sign):
+    x = torch.full((2, 128), sign * 88388.0, dtype=torch.float32, device=DEVICE)
+    z = torch.ones_like(x, dtype=torch.float16)
+    weight = torch.ones(128, dtype=torch.float16, device=DEVICE)
+    out = rmsnorm_fn(x, weight, None, z=z, norm_before_gate=True)
+    expected = sign * F.silu(torch.tensor(1.0, device=DEVICE))
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected.expand_as(out))
+
+
 # Test various M sizes to ensure rows_per_block logic works correctly
 NUM_TOKENS = [
     1,
