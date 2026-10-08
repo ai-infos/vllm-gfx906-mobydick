@@ -8,11 +8,74 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="GDN Triton kernels require a GPU.",
+)
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_large_fp32_state_readout_survives_until_normalization(packed, sign):
+    """PR #22: a real large readout must survive, including the padding row."""
+    dim = 128
+    q = torch.zeros(1, 2, 1, dim, dtype=torch.float16, device=DEVICE)
+    k, v = torch.zeros_like(q), torch.zeros_like(q)
+    q[..., 0], k[..., 1] = 1, 1
+    gates = torch.zeros(2, 1, dtype=q.dtype, device=DEVICE)
+    params = torch.zeros(1, dtype=q.dtype, device=DEVICE)
+    state = torch.zeros(2, 1, dim, dim, dtype=torch.float32, device=DEVICE)
+    state[1, ..., 0] = sign * 2e6
+    indices = torch.tensor([1, 0], dtype=torch.int32, device=DEVICE)
+    if packed:
+        mixed_qkv = torch.cat([q, k, v], dim=-1).reshape(2, -1)
+        out = torch.empty(2, 1, 1, dim, dtype=torch.float32, device=DEVICE)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv,
+            gates,
+            gates,
+            params,
+            params,
+            dim**-0.5,
+            state,
+            out,
+            indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out = out.transpose(0, 1)
+    else:
+        out, _ = fused_sigmoid_gating_delta_rule_update(
+            params,
+            gates,
+            gates,
+            params,
+            q,
+            k,
+            v,
+            initial_state=state,
+            ssm_state_indices=indices,
+            cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32, device=DEVICE),
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    expected = sign * 1e6 * dim**-0.5 / (1 + 1e-6) ** 0.5
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert out.abs().max() > torch.finfo(torch.float16).max
+    torch.testing.assert_close(out[:, :1], torch.full_like(out[:, :1], expected))
+    assert torch.count_nonzero(out[:, 1:]) == 0
+    assert torch.count_nonzero(state[0]) == 0
+    torch.testing.assert_close(
+        state[1, ..., 0], torch.full_like(state[1, ..., 0], sign * 1e6)
+    )
+    normalized = out * torch.rsqrt(out.square().mean(-1, keepdim=True) + 1e-5)
+    assert torch.isfinite(normalized.to(torch.float16)).all()
 
 
 @pytest.mark.parametrize("tp_size", [1])
