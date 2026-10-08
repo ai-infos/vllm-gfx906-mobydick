@@ -154,9 +154,24 @@ The canonical recipe is `docker/Dockerfile.gfx906`, driven by
 | Flash-attention wrapper | ai-infos fork, `0ac8e77b2a6cf773ecf17bc486e1a11fe1e066e0` |
 | uv | 0.12.23 Linux amd64 tarball, SHA256 in the input file |
 
-Every uv install is constrained to that exact Torch build and Triton 3.8.0, preventing replacement with CUDA/CPU Torch or a PyPI Triton wheel. Flash-attention forces a source wheel
-and skips CK under its Triton AMD mode. Rust uses the project venv interpreter
-and the repository's `rust-toolchain.toml`.
+The base records its exact Torch build and constrains Triton to 3.8.0.
+Dependent installs also use [gfx906-excludes.txt](../../docker/gfx906-excludes.txt)
+to retain the base's Torch, TorchVision and TorchAudio builds: the custom Torch
+version is not available on PyPI. Other dependencies still resolve normally.
+Build and runtime import checks verify Torch against the recorded base version;
+Triton is installed from the locally built source wheel. Flash-attention forces
+a source wheel and skips CK under its Triton AMD mode. Rust uses the project
+venv interpreter and the repository's `rust-toolchain.toml`.
+
+The 2026-10-08 resolver follow-up was checked with the pinned uv 0.12.23:
+the complete ROCm requirements passed a dry run with no Torch-family wheel
+replacement. An offline regression rejects the original unavailable Torch pin,
+accepts the exclusions and still resolves unrelated transitive dependencies.
+All 14 Docker metadata tests passed in the Linux validation snapshot after
+normalizing existing CI-shell-script line endings there; no CI scripts changed.
+The modified test passed mypy 1.20.2 / Python 3.12. README Bash syntax and actual
+vLLM CLI argument parsing passed. This does not establish the full Docker build
+or GPU inference.
 
 The reference reports a PyPI Triton 3.8.0 import segfault on its gfx906 host
 ([Triton recon](RECON-triton-1.md)); the image therefore builds from source.

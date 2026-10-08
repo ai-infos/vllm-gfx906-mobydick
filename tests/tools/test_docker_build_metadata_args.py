@@ -3,13 +3,84 @@
 
 import os
 import shlex
+import shutil
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = REPO_ROOT / ".buildkite" / "scripts" / "docker-build-metadata-args.sh"
 ROCM_CI_BAKE = REPO_ROOT / ".buildkite" / "scripts" / "ci-bake-rocm.sh"
 ROCM_IMAGE_SMOKE = REPO_ROOT / ".buildkite" / "scripts" / "rocm" / "smoke-test-image.sh"
+
+
+def test_gfx906_resolution_retains_image_torch_and_resolves_other_dependencies(
+    tmp_path: Path,
+) -> None:
+    """The custom Torch build is unavailable on indexes, but supplied by the image."""
+    uv = os.environ.get("UV_BIN") or shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is required for the gfx906 dependency-resolution regression")
+        return
+    for name, requirements in (
+        (
+            "gfx906_probe",
+            ["torch>=2.10", "torchvision>=0.1", "torchaudio>=0.1", "other_probe==1.0"],
+        ),
+        ("other_probe", []),
+    ):
+        dist_info = f"{name}-1.0.dist-info"
+        with zipfile.ZipFile(tmp_path / f"{name}-1.0-py3-none-any.whl", "w") as wheel:
+            metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+            metadata += "".join(f"Requires-Dist: {req}\n" for req in requirements)
+            wheel.writestr(f"{dist_info}/METADATA", metadata)
+            wheel.writestr(
+                f"{dist_info}/WHEEL",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            wheel.writestr(f"{dist_info}/RECORD", "")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("torch==2.13.0+gfx906.20260802001858\n")
+    requirements_file = tmp_path / "requirements.in"
+    requirements_file.write_text("gfx906-probe==1.0\n")
+    excludes = tmp_path / "excludes.txt"
+    excludes.write_text((REPO_ROOT / "docker/gfx906-excludes.txt").read_text())
+    env = os.environ.copy()
+    for key in ("UV_CONSTRAINT", "UV_EXCLUDE", "UV_OVERRIDE"):
+        env.pop(key, None)
+    env["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
+    command = [
+        uv,
+        "--no-config",
+        "pip",
+        "compile",
+        "--python",
+        sys.executable,
+        "--no-index",
+        "--find-links",
+        str(tmp_path),
+        "--constraints",
+        str(constraints),
+        str(requirements_file),
+    ]
+    before = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert before.returncode != 0 and "no solution" in before.stderr.lower()
+    assert "torch" in before.stderr
+    after = subprocess.run(
+        command + ["--excludes", str(excludes)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert after.returncode == 0, after.stderr
+    assert "other-probe==1.0" in after.stdout
+    for name in ("torch", "torchvision", "torchaudio"):
+        assert not any(
+            line.startswith(f"{name}==") for line in after.stdout.splitlines()
+        )
 
 
 def run_helper(

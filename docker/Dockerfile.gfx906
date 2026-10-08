@@ -48,7 +48,9 @@ WORKDIR /src/vllm
 COPY . .
 ARG VLLM_VERSION
 ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION} VLLM_RS_BUILD_VERSION=${VLLM_VERSION} VLLM_REQUIRE_RUST_FRONTEND=1
-RUN uv pip install -r requirements/rocm.txt
+ENV UV_EXCLUDE=/src/vllm/docker/gfx906-excludes.txt
+RUN uv pip install -r requirements/rocm.txt \
+    && "$VIRTUAL_ENV/bin/python" -c "import torch; assert 'torch==' + torch.__version__ in open('/opt/gfx906-constraints.txt').read().splitlines(), torch.__version__"
 RUN bash ./build_rust.sh
 RUN uv build --sdist --no-build-isolation --out-dir /wheels/vllm \
     && uv build --wheel --no-build-isolation --out-dir /wheels/vllm
@@ -67,8 +69,10 @@ LABEL org.opencontainers.image.source="https://github.com/ai-infos/vllm-gfx906-m
     io.gfx906.flash-attention.revision=${FLASH_ATTN_REV}
 COPY --from=build_triton /wheels/triton /wheels/triton
 COPY --from=build_vllm /wheels /wheels
+COPY --from=build_vllm /src/vllm/docker/gfx906-excludes.txt /opt/gfx906-excludes.txt
+ENV UV_EXCLUDE=/opt/gfx906-excludes.txt
 RUN uv pip install /wheels/triton/*.whl /wheels/flash-attn/*.whl /wheels/vllm/*.whl \
-    && "$VIRTUAL_ENV/bin/python" -c "import torch, triton; from vllm import _gfx906_fa_C; assert torch.version.hip and triton.__version__ == '3.8.0'; print(_gfx906_fa_C.forward)" \
+    && "$VIRTUAL_ENV/bin/python" -c "import torch, triton; from vllm import _gfx906_fa_C; assert 'torch==' + torch.__version__ in open('/opt/gfx906-constraints.txt').read().splitlines(), torch.__version__; assert torch.version.hip and triton.__version__ == '3.8.0'; print(_gfx906_fa_C.forward)" \
     && mkdir -p /usr/share/vllm-gfx906 \
     && cp /wheels/vllm/build-dependencies.txt /usr/share/vllm-gfx906/ \
     && uv pip freeze > /usr/share/vllm-gfx906/runtime-dependencies.txt \

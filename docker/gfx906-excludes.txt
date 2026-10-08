@@ -1,0 +1,4 @@
+# Supplied by the pinned base image; keep its gfx906 builds instead of PyPI wheels.
+torch
+torchvision
+torchaudio
